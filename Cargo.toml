@@ -1,0 +1,23 @@
+[package]
+name = "oxideav-cli-convert"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-cli-convert"
+authors = ["Mark Karpeles"]
+description = "ImageMagick-style convert engine for the oxideav CLI — translates IM arg syntax into an oxideav-pipeline Job"
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-cli-convert"
+keywords = ["multimedia", "convert", "imagemagick", "cli", "pipeline"]
+categories = ["multimedia", "command-line-utilities"]
+
+[dependencies]
+oxideav-core = "0.1"
+oxideav-codec = "0.1"
+oxideav-container = "0.1"
+oxideav-source = "0.1"
+oxideav-pipeline = { version = "0.1", features = ["image_filter"] }
+indexmap = "2"
+serde_json = "1"
