@@ -169,7 +169,7 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
 /// uppercase `X`. Both parts must be non-negative integers.
 fn parse_wxh(s: &str) -> Result<(u32, u32), String> {
     let (w, h) = s
-        .split_once(|c| c == 'x' || c == 'X')
+        .split_once(['x', 'X'])
         .ok_or_else(|| format!("'{s}' is not in WxH form"))?;
     let w: u32 = w
         .parse()
@@ -187,7 +187,7 @@ fn parse_wxh(s: &str) -> Result<(u32, u32), String> {
 /// IM's convention of `sigma = radius / 2.0`. Unlike IM we don't
 /// accept floats for radius — `Blur::new` takes `u32`.
 fn parse_blur(s: &str) -> Result<(u32, f32), String> {
-    let (radius_str, sigma_str) = match s.split_once(|c| c == 'x' || c == 'X') {
+    let (radius_str, sigma_str) = match s.split_once(['x', 'X']) {
         Some((r, s)) => (r, Some(s)),
         None => (s, None),
     };
