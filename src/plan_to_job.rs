@@ -12,9 +12,7 @@
 use crate::op::{ConvertPlan, Dither, Op};
 use indexmap::IndexMap;
 use oxideav_core::Error;
-use oxideav_pipeline::{
-    FilterNode, Job, OutputSpec, SourceRef, TrackInput, TrackSpec,
-};
+use oxideav_pipeline::{FilterNode, Job, OutputSpec, SourceRef, TrackInput, TrackSpec};
 use serde_json::{json, Value};
 
 /// Build a [`Job`] from a [`ConvertPlan`].
@@ -33,15 +31,21 @@ pub fn plan_to_job(plan: &ConvertPlan) -> Result<Job, Error> {
     });
 
     // A filter-chain step — wrap the current chain in a FilterNode.
-    let wrap = |prev: TrackInput, filter: &str, params: Value| TrackInput::Filter(FilterNode {
-        filter: filter.to_string(),
-        params,
-        input: Box::new(prev),
-    });
+    let wrap = |prev: TrackInput, filter: &str, params: Value| {
+        TrackInput::Filter(FilterNode {
+            filter: filter.to_string(),
+            params,
+            input: Box::new(prev),
+        })
+    };
 
     for op in &plan.ops {
         match op {
-            Op::Resize { width, height, bang } => {
+            Op::Resize {
+                width,
+                height,
+                bang,
+            } => {
                 // IM's `!` skips aspect-ratio preservation. Our
                 // Resize always takes literal target dims, so bang vs
                 // non-bang maps to the same filter for now.  When we
@@ -231,8 +235,15 @@ mod tests {
     #[test]
     fn chain_order_preserved() {
         let job = plan_to_job(&plan_with(vec![
-            Op::Resize { width: 64, height: 64, bang: false },
-            Op::Blur { radius: 2, sigma: 1.0 },
+            Op::Resize {
+                width: 64,
+                height: 64,
+                bang: false,
+            },
+            Op::Blur {
+                radius: 2,
+                sigma: 1.0,
+            },
         ]))
         .unwrap();
         let out = job.outputs.values().next().unwrap();

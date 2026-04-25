@@ -37,11 +37,7 @@ impl Dither {
 pub enum Op {
     /// `-resize WxH[!]`. `bang = true` means the `!` was present:
     /// force exact dimensions without preserving aspect ratio.
-    Resize {
-        width: u32,
-        height: u32,
-        bang: bool,
-    },
+    Resize { width: u32, height: u32, bang: bool },
     /// `-blur RxS`. Sigma defaults to `radius / 2.0` when the `xS`
     /// portion is omitted (matches IM's convention).
     Blur { radius: u32, sigma: f32 },

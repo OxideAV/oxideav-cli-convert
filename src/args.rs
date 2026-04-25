@@ -47,9 +47,10 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
     while i < middle.len() {
         let flag = &middle[i];
         let val = |k: usize| -> Result<&str, Error> {
-            middle.get(k).map(|s| s.as_str()).ok_or_else(|| {
-                Error::invalid(format!("convert: {flag}: missing value"))
-            })
+            middle
+                .get(k)
+                .map(|s| s.as_str())
+                .ok_or_else(|| Error::invalid(format!("convert: {flag}: missing value")))
         };
 
         match flag.as_str() {
@@ -59,24 +60,28 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                     Some(c) => (true, c),
                     None => (false, v),
                 };
-                let (w, h) = parse_wxh(core).map_err(|e| {
-                    Error::invalid(format!("convert: -resize: {e}"))
-                })?;
-                ops.push(Op::Resize { width: w, height: h, bang });
+                let (w, h) = parse_wxh(core)
+                    .map_err(|e| Error::invalid(format!("convert: -resize: {e}")))?;
+                ops.push(Op::Resize {
+                    width: w,
+                    height: h,
+                    bang,
+                });
                 i += 2;
             }
             "-blur" => {
                 let v = val(i + 1)?;
-                let (radius, sigma) = parse_blur(v).map_err(|e| {
-                    Error::invalid(format!("convert: -blur: {e}"))
-                })?;
+                let (radius, sigma) =
+                    parse_blur(v).map_err(|e| Error::invalid(format!("convert: -blur: {e}")))?;
                 ops.push(Op::Blur { radius, sigma });
                 i += 2;
             }
             "-edge" => {
                 let v = val(i + 1)?;
                 let r: u32 = v.parse().map_err(|_| {
-                    Error::invalid(format!("convert: -edge: '{v}' is not a non-negative integer"))
+                    Error::invalid(format!(
+                        "convert: -edge: '{v}' is not a non-negative integer"
+                    ))
                 })?;
                 ops.push(Op::Edge { radius: r });
                 i += 2;
@@ -84,14 +89,19 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
             "-colors" => {
                 let v = val(i + 1)?;
                 let n: u32 = v.parse().map_err(|_| {
-                    Error::invalid(format!("convert: -colors: '{v}' is not a non-negative integer"))
+                    Error::invalid(format!(
+                        "convert: -colors: '{v}' is not a non-negative integer"
+                    ))
                 })?;
                 if !(2..=256).contains(&n) {
                     return Err(Error::invalid(format!(
                         "convert: -colors {n} out of range (2..=256)"
                     )));
                 }
-                ops.push(Op::Colors { count: n, dither: pending_dither });
+                ops.push(Op::Colors {
+                    count: n,
+                    dither: pending_dither,
+                });
                 i += 2;
             }
             "-dither" => {
@@ -107,7 +117,9 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
             "-quality" => {
                 let v = val(i + 1)?;
                 let q: u32 = v.parse().map_err(|_| {
-                    Error::invalid(format!("convert: -quality: '{v}' is not a non-negative integer"))
+                    Error::invalid(format!(
+                        "convert: -quality: '{v}' is not a non-negative integer"
+                    ))
                 })?;
                 ops.push(Op::Quality(q));
                 i += 2;
@@ -119,18 +131,28 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
             // Known IM ops we don't yet have a primitive for. Friendly
             // message so users know what's missing, not a generic
             // parse failure.
-            "-rotate" | "-crop" | "-flip" | "-flop" | "-negate"
-            | "-brightness-contrast" | "-contrast" | "-gamma" | "-sepia"
-            | "-modulate" | "-colorspace" | "-level" | "-normalize"
-            | "-sharpen" | "-unsharp" | "-threshold" => {
+            "-rotate"
+            | "-crop"
+            | "-flip"
+            | "-flop"
+            | "-negate"
+            | "-brightness-contrast"
+            | "-contrast"
+            | "-gamma"
+            | "-sepia"
+            | "-modulate"
+            | "-colorspace"
+            | "-level"
+            | "-normalize"
+            | "-sharpen"
+            | "-unsharp"
+            | "-threshold" => {
                 return Err(Error::unsupported(format!(
                     "convert: {flag} is not yet implemented"
                 )));
             }
             other if other.starts_with('-') => {
-                return Err(Error::invalid(format!(
-                    "convert: unknown flag '{other}'"
-                )));
+                return Err(Error::invalid(format!("convert: unknown flag '{other}'")));
             }
             other => {
                 return Err(Error::invalid(format!(
@@ -200,19 +222,39 @@ mod tests {
     #[test]
     fn resize_bilinear_basic() {
         let p = parse(&to_vec(&["a.png", "-resize", "800x600", "b.jpg"])).unwrap();
-        assert_eq!(p.ops, vec![Op::Resize { width: 800, height: 600, bang: false }]);
+        assert_eq!(
+            p.ops,
+            vec![Op::Resize {
+                width: 800,
+                height: 600,
+                bang: false
+            }]
+        );
     }
 
     #[test]
     fn resize_bang_flag() {
         let p = parse(&to_vec(&["a.png", "-resize", "64x32!", "b.jpg"])).unwrap();
-        assert_eq!(p.ops, vec![Op::Resize { width: 64, height: 32, bang: true }]);
+        assert_eq!(
+            p.ops,
+            vec![Op::Resize {
+                width: 64,
+                height: 32,
+                bang: true
+            }]
+        );
     }
 
     #[test]
     fn blur_sigma_defaults_to_half_radius() {
         let p = parse(&to_vec(&["a.png", "-blur", "4", "b.jpg"])).unwrap();
-        assert_eq!(p.ops, vec![Op::Blur { radius: 4, sigma: 2.0 }]);
+        assert_eq!(
+            p.ops,
+            vec![Op::Blur {
+                radius: 4,
+                sigma: 2.0
+            }]
+        );
     }
 
     #[test]
@@ -264,10 +306,7 @@ mod tests {
 
     #[test]
     fn quality_strip() {
-        let p = parse(&to_vec(&[
-            "a.png", "-quality", "85", "-strip", "b.jpg",
-        ]))
-        .unwrap();
+        let p = parse(&to_vec(&["a.png", "-quality", "85", "-strip", "b.jpg"])).unwrap();
         assert_eq!(p.ops, vec![Op::Quality(85), Op::Strip]);
     }
 }
