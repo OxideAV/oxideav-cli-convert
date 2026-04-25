@@ -12,13 +12,10 @@
 //! # Example
 //!
 //! ```no_run
-//! use oxideav_codec::CodecRegistry;
-//! use oxideav_container::ContainerRegistry;
-//! use oxideav_source::SourceRegistry;
+//! use oxideav_core::RuntimeContext;
 //!
-//! let codecs = CodecRegistry::new();
-//! let containers = ContainerRegistry::new();
-//! let sources = SourceRegistry::with_defaults();
+//! let mut ctx = RuntimeContext::new();
+//! oxideav_source::register(&mut ctx);
 //!
 //! // Equivalent to:
 //! //   oxideav convert in.png -resize 800x600 out.jpg
@@ -29,9 +26,7 @@
 //!         "800x600".into(),
 //!         "out.jpg".into(),
 //!     ],
-//!     &codecs,
-//!     &containers,
-//!     &sources,
+//!     &ctx,
 //! ).unwrap();
 //! ```
 
@@ -41,25 +36,17 @@ pub mod plan_to_job;
 
 pub use op::{ConvertPlan, Dither, Op};
 
-use oxideav_codec::CodecRegistry;
-use oxideav_container::ContainerRegistry;
-use oxideav_core::Error;
-use oxideav_source::SourceRegistry;
+use oxideav_core::{Error, RuntimeContext};
 
-/// Run convert with caller-supplied registries.
+/// Run convert with a caller-supplied [`RuntimeContext`].
 ///
-/// The CLI passes the same `Registries::with_all_features()` it uses
-/// for `remux` / `transcode` / `run`; third-party embedders can pass
-/// a narrower set.
-pub fn run(
-    args: &[String],
-    codecs: &CodecRegistry,
-    containers: &ContainerRegistry,
-    sources: &SourceRegistry,
-) -> Result<(), Error> {
+/// The CLI passes the same context produced by `oxideav::with_all_features()`
+/// it uses for `remux` / `transcode` / `run`; third-party embedders can
+/// pass a narrower set.
+pub fn run(args: &[String], ctx: &RuntimeContext) -> Result<(), Error> {
     let plan = args::parse(args)?;
     let job = plan_to_job::plan_to_job(&plan)?;
-    let stats = oxideav_pipeline::Executor::new(&job, codecs, containers, sources).run()?;
+    let stats = oxideav_pipeline::Executor::new(&job, ctx).run()?;
     eprintln!(
         "convert: {} packet(s) read, {} frame(s) decoded, {} frame(s) written",
         stats.packets_read, stats.frames_decoded, stats.frames_written
