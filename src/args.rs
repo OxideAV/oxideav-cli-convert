@@ -28,7 +28,14 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
 
     // First positional is input; last positional is output; the
     // middle is a stream of -flag [value] pairs.
-    let input = args[0].clone();
+    //
+    // Run the input through the generator-shorthand translator first
+    // so things like `xc:red` / `synth:5,sine,440` rewrite to canonical
+    // `generate://...` URIs before the source registry sees them.
+    // Other inputs (file paths, http(s):// URIs, already-canonical
+    // generate:// URIs) pass through unchanged. Only the convert verb
+    // does this — transcode/probe/remux/run accept canonical form only.
+    let input = translate_input_shorthand(&args[0]);
     let output = args[args.len() - 1].clone();
     if output.starts_with('-') {
         return Err(Error::invalid(format!(
@@ -163,6 +170,21 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
     }
 
     Ok(ConvertPlan { input, ops, output })
+}
+
+/// Apply the `oxideav-generator` shorthand translator when it's
+/// linked in; otherwise return the input verbatim. Keeping the call
+/// behind a feature gate means the convert verb still works (with a
+/// clear error from the source registry) when the generator crate is
+/// excluded.
+#[cfg(feature = "generator")]
+fn translate_input_shorthand(input: &str) -> String {
+    oxideav_generator::shorthand::translate(input)
+}
+
+#[cfg(not(feature = "generator"))]
+fn translate_input_shorthand(input: &str) -> String {
+    input.to_string()
 }
 
 /// Parse `WxH` — width × height. Accepts either lowercase `x` or

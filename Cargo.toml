@@ -13,10 +13,19 @@ homepage = "https://github.com/OxideAV/oxideav-cli-convert"
 keywords = ["multimedia", "convert", "imagemagick", "cli", "pipeline"]
 categories = ["multimedia", "command-line-utilities"]
 
+[features]
+default = ["generator"]
+# Hooks the oxideav-generator shorthand translator into the convert
+# arg parser (`xc:`, `pattern:`, `gradient:`, `synth:`, `testsrc:`, …).
+# Off → those shorthands fall through unchanged and the source registry
+# rejects them as unknown URIs.
+generator = ["dep:oxideav-generator"]
+
 [dependencies]
 oxideav-core = "0.1"
 oxideav-source = "0.1"
 oxideav-pipeline = "0.1"
 oxideav-image-filter = "0.0"
+oxideav-generator = { version = "0.1", optional = true }
 indexmap = "2"
 serde_json = "1"
