@@ -25,7 +25,7 @@ generator = ["dep:oxideav-generator"]
 oxideav-core = "0.1"
 oxideav-source = "0.1"
 oxideav-pipeline = "0.1"
-oxideav-image-filter = "0.0"
+oxideav-image-filter = "0.1"
 oxideav-generator = { version = "0.1", optional = true }
 indexmap = "2"
 serde_json = "1"
