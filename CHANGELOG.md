@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.3...v0.0.4) - 2026-05-03
+
+### Other
+
+- bump oxideav-image-filter 0.0 -> 0.1 (sibling promoted to 0.1 series)
+- loosen oxideav-image-filter pin 0.0.4 -> 0.0
+- require oxideav-image-filter >= 0.0.4 for new VideoFrame API
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- add generator-shorthand translator hook
+- pin release-plz to patch-only bumps
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.2...v0.0.3) - 2026-04-25
 
 ### Other
