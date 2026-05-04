@@ -32,9 +32,10 @@
 
 pub mod args;
 pub mod op;
+pub mod pdf_runner;
 pub mod plan_to_job;
 
-pub use op::{ConvertPlan, Dither, Op};
+pub use op::{AlphaOp, ConvertPlan, Dither, Op, PrintfTemplate};
 
 use oxideav_core::{Error, RuntimeContext};
 
@@ -45,6 +46,17 @@ use oxideav_core::{Error, RuntimeContext};
 /// pass a narrower set.
 pub fn run(args: &[String], ctx: &RuntimeContext) -> Result<(), Error> {
     let plan = args::parse(args)?;
+
+    // Side-channel: PDF inputs go through a Scene-aware runner that
+    // bypasses the regular FrameSource pipeline. PDF pages don't fit
+    // the `Frame::Video` shape `oxideav-pipeline` expects, and the
+    // routing rule (encoder accepts Scene → pass through; otherwise
+    // fan out per page when the filename has a `%d` template) is
+    // specific to `convert`. See `pdf_runner` module docs.
+    if pdf_runner::is_pdf_input(&plan.input) {
+        return pdf_runner::run(&plan);
+    }
+
     let job = plan_to_job::plan_to_job(&plan)?;
     let stats = oxideav_pipeline::Executor::new(&job, ctx).run()?;
     eprintln!(

@@ -105,6 +105,13 @@ pub fn plan_to_job(plan: &ConvertPlan) -> Result<Job, Error> {
                 codec_params["quality"] = json!(q);
             }
             Op::Strip => strip_metadata = true,
+            // Vector-input ops; silently dropped on the raster
+            // pipeline path (raster inputs have no DPI, no
+            // composite-over-bg semantics that wouldn't conflict
+            // with `-resize`/etc., and no alpha-channel grammar to
+            // honour beyond what the encoder already does). The
+            // pdf_runner side-channel applies them when reading PDFs.
+            Op::Density(_) | Op::Background(_) | Op::Alpha(_) => {}
         }
     }
 
@@ -195,6 +202,7 @@ mod tests {
             input: "in.png".into(),
             ops,
             output: "out.jpg".into(),
+            output_template: None,
         }
     }
 
