@@ -200,6 +200,7 @@ mod tests {
     fn plan_with(ops: Vec<Op>) -> ConvertPlan {
         ConvertPlan {
             input: "in.png".into(),
+            input_pages: None,
             ops,
             output: "out.jpg".into(),
             output_template: None,

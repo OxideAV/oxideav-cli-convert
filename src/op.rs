@@ -138,12 +138,61 @@ impl PrintfTemplate {
     }
 }
 
+/// ImageMagick-style `[N]` / `[N-M]` page-selection suffix on an
+/// input path. `input.pdf[0]` selects page 0; `input.pdf[2-5]`
+/// selects pages 2, 3, 4, 5 (inclusive on both ends, like IM).
+///
+/// Today the selector only honours numeric pages — IM also supports
+/// negative indices (`[-1]` = last page) and comma-separated lists
+/// (`[0,2,4]`). Both are documented round-3 follow-ups.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PageSelector {
+    /// Single page index.
+    Single(usize),
+    /// Inclusive range `start..=end`.
+    Range(usize, usize),
+}
+
+impl PageSelector {
+    /// Resolve the selector to a list of zero-based page indices,
+    /// validated against `total_pages`.
+    pub fn resolve(&self, total_pages: usize) -> Result<Vec<usize>, String> {
+        match self {
+            PageSelector::Single(n) => {
+                if *n >= total_pages {
+                    Err(format!(
+                        "page index {n} out of range (input has {total_pages} page(s))"
+                    ))
+                } else {
+                    Ok(vec![*n])
+                }
+            }
+            PageSelector::Range(a, b) => {
+                if a > b {
+                    return Err(format!("page range [{a}-{b}] is inverted"));
+                }
+                if *b >= total_pages {
+                    return Err(format!(
+                        "page range [{a}-{b}] out of range (input has {total_pages} page(s))"
+                    ));
+                }
+                Ok((*a..=*b).collect())
+            }
+        }
+    }
+}
+
 /// The parsed result of one `oxideav convert` invocation.
 #[derive(Clone, Debug)]
 pub struct ConvertPlan {
-    /// Input URI. Currently exactly one — IM's multi-input stack is a
-    /// documented follow-up.
+    /// Input URI WITH any `[N]`/`[N-M]` page selector stripped.
+    /// Currently exactly one — IM's multi-input stack is a documented
+    /// follow-up.
     pub input: String,
+    /// Page selector parsed from the input arg's `[…]` suffix, when
+    /// present. `None` means "all pages" for Scene-shaped inputs and
+    /// is ignored for raster inputs.
+    pub input_pages: Option<PageSelector>,
     /// Chain of operations in source order.
     pub ops: Vec<Op>,
     /// Output path (literal).

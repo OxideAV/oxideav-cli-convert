@@ -1,45 +1,89 @@
 //! PDF-input side-channel for the convert verb.
 //!
 //! When `convert` sees an input ending in `.pdf` (or whose magic bytes
-//! say so), it sniffs the file as a [`Scene`], then routes the work
-//! based on what the output side can accept:
+//! say so), it sniffs the file as a [`Scene`], applies any `[N]`/
+//! `[N-M]` page selector, then routes the work based on what the
+//! output format can accept:
 //!
-//! | Output                         | Scene encoder?  | Fan out?      | Action                                      |
-//! |--------------------------------|:---------------:|:-------------:|---------------------------------------------|
-//! | `out.pdf` (no `%d`)            | yes             | no            | pass Scene through to `write_pdf_from_scene`|
-//! | `page-%03d.png` (printf)       | no              | yes           | render every page, write one file each      |
-//! | `out.png` (no `%d`, multi-page)| no              | no            | error — suggest a printf template           |
-//! | `out.png` (no `%d`, 1 page)    | no              | no            | render page 0, write it                     |
-//! | `out.pdf` (with `%d`)          | yes             | yes           | error — Scene-aware output + printf is bogus|
+//! ## Output classes
+//!
+//! | Class      | Examples       | Behaviour                                   |
+//! |------------|----------------|---------------------------------------------|
+//! | Scene      | `.pdf`         | writer consumes the whole `Scene`           |
+//! | Vector     | `.svg`         | one VectorFrame per page, no rasterisation  |
+//! | Raster     | `.png` `.jpg` `.bmp` `.webp` | render each page, encode |
+//!
+//! ## Routing
+//!
+//! - `Scene → Scene` (no `%d`): pass selected-pages Scene through.
+//! - `Scene → Vector` (single page selected, no `%d`): write one
+//!   document file containing that page's VectorFrame.
+//! - `Scene → Vector` (multi-page, `%d`): one Vector file per page.
+//! - `Scene → Vector` (multi-page, no `%d`): error — suggest `%d`.
+//! - `Scene → Raster` (single page selected, no `%d`): render + encode.
+//! - `Scene → Raster` (multi-page, `%d`): render + encode per page.
+//! - `Scene → Raster` (multi-page, no `%d`): error — suggest `%d`.
+//! - `Scene → Scene` (with `%d`): error — Scene + printf is bogus.
 //!
 //! Architecturally this stays out of `oxideav-pipeline`: we never
 //! wire PDF as a `Demuxer` because pages don't fit the `Frame::Video`
-//! shape. The convert verb is the only consumer that needs Scene
-//! input today, so a side-channel here is cheaper than a core change.
+//! shape, and the routing rule is convert-specific.
 
 use std::fs;
 use std::path::Path;
 
-use oxideav_core::{Error, Result, Rgba};
+use oxideav_core::{Error, PixelFormat, Result, Rgba, VideoFrame, VideoPlane};
 use oxideav_pdf::{read_pdf_to_scene, write_pdf_from_scene};
-use oxideav_png::{encode_png_image, PngImage, PngPixelFormat};
+use oxideav_pixfmt::{convert as pix_convert, ConvertOptions, FrameInfo};
 use oxideav_raster::Renderer;
-use oxideav_scene::Page;
+use oxideav_scene::{Page, Scene};
+use oxideav_svg::write_svg;
 
 use crate::op::{AlphaOp, ConvertPlan, Op};
 
-/// File extensions whose encoders consume an entire `Scene` rather
-/// than a single rasterised frame. Update as more Scene-aware
-/// encoders land (oxideav-svg already accepts a single VectorFrame
-/// — multi-page SVG would extend this list).
-const SCENE_AWARE_OUTPUTS: &[&str] = &["pdf"];
+/// What kind of output the convert verb is producing — drives the
+/// routing decision in [`run`]. Add new arms when new formats are
+/// wired (e.g. `.tiff` → Raster once oxideav-tiff has an encoder).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputClass {
+    /// Format consumes a whole [`Scene`] (`.pdf` today; multi-page
+    /// SVG would land here if we ever support it).
+    Scene,
+    /// Format takes a single [`oxideav_core::vector::VectorFrame`]
+    /// per file, no rasterisation (`.svg`).
+    Vector,
+    /// Format takes a rasterised RGBA / RGB buffer per file
+    /// (`.png` `.jpg` `.bmp` `.webp`, …).
+    Raster(RasterFormat),
+}
 
-fn output_format_accepts_scene(path_or_template: &str) -> bool {
-    let lit = match ext_of(path_or_template) {
-        Some(s) => s.to_ascii_lowercase(),
-        None => return false,
-    };
-    SCENE_AWARE_OUTPUTS.iter().any(|&e| e == lit)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RasterFormat {
+    Png,
+    Jpeg,
+    Bmp,
+    Webp,
+}
+
+fn classify_output(path_or_template: &str) -> Result<OutputClass> {
+    let ext = ext_of(path_or_template)
+        .ok_or_else(|| {
+            Error::invalid(format!(
+                "convert: output '{path_or_template}' has no extension"
+            ))
+        })?
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "pdf" => Ok(OutputClass::Scene),
+        "svg" => Ok(OutputClass::Vector),
+        "png" | "apng" => Ok(OutputClass::Raster(RasterFormat::Png)),
+        "jpg" | "jpeg" => Ok(OutputClass::Raster(RasterFormat::Jpeg)),
+        "bmp" | "dib" => Ok(OutputClass::Raster(RasterFormat::Bmp)),
+        "webp" => Ok(OutputClass::Raster(RasterFormat::Webp)),
+        other => Err(Error::unsupported(format!(
+            "convert: PDF→{other} not yet supported (round-2 covers png/jpg/bmp/webp/svg/pdf)"
+        ))),
+    }
 }
 
 fn ext_of(path: &str) -> Option<&str> {
@@ -50,7 +94,7 @@ fn ext_of(path: &str) -> Option<&str> {
 }
 
 /// Returns true when the input path's extension is `.pdf` or its
-/// first 5 bytes are `%PDF-`. Cheap enough to call unconditionally.
+/// first 5 bytes are `%PDF-`.
 pub fn is_pdf_input(input: &str) -> bool {
     if input.to_ascii_lowercase().ends_with(".pdf") {
         return true;
@@ -73,65 +117,121 @@ pub fn run(plan: &ConvertPlan) -> Result<()> {
     let scene = read_pdf_to_scene(&bytes)
         .map_err(|e| Error::invalid(format!("convert: failed to parse PDF: {e:?}")))?;
 
-    let pages = scene
-        .pages
-        .as_ref()
-        .ok_or_else(|| Error::invalid("convert: PDF has no pages — refusing to write empty output"))?;
-    if pages.is_empty() {
+    let all_pages = scene.pages.as_ref().ok_or_else(|| {
+        Error::invalid("convert: PDF has no pages — refusing to write empty output")
+    })?;
+    if all_pages.is_empty() {
         return Err(Error::invalid(
             "convert: PDF has no pages — refusing to write empty output",
         ));
     }
 
-    let scene_aware = output_format_accepts_scene(&plan.output);
+    // Resolve the input page selector against the actual page count.
+    let indices: Vec<usize> = match &plan.input_pages {
+        Some(sel) => sel
+            .resolve(all_pages.len())
+            .map_err(|e| Error::invalid(format!("convert: input '{}': {e}", plan.input)))?,
+        None => (0..all_pages.len()).collect(),
+    };
+    let selected: Vec<&Page> = indices.iter().map(|i| &all_pages[*i]).collect();
+
+    let class = classify_output(&plan.output)?;
     let has_template = plan.output_template.is_some();
 
-    match (scene_aware, has_template) {
-        (true, true) => Err(Error::invalid(format!(
-            "convert: output '{}' is Scene-aware (.pdf/.svg) but the filename has a `%d` template; remove the template OR pick a per-frame output format like .png",
+    match (class, has_template, selected.len()) {
+        // Scene → Scene with printf is bogus.
+        (OutputClass::Scene, true, _) => Err(Error::invalid(format!(
+            "convert: output '{}' is Scene-aware (.pdf) but the filename has a `%d` template; remove the template OR pick a per-frame output format",
             plan.output
         ))),
-        (true, false) => {
-            // PDF → PDF (or future PDF → SVG with a Scene-aware writer).
-            // Pass the Scene through verbatim. The `-resize` / `-blur` /
-            // etc. ops are silently dropped on this path — they're raster
-            // operations and don't apply to a Scene. Document the drop.
-            if !plan.ops.is_empty() {
+
+        // Scene → Scene: pass selected pages through.
+        (OutputClass::Scene, false, _) => {
+            if !plan.ops.is_empty() && plan.ops.iter().any(|o| !matches!(o, Op::Density(_))) {
                 eprintln!("convert: note: raster ops ignored on Scene-aware output");
             }
-            let out = write_pdf_from_scene(&scene)
+            let mut out_scene = Scene::default();
+            out_scene.pages = Some(selected.into_iter().cloned().collect());
+            let bytes = write_pdf_from_scene(&out_scene)
                 .map_err(|e| Error::invalid(format!("convert: failed to write PDF: {e:?}")))?;
-            fs::write(&plan.output, out)
-                .map_err(|e| Error::invalid(format!("convert: failed to write {}: {e}", plan.output)))?;
+            fs::write(&plan.output, bytes).map_err(|e| {
+                Error::invalid(format!("convert: failed to write {}: {e}", plan.output))
+            })?;
             Ok(())
         }
-        (false, false) if pages.len() > 1 => Err(Error::invalid(format!(
-            "convert: PDF has {} pages but output '{}' is a single file with no `%d` template; use e.g. `page-%03d.png`",
-            pages.len(),
-            plan.output
-        ))),
-        (false, false) => {
-            // Single page → single output file.
-            let frame = render_page_to_rgba(&pages[0], &plan.ops)?;
-            encode_to_path(&frame, &plan.output, &plan.ops)?;
-            Ok(())
-        }
-        (false, true) => {
-            // Multi-page → fan out via the printf template.
+
+        // Vector → with printf template (per-page SVG fan-out).
+        (OutputClass::Vector, true, _) => {
             let tmpl = plan.output_template.as_ref().expect("checked above");
-            for (i, page) in pages.iter().enumerate() {
-                let frame = render_page_to_rgba(page, &plan.ops)?;
-                let path = tmpl.expand(i);
-                encode_to_path(&frame, &path, &plan.ops)?;
+            for (out_idx, page) in selected.iter().enumerate() {
+                let bytes = write_svg(&page.content);
+                let path = tmpl.expand(out_idx);
+                fs::write(&path, bytes).map_err(|e| {
+                    Error::invalid(format!("convert: failed to write {path}: {e}"))
+                })?;
             }
             Ok(())
+        }
+        // Vector → single literal file. Must have exactly one selected
+        // page; multi-page SVG isn't a thing.
+        (OutputClass::Vector, false, _) => {
+            if selected.len() == 1 {
+                let bytes = write_svg(&selected[0].content);
+                fs::write(&plan.output, bytes).map_err(|e| {
+                    Error::invalid(format!("convert: failed to write {}: {e}", plan.output))
+                })?;
+                Ok(())
+            } else {
+                Err(Error::invalid(format!(
+                    "convert: {} selected pages but vector output '{}' has no `%d` template (SVG is one-page-per-file); use a `%d` template OR a `[N]` selector to pick one page",
+                    selected.len(),
+                    plan.output
+                )))
+            }
+        }
+
+        // Raster → with printf template (per-page raster fan-out).
+        (OutputClass::Raster(fmt), true, _) => {
+            let tmpl = plan.output_template.as_ref().expect("checked above");
+            for (out_idx, page) in selected.iter().enumerate() {
+                let img = render_page_to_rgba(page, &plan.ops)?;
+                let path = tmpl.expand(out_idx);
+                encode_raster_to_path(&img, fmt, &path, &plan.ops)?;
+            }
+            Ok(())
+        }
+        // Raster → single literal file. Single page only.
+        (OutputClass::Raster(fmt), false, _) => {
+            if selected.len() == 1 {
+                let img = render_page_to_rgba(selected[0], &plan.ops)?;
+                encode_raster_to_path(&img, fmt, &plan.output, &plan.ops)
+            } else {
+                Err(Error::invalid(format!(
+                    "convert: {} selected pages but output '{}' is a single file with no `%d` template; use e.g. `page-%03d.png` OR a `[N]` selector to pick one page",
+                    selected.len(),
+                    plan.output
+                )))
+            }
         }
     }
 }
 
-/// Rasterise a single PDF page using `-density` + `-background` + the
-/// `-alpha` chain from `ops`. Returns a packed RGBA `VideoFrame` whose
-/// stride is `width * 4`.
+/// Owned packed RGBA / RGB24 buffer with explicit dimensions. Lives
+/// only long enough to hand off to an encoder. The pixel-format side
+/// is encoded by `stride / width` (4 = Rgba, 3 = Rgb24).
+pub(crate) struct RgbaImage {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pixels: Vec<u8>,
+    pub(crate) stride: usize,
+}
+
+impl RgbaImage {
+    fn is_rgb(&self) -> bool {
+        self.stride == (self.width as usize) * 3
+    }
+}
+
 fn render_page_to_rgba(page: &Page, ops: &[Op]) -> Result<RgbaImage> {
     let density = last_density(ops).unwrap_or(72);
     let bg_arr = last_background(ops).unwrap_or([255, 255, 255, 255]);
@@ -145,9 +245,6 @@ fn render_page_to_rgba(page: &Page, ops: &[Op]) -> Result<RgbaImage> {
     renderer.background = bg;
     let frame = renderer.render(&page.content);
 
-    // Convert the renderer's VideoFrame (one Rgba plane, stride =
-    // width * 4) into a tightly-packed buffer we own. The renderer
-    // always emits straight-alpha RGBA at exactly one plane.
     let plane = frame
         .planes
         .into_iter()
@@ -160,37 +257,8 @@ fn render_page_to_rgba(page: &Page, ops: &[Op]) -> Result<RgbaImage> {
         stride: plane.stride,
     };
 
-    // Apply the alpha-handling chain in source order so the user's
-    // intent (`-alpha remove` then `-alpha off`) composes predictably.
     apply_alpha_ops(&mut img, ops, bg_arr);
-
     Ok(img)
-}
-
-/// Owned packed RGBA buffer with explicit dimensions. Lives only
-/// long enough to hand off to an encoder.
-struct RgbaImage {
-    width: u32,
-    height: u32,
-    /// `stride * height` bytes. Renderer guarantees straight alpha.
-    pixels: Vec<u8>,
-    stride: usize,
-    // Track whether the buffer is still RGBA (true) or has been
-    // collapsed to RGB24 by `-alpha off`.
-}
-
-impl RgbaImage {
-    fn pixel_format_for_encode(&self) -> PngPixelFormat {
-        // The buffer is always straight-alpha RGBA at this point;
-        // `apply_alpha_ops` mutates `pixels` in place and may shrink
-        // it via `-alpha off`. We track which side we're on by
-        // looking at `stride / width` — 4 = RGBA, 3 = RGB24.
-        if self.stride == (self.width as usize) * 3 {
-            PngPixelFormat::Rgb24
-        } else {
-            PngPixelFormat::Rgba
-        }
-    }
 }
 
 fn last_density(ops: &[Op]) -> Option<u32> {
@@ -207,11 +275,18 @@ fn last_background(ops: &[Op]) -> Option<[u8; 4]> {
     })
 }
 
+fn last_quality(ops: &[Op]) -> Option<u8> {
+    ops.iter().rev().find_map(|o| match o {
+        Op::Quality(q) => Some((*q).min(100) as u8),
+        _ => None,
+    })
+}
+
 fn apply_alpha_ops(img: &mut RgbaImage, ops: &[Op], bg: [u8; 4]) {
     for op in ops {
         if let Op::Alpha(a) = op {
             match a {
-                AlphaOp::On => { /* RGBA stays RGBA — no-op */ }
+                AlphaOp::On => {}
                 AlphaOp::Off => drop_alpha(img),
                 AlphaOp::Remove => flatten_alpha_over(img, bg),
                 AlphaOp::Set => set_alpha(img, 255),
@@ -221,12 +296,9 @@ fn apply_alpha_ops(img: &mut RgbaImage, ops: &[Op], bg: [u8; 4]) {
     }
 }
 
-/// Composite each pixel over `bg` (straight alpha) and force the
-/// output alpha to 255. After this the image is still RGBA but every
-/// pixel is fully opaque.
 fn flatten_alpha_over(img: &mut RgbaImage, bg: [u8; 4]) {
-    if img.stride != (img.width as usize) * 4 {
-        return; // already collapsed to RGB24
+    if img.is_rgb() {
+        return;
     }
     let bg_r = bg[0] as u32;
     let bg_g = bg[1] as u32;
@@ -247,10 +319,9 @@ fn flatten_alpha_over(img: &mut RgbaImage, bg: [u8; 4]) {
     }
 }
 
-/// Drop the alpha channel: RGBA → RGB24 in place.
 fn drop_alpha(img: &mut RgbaImage) {
-    if img.stride != (img.width as usize) * 4 {
-        return; // already RGB24
+    if img.is_rgb() {
+        return;
     }
     let w = img.width as usize;
     let h = img.height as usize;
@@ -263,7 +334,7 @@ fn drop_alpha(img: &mut RgbaImage) {
 }
 
 fn set_alpha(img: &mut RgbaImage, value: u8) {
-    if img.stride != (img.width as usize) * 4 {
+    if img.is_rgb() {
         return;
     }
     for px in img.pixels.chunks_exact_mut(4) {
@@ -271,40 +342,138 @@ fn set_alpha(img: &mut RgbaImage, value: u8) {
     }
 }
 
-fn encode_to_path(img: &RgbaImage, path: &str, ops: &[Op]) -> Result<()> {
-    // For now the only fan-out target we know how to encode is PNG.
-    // Other formats (JPG, WebP, etc.) on the fan-out path require
-    // routing through their own encoders — round-2 followup.
-    let ext = ext_of(path)
-        .ok_or_else(|| Error::invalid(format!("convert: output '{path}' has no extension")))?
-        .to_ascii_lowercase();
-    let _ = ops; // future: -quality forwarded per format
-    match ext.as_str() {
-        "png" => {
-            let png = PngImage {
-                width: img.width,
-                height: img.height,
-                pixel_format: img.pixel_format_for_encode(),
-                stride: img.stride,
-                data: img.pixels.clone(),
-                palette: Vec::new(),
-            };
-            let bytes = encode_png_image(&png)
-                .map_err(|e| Error::invalid(format!("convert: PNG encode failed: {e:?}")))?;
-            fs::write(Path::new(path), bytes)
-                .map_err(|e| Error::invalid(format!("convert: failed to write {path}: {e}")))?;
-            Ok(())
+/// Encode a single rendered page to disk via the format-specific
+/// encoder. Format-side details (palette, YUV conversion, lossless
+/// vs lossy choice) live here so the routing in `run` stays simple.
+fn encode_raster_to_path(
+    img: &RgbaImage,
+    fmt: RasterFormat,
+    path: &str,
+    ops: &[Op],
+) -> Result<()> {
+    let bytes = match fmt {
+        RasterFormat::Png => encode_png(img)?,
+        RasterFormat::Bmp => encode_bmp(img)?,
+        RasterFormat::Webp => encode_webp(img)?,
+        RasterFormat::Jpeg => encode_jpeg(img, ops)?,
+    };
+    fs::write(Path::new(path), bytes)
+        .map_err(|e| Error::invalid(format!("convert: failed to write {path}: {e}")))?;
+    Ok(())
+}
+
+fn encode_png(img: &RgbaImage) -> Result<Vec<u8>> {
+    use oxideav_png::{encode_png_image, PngImage, PngPixelFormat};
+    let pf = if img.is_rgb() {
+        PngPixelFormat::Rgb24
+    } else {
+        PngPixelFormat::Rgba
+    };
+    let png = PngImage {
+        width: img.width,
+        height: img.height,
+        pixel_format: pf,
+        stride: img.stride,
+        data: img.pixels.clone(),
+        palette: Vec::new(),
+    };
+    encode_png_image(&png).map_err(|e| Error::invalid(format!("convert: PNG encode failed: {e:?}")))
+}
+
+fn encode_bmp(img: &RgbaImage) -> Result<Vec<u8>> {
+    use oxideav_bmp::{encode_bmp as bmp_encode, BmpImage, BmpPixelFormat, BmpPlane};
+    let pf = if img.is_rgb() {
+        BmpPixelFormat::Rgb24
+    } else {
+        BmpPixelFormat::Rgba
+    };
+    let bmp = BmpImage {
+        width: img.width,
+        height: img.height,
+        pixel_format: pf,
+        planes: vec![BmpPlane {
+            stride: img.stride,
+            data: img.pixels.clone(),
+        }],
+        pts: None,
+    };
+    bmp_encode(&bmp).map_err(|e| Error::invalid(format!("convert: BMP encode failed: {e:?}")))
+}
+
+fn encode_webp(img: &RgbaImage) -> Result<Vec<u8>> {
+    use oxideav_webp::encode_vp8l_argb;
+    use oxideav_webp::riff::{build_vp8l_with_alpha, build_webp_file, ImageKind, WebpMetadata};
+    // VP8L (lossless) takes ARGB-packed `&[u32]` (one u32 per pixel,
+    // alpha in the high byte). Pack accordingly.
+    let n_px = (img.width as usize) * (img.height as usize);
+    let mut argb = Vec::with_capacity(n_px);
+    let has_alpha = !img.is_rgb();
+    if has_alpha {
+        for px in img.pixels.chunks_exact(4) {
+            let v = ((px[3] as u32) << 24)
+                | ((px[0] as u32) << 16)
+                | ((px[1] as u32) << 8)
+                | (px[2] as u32);
+            argb.push(v);
         }
-        other => Err(Error::unsupported(format!(
-            "convert: PDF→{other} fan-out not yet supported (only PNG today; JPG/WebP/etc. is a follow-up)"
-        ))),
+    } else {
+        for px in img.pixels.chunks_exact(3) {
+            let v = (0xff_u32 << 24)
+                | ((px[0] as u32) << 16)
+                | ((px[1] as u32) << 8)
+                | (px[2] as u32);
+            argb.push(v);
+        }
     }
+    let bitstream = encode_vp8l_argb(img.width, img.height, &argb, has_alpha)
+        .map_err(|e| Error::invalid(format!("convert: WebP VP8L encode failed: {e:?}")))?;
+    // Wrap the raw VP8L bitstream in a RIFF/WEBP container so the
+    // output file is a real `.webp` players accept.
+    let bytes = if has_alpha {
+        build_vp8l_with_alpha(&bitstream, img.width, img.height, &WebpMetadata::default())
+    } else {
+        build_webp_file(
+            ImageKind::Vp8lLossless,
+            &bitstream,
+            img.width,
+            img.height,
+            None,
+            &WebpMetadata::default(),
+        )
+    };
+    Ok(bytes)
+}
+
+fn encode_jpeg(img: &RgbaImage, ops: &[Op]) -> Result<Vec<u8>> {
+    use oxideav_mjpeg::encoder::encode_jpeg as jpeg_encode;
+    let quality = last_quality(ops).unwrap_or(85);
+
+    // The MJPEG encoder takes a YUV420P planar VideoFrame. Walk the
+    // RGBA / RGB24 buffer through pixfmt's RGB→YUV420P (the convert
+    // table has both RGBA→YUV420P and Rgb24→YUV420P entries).
+    let src_format = if img.is_rgb() {
+        PixelFormat::Rgb24
+    } else {
+        PixelFormat::Rgba
+    };
+    let src_frame = VideoFrame {
+        pts: None,
+        planes: vec![VideoPlane {
+            stride: img.stride,
+            data: img.pixels.clone(),
+        }],
+    };
+    let info = FrameInfo::new(src_format, img.width, img.height);
+    let yuv = pix_convert(&src_frame, info, PixelFormat::Yuv420P, &ConvertOptions::default())
+        .map_err(|e| Error::invalid(format!("convert: RGB→YUV420P conversion failed: {e:?}")))?;
+    jpeg_encode(&yuv, img.width, img.height, PixelFormat::Yuv420P, quality)
+        .map_err(|e| Error::invalid(format!("convert: JPEG encode failed: {e:?}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::op::PrintfTemplate as Tmpl;
+    use crate::op::{PageSelector, PrintfTemplate as Tmpl};
 
     #[test]
     fn detects_pdf_extension_case_insensitively() {
@@ -315,12 +484,17 @@ mod tests {
     }
 
     #[test]
-    fn scene_aware_table_recognises_pdf() {
-        assert!(output_format_accepts_scene("out.pdf"));
-        assert!(output_format_accepts_scene("page-%03d.pdf"));
-        assert!(!output_format_accepts_scene("out.png"));
-        assert!(!output_format_accepts_scene("out.jpg"));
-        assert!(!output_format_accepts_scene("noext"));
+    fn classify_output_covers_round2_targets() {
+        assert!(matches!(classify_output("out.pdf"), Ok(OutputClass::Scene)));
+        assert!(matches!(classify_output("out.svg"), Ok(OutputClass::Vector)));
+        assert!(matches!(classify_output("out.png"), Ok(OutputClass::Raster(RasterFormat::Png))));
+        assert!(matches!(classify_output("out.jpg"), Ok(OutputClass::Raster(RasterFormat::Jpeg))));
+        assert!(matches!(classify_output("out.jpeg"), Ok(OutputClass::Raster(RasterFormat::Jpeg))));
+        assert!(matches!(classify_output("out.bmp"), Ok(OutputClass::Raster(RasterFormat::Bmp))));
+        assert!(matches!(classify_output("out.webp"), Ok(OutputClass::Raster(RasterFormat::Webp))));
+        assert!(matches!(classify_output("out.tiff"), Err(_)));
+        assert!(matches!(classify_output("out.gif"), Err(_)));
+        assert!(matches!(classify_output("noext"), Err(_)));
     }
 
     #[test]
@@ -348,10 +522,7 @@ mod tests {
         let mut img = RgbaImage {
             width: 2,
             height: 1,
-            pixels: vec![
-                255, 0, 0, 255,   // opaque red — unchanged
-                0, 0, 0, 0,       // fully transparent — becomes white
-            ],
+            pixels: vec![255, 0, 0, 255, 0, 0, 0, 0],
             stride: 8,
         };
         flatten_alpha_over(&mut img, [255, 255, 255, 255]);
@@ -392,5 +563,21 @@ mod tests {
         };
         assert_eq!(t.expand(0), "out0.jpg");
         assert_eq!(t.expand(42), "out42.jpg");
+    }
+
+    #[test]
+    fn page_selector_single_resolves() {
+        let s = PageSelector::Single(2);
+        assert_eq!(s.resolve(5).unwrap(), vec![2]);
+        assert!(s.resolve(2).is_err()); // out of range
+    }
+
+    #[test]
+    fn page_selector_range_resolves_inclusive() {
+        let s = PageSelector::Range(1, 3);
+        assert_eq!(s.resolve(5).unwrap(), vec![1, 2, 3]);
+        assert!(s.resolve(3).is_err()); // 3 is out of range when total=3
+        let inverted = PageSelector::Range(3, 1);
+        assert!(inverted.resolve(5).is_err());
     }
 }

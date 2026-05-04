@@ -33,5 +33,13 @@ oxideav-scene = "0.1"
 oxideav-raster = "0.1"
 oxideav-png = "0.1"
 oxideav-pixfmt = "0.1"
+# Per-page raster encoders for the fan-out path. Lossless paths only
+# (BMP raw RGBA, JPEG via YUV420, WebP-VP8L lossless); animated /
+# palette-quantised / multi-image formats (GIF, TIFF) are deferred.
+oxideav-bmp = "0.1"
+oxideav-mjpeg = "0.1"
+oxideav-webp = "0.0"
+# SVG writer for the per-page vector output path (PDF→SVG, no raster).
+oxideav-svg = "0.1"
 indexmap = "2"
 serde_json = "1"

@@ -6,7 +6,7 @@
 //! following value; a few (`-strip`) are valueless.  Any unrecognised
 //! flag errors out with a clear message — we never silently drop.
 
-use crate::op::{AlphaOp, ConvertPlan, Dither, Op, PrintfTemplate};
+use crate::op::{AlphaOp, ConvertPlan, Dither, Op, PageSelector, PrintfTemplate};
 use oxideav_core::Error;
 
 /// Parse the slice that comes after `oxideav convert`.
@@ -197,16 +197,71 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
         )));
     }
 
-    let input = translate_input_shorthand(&positionals[0]);
+    let (raw_input, input_pages) = split_input_selector(&positionals[0])?;
+    let input = translate_input_shorthand(raw_input);
     let output = positionals[1].clone();
     let output_template = parse_printf_template(&output)?;
 
     Ok(ConvertPlan {
         input,
+        input_pages,
         ops,
         output,
         output_template,
     })
+}
+
+/// Strip an ImageMagick-style `[N]` / `[N-M]` page selector suffix
+/// from the input path. `input.pdf[0]` → `("input.pdf", Some(Single(0)))`.
+/// Inputs with no `[…]` suffix return `(input, None)`.
+///
+/// Returns an `Err` for malformed selectors (`[abc]`, `[1-2-3]`, `[]`,
+/// unbalanced brackets, etc.) so the user gets a clear message.
+pub(crate) fn split_input_selector(s: &str) -> Result<(&str, Option<PageSelector>), Error> {
+    if !s.ends_with(']') {
+        return Ok((s, None));
+    }
+    let open = match s.rfind('[') {
+        Some(i) => i,
+        None => {
+            return Err(Error::invalid(format!(
+                "convert: input '{s}' has a closing `]` with no matching `[`"
+            )));
+        }
+    };
+    let body = &s[open + 1..s.len() - 1];
+    if body.is_empty() {
+        return Err(Error::invalid(format!(
+            "convert: input '{s}' has an empty `[]` page selector"
+        )));
+    }
+    let sel = match body.split_once('-') {
+        None => {
+            let n: usize = body
+                .parse()
+                .map_err(|_| Error::invalid(format!("convert: input '{s}': '{body}' is not a non-negative integer page index")))?;
+            PageSelector::Single(n)
+        }
+        Some((a, b)) => {
+            if b.contains('-') {
+                return Err(Error::invalid(format!(
+                    "convert: input '{s}': page selector '{body}' has more than one `-` (expected `[N]` or `[N-M]`)"
+                )));
+            }
+            let a: usize = a.parse().map_err(|_| {
+                Error::invalid(format!(
+                    "convert: input '{s}': '{a}' in range '{body}' is not a non-negative integer"
+                ))
+            })?;
+            let b: usize = b.parse().map_err(|_| {
+                Error::invalid(format!(
+                    "convert: input '{s}': '{b}' in range '{body}' is not a non-negative integer"
+                ))
+            })?;
+            PageSelector::Range(a, b)
+        }
+    };
+    Ok((&s[..open], Some(sel)))
 }
 
 /// Scan an output filename for a single `%[0-9]*d` token.
@@ -592,5 +647,57 @@ mod tests {
     fn parse_leaves_output_template_none_for_literal_path() {
         let p = parse(&to_vec(&["in.png", "out.jpg"])).unwrap();
         assert!(p.output_template.is_none());
+    }
+
+    #[test]
+    fn input_selector_single_page() {
+        let (path, sel) = split_input_selector("input.pdf[0]").unwrap();
+        assert_eq!(path, "input.pdf");
+        assert_eq!(sel, Some(PageSelector::Single(0)));
+    }
+
+    #[test]
+    fn input_selector_range() {
+        let (path, sel) = split_input_selector("foo.pdf[2-5]").unwrap();
+        assert_eq!(path, "foo.pdf");
+        assert_eq!(sel, Some(PageSelector::Range(2, 5)));
+    }
+
+    #[test]
+    fn input_selector_absent_passes_through() {
+        let (path, sel) = split_input_selector("plain.pdf").unwrap();
+        assert_eq!(path, "plain.pdf");
+        assert_eq!(sel, None);
+    }
+
+    #[test]
+    fn input_selector_empty_brackets_rejected() {
+        assert!(split_input_selector("foo.pdf[]").is_err());
+    }
+
+    #[test]
+    fn input_selector_non_numeric_rejected() {
+        assert!(split_input_selector("foo.pdf[abc]").is_err());
+        assert!(split_input_selector("foo.pdf[1-x]").is_err());
+    }
+
+    #[test]
+    fn input_selector_extra_dash_rejected() {
+        assert!(split_input_selector("foo.pdf[1-2-3]").is_err());
+    }
+
+    #[test]
+    fn parse_pulls_selector_into_input_pages() {
+        let p = parse(&to_vec(&["in.pdf[0]", "out.png"])).unwrap();
+        assert_eq!(p.input, "in.pdf");
+        assert_eq!(p.input_pages, Some(PageSelector::Single(0)));
+    }
+
+    #[test]
+    fn parse_pulls_range_selector_into_input_pages() {
+        let p = parse(&to_vec(&["in.pdf[2-4]", "page-%02d.png"])).unwrap();
+        assert_eq!(p.input, "in.pdf");
+        assert_eq!(p.input_pages, Some(PageSelector::Range(2, 4)));
+        assert!(p.output_template.is_some());
     }
 }

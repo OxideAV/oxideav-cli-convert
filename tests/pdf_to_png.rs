@@ -170,3 +170,199 @@ fn pdf_to_pdf_passes_scene_through() {
     let bytes = fs::read(&out).unwrap();
     assert!(bytes.starts_with(b"%PDF-"), "output is not a PDF");
 }
+
+// -------- Round 2 -------- //
+
+#[test]
+fn pdf_page_selector_single_renders_one_file() {
+    let dir = temp_dir("selector-single");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+
+    // [1] selects page 1 only — single output (no %d) should work.
+    let out = dir.join("page1.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[1]", pdf_path.to_string_lossy()),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("convert with [1] selector");
+    assert!(out.exists(), "page1.png missing");
+    assert_eq!(&fs::read(&out).unwrap()[..4], b"\x89PNG");
+}
+
+#[test]
+fn pdf_page_selector_out_of_range_errors() {
+    let dir = temp_dir("selector-oor");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("out.png");
+    let err = oxideav_cli_convert::run(
+        &[
+            format!("{}[5]", pdf_path.to_string_lossy()),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .unwrap_err();
+    assert!(format!("{err:?}").contains("out of range"));
+}
+
+#[test]
+fn pdf_to_svg_single_page_writes_svg() {
+    let dir = temp_dir("svg-single");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("page0.svg");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("convert pdf[0]→svg");
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bytes.starts_with(b"<?xml") || bytes.starts_with(b"<svg"),
+        "output is not an SVG (first 16 bytes: {:?})",
+        &bytes[..bytes.len().min(16)]
+    );
+}
+
+#[test]
+fn pdf_to_svg_multi_page_via_template() {
+    let dir = temp_dir("svg-multi");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let template = dir.join("page-%d.svg");
+    oxideav_cli_convert::run(
+        &[
+            pdf_path.to_string_lossy().into_owned(),
+            template.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("convert pdf→svg fan-out");
+    assert!(dir.join("page-0.svg").exists());
+    assert!(dir.join("page-1.svg").exists());
+}
+
+#[test]
+fn pdf_to_svg_multi_page_no_template_errors() {
+    let dir = temp_dir("svg-multi-no-tmpl");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("out.svg");
+    let err = oxideav_cli_convert::run(
+        &[
+            pdf_path.to_string_lossy().into_owned(),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .unwrap_err();
+    assert!(format!("{err:?}").contains("one-page-per-file") || format!("{err:?}").contains("`%d` template"));
+}
+
+#[test]
+fn pdf_to_pdf_with_selector_keeps_only_selected_pages() {
+    let dir = temp_dir("pdf-pdf-selector");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("out.pdf");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("convert pdf[0]→pdf");
+    let bytes = fs::read(&out).unwrap();
+    assert!(bytes.starts_with(b"%PDF-"));
+    // Round-trip the result and assert it has exactly 1 page.
+    let scene = oxideav_pdf::read_pdf_to_scene(&bytes).unwrap();
+    assert_eq!(scene.pages.unwrap().len(), 1);
+}
+
+#[test]
+fn pdf_to_jpg_single_page() {
+    let dir = temp_dir("jpg");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("page0.jpg");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-background".into(),
+            "white".into(),
+            "-alpha".into(),
+            "remove".into(),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("convert pdf[0]→jpg");
+    let bytes = fs::read(&out).unwrap();
+    // JPEG SOI marker.
+    assert_eq!(&bytes[..2], &[0xff, 0xd8]);
+}
+
+#[test]
+fn pdf_to_bmp_single_page() {
+    let dir = temp_dir("bmp");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("page0.bmp");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("convert pdf[0]→bmp");
+    let bytes = fs::read(&out).unwrap();
+    assert_eq!(&bytes[..2], b"BM"); // Windows BMP signature
+}
+
+#[test]
+fn pdf_to_webp_single_page() {
+    let dir = temp_dir("webp");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("page0.webp");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("convert pdf[0]→webp");
+    let bytes = fs::read(&out).unwrap();
+    // RIFF container with WEBP fourcc at offset 8.
+    assert_eq!(&bytes[..4], b"RIFF");
+    assert_eq!(&bytes[8..12], b"WEBP");
+}
+
+#[test]
+fn pdf_range_selector_fans_out_to_two_pngs() {
+    let dir = temp_dir("range-selector");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let template = dir.join("p-%d.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0-1]", pdf_path.to_string_lossy()),
+            template.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("convert pdf[0-1]→png fan-out");
+    assert!(dir.join("p-0.png").exists());
+    assert!(dir.join("p-1.png").exists());
+}
