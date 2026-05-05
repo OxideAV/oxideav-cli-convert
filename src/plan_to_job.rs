@@ -172,15 +172,10 @@ pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Erro
 ///    `qoi` → `qoi`, `dds` → `dds`), so a registered extension Just
 ///    Works without any hard-coded knowledge here. New sibling crates
 ///    extend the supported set the moment the umbrella registers them.
-/// 2. Fall through to a tiny aliasing table for the cases where the
-///    container name does NOT equal the codec id we want to encode
-///    with: audio containers that wrap multiple codecs (`wav` →
-///    `pcm_s16le`, `ogg` → `vorbis`), and image extensions whose
-///    canonical encoder is a different codec (`jpg` → `mjpeg`, `avif`
-///    → `av1`, `ico`/`cur` → `png`).
-/// 3. Otherwise return `None` and let the pipeline infer per-track
+/// 2. Otherwise return `None` and let the pipeline infer per-track
 ///    (the right answer for video containers like MP4/MKV that don't
-///    pin a single codec).
+///    pin a single codec, and the prompt to add `-format CODEC` for
+///    extensions nobody has registered yet).
 fn codec_for_output(
     format_override: Option<&str>,
     output: &str,
@@ -189,26 +184,9 @@ fn codec_for_output(
     let ext = format_override
         .map(|s| s.to_ascii_lowercase())
         .or_else(|| ext_of(output).map(|s| s.to_ascii_lowercase()))?;
-
-    if let Some(name) = ctx.containers.container_for_extension(&ext) {
-        return Some(name.to_string());
-    }
-
-    // Aliases for cases where the container name registered in the
-    // registry isn't the codec id we want on the encoding side. Keep
-    // this table small — additions belong in the producing crate's
-    // `register_extension` / `register_muxer` calls when the names
-    // line up, not here.
-    let codec = match ext.as_str() {
-        "jpg" | "jpeg" => "mjpeg",
-        "ico" | "cur" => "png", // ICO subimages most commonly PNG
-        "avif" => "av1",
-        "wav" | "wave" => "pcm_s16le",
-        "ogg" | "oga" => "vorbis",
-        // Video / container paths: let the pipeline decide per-track.
-        _ => return None,
-    };
-    Some(codec.to_string())
+    ctx.containers
+        .container_for_extension(&ext)
+        .map(|s| s.to_string())
 }
 
 fn ext_of(path: &str) -> Option<&str> {
@@ -232,9 +210,8 @@ mod tests {
         }
     }
 
-    /// Empty context — exercises the alias fallback table for
-    /// extensions like `jpg` (no registered container, but resolves
-    /// via the alias to `mjpeg`) and unknown extensions (`None`).
+    /// Empty context — every extension resolves to `None` since no
+    /// crates have registered any extension/codec pairs yet.
     fn empty_ctx() -> RuntimeContext {
         RuntimeContext::new()
     }
@@ -320,65 +297,21 @@ mod tests {
     // ---- codec_for_output coverage ----
 
     #[test]
-    fn jpg_resolves_via_alias_fallback() {
-        // No registered container; alias table maps jpg → mjpeg.
-        let ctx = empty_ctx();
-        assert_eq!(
-            codec_for_output(None, "out.jpg", &ctx).as_deref(),
-            Some("mjpeg")
-        );
-        assert_eq!(
-            codec_for_output(None, "OUT.JPEG", &ctx).as_deref(),
-            Some("mjpeg")
-        );
-    }
-
-    #[test]
-    fn audio_aliases_resolve() {
-        let ctx = empty_ctx();
-        assert_eq!(
-            codec_for_output(None, "out.wav", &ctx).as_deref(),
-            Some("pcm_s16le")
-        );
-        assert_eq!(
-            codec_for_output(None, "out.WAVE", &ctx).as_deref(),
-            Some("pcm_s16le")
-        );
-        assert_eq!(
-            codec_for_output(None, "out.ogg", &ctx).as_deref(),
-            Some("vorbis")
-        );
-        assert_eq!(
-            codec_for_output(None, "out.oga", &ctx).as_deref(),
-            Some("vorbis")
-        );
-        assert_eq!(
-            codec_for_output(None, "out.avif", &ctx).as_deref(),
-            Some("av1")
-        );
-        assert_eq!(
-            codec_for_output(None, "out.ico", &ctx).as_deref(),
-            Some("png")
-        );
-        assert_eq!(
-            codec_for_output(None, "out.cur", &ctx).as_deref(),
-            Some("png")
-        );
-    }
-
-    #[test]
     fn unknown_extension_returns_none() {
+        // Empty context — no registrations, so every lookup is None.
         let ctx = empty_ctx();
+        assert!(codec_for_output(None, "out.jpg", &ctx).is_none());
         assert!(codec_for_output(None, "out.mkv", &ctx).is_none());
         assert!(codec_for_output(None, "out.unknown_ext_xyz", &ctx).is_none());
     }
 
     #[test]
-    fn registry_hit_takes_precedence_over_extension_lookup() {
+    fn registry_hit_returns_container_name() {
         // Register a synthetic container under an extension and
-        // confirm the resolver picks it up — this is the path that
-        // newly-published image-format crates ride (qoi, dds, exr,
-        // icer, pict, jxs, …) without any hard-coded change here.
+        // confirm the resolver picks it up. This is the path every
+        // image-format crate rides (qoi, dds, exr, icer, pict, jxs,
+        // jxl, jp2, png, qoi, …) once their `register_containers`
+        // call lands and the umbrella wires them in.
         let mut ctx = RuntimeContext::new();
         ctx.containers.register_extension("foo", "foo_codec");
         assert_eq!(
@@ -393,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn format_override_uses_registry_first() {
+    fn format_override_uses_registry() {
         let mut ctx = RuntimeContext::new();
         ctx.containers.register_extension("bar", "bar_codec");
         // -format BAR with output that ends in something else still
@@ -402,30 +335,8 @@ mod tests {
             codec_for_output(Some("BAR"), "out.unrelated", &ctx).as_deref(),
             Some("bar_codec")
         );
-    }
-
-    #[test]
-    fn format_override_falls_through_to_alias_table() {
-        // No container registered for jpg; -format jpg still resolves
-        // via the alias table.
-        let ctx = empty_ctx();
-        assert_eq!(
-            codec_for_output(Some("jpg"), "irrelevant.bin", &ctx).as_deref(),
-            Some("mjpeg")
-        );
-    }
-
-    #[test]
-    fn registry_overrides_alias_table_on_collision() {
-        // If a container were ever registered under "jpg" pointing at
-        // a different codec id, the registry path wins over the alias
-        // table — this guarantees the registry stays the source of
-        // truth as more crates land.
-        let mut ctx = RuntimeContext::new();
-        ctx.containers.register_extension("jpg", "shiny_jpg_codec");
-        assert_eq!(
-            codec_for_output(None, "out.jpg", &ctx).as_deref(),
-            Some("shiny_jpg_codec")
-        );
+        // -format with no matching registration → None (caller can
+        // surface a "use -format CODEC" hint).
+        assert!(codec_for_output(Some("nothing"), "out.unrelated", &ctx).is_none());
     }
 }
