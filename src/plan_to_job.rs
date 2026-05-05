@@ -11,12 +11,18 @@
 
 use crate::op::{ConvertPlan, Dither, Op};
 use indexmap::IndexMap;
-use oxideav_core::Error;
+use oxideav_core::{Error, RuntimeContext};
 use oxideav_pipeline::{FilterNode, Job, OutputSpec, SourceRef, TrackInput, TrackSpec};
 use serde_json::{json, Value};
 
 /// Build a [`Job`] from a [`ConvertPlan`].
-pub fn plan_to_job(plan: &ConvertPlan) -> Result<Job, Error> {
+///
+/// `ctx` is consulted via its [`ContainerRegistry`](oxideav_core::ContainerRegistry)
+/// to map the output extension to a codec id — sibling crates that
+/// register a container (e.g. `oxideav-png`, `oxideav-qoi`,
+/// `oxideav-dds`) automatically extend the supported output set without
+/// needing a hard-coded entry here.
+pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Error> {
     // Walk ops, distinguishing track-side filters from sink-side
     // metadata (format / quality / strip).  Filters are flattened
     // into the recursive `TrackInput` chain; the rest are deferred
@@ -128,7 +134,7 @@ pub fn plan_to_job(plan: &ConvertPlan) -> Result<Job, Error> {
     // output extension (or `-format` override) so the IM-style
     // `convert in.png -resize 64x64 out.jpg` works without the user
     // stating the obvious.
-    let codec = codec_for_output(format_override.as_deref(), &plan.output);
+    let codec = codec_for_output(format_override.as_deref(), &plan.output, ctx);
 
     let track = TrackSpec {
         input: chain,
@@ -156,30 +162,49 @@ pub fn plan_to_job(plan: &ConvertPlan) -> Result<Job, Error> {
 }
 
 /// Guess the output codec from the extension, honouring `-format`
-/// override. Covers the common image codecs + a few audio ones; video
-/// containers like MP4/MKV infer their codec at the track level and
-/// don't need an explicit entry here.
-fn codec_for_output(format_override: Option<&str>, output: &str) -> Option<String> {
+/// override.
+///
+/// Resolution order:
+///
+/// 1. Consult [`ContainerRegistry::container_for_extension`]
+///    (`oxideav_core::ContainerRegistry`). For image-format crates the
+///    container name doubles as the codec id (e.g. `png` → `png`,
+///    `qoi` → `qoi`, `dds` → `dds`), so a registered extension Just
+///    Works without any hard-coded knowledge here. New sibling crates
+///    extend the supported set the moment the umbrella registers them.
+/// 2. Fall through to a tiny aliasing table for the cases where the
+///    container name does NOT equal the codec id we want to encode
+///    with: audio containers that wrap multiple codecs (`wav` →
+///    `pcm_s16le`, `ogg` → `vorbis`), and image extensions whose
+///    canonical encoder is a different codec (`jpg` → `mjpeg`, `avif`
+///    → `av1`, `ico`/`cur` → `png`).
+/// 3. Otherwise return `None` and let the pipeline infer per-track
+///    (the right answer for video containers like MP4/MKV that don't
+///    pin a single codec).
+fn codec_for_output(
+    format_override: Option<&str>,
+    output: &str,
+    ctx: &RuntimeContext,
+) -> Option<String> {
     let ext = format_override
         .map(|s| s.to_ascii_lowercase())
         .or_else(|| ext_of(output).map(|s| s.to_ascii_lowercase()))?;
+
+    if let Some(name) = ctx.containers.container_for_extension(&ext) {
+        return Some(name.to_string());
+    }
+
+    // Aliases for cases where the container name registered in the
+    // registry isn't the codec id we want on the encoding side. Keep
+    // this table small — additions belong in the producing crate's
+    // `register_extension` / `register_muxer` calls when the names
+    // line up, not here.
     let codec = match ext.as_str() {
-        "png" | "apng" => "png",
         "jpg" | "jpeg" => "mjpeg",
-        "gif" => "gif",
-        "webp" => "webp",
-        "bmp" => "bmp",
-        "tiff" | "tif" => "tiff",
         "ico" | "cur" => "png", // ICO subimages most commonly PNG
-        "jxl" => "jxl",
-        "jp2" | "j2k" => "jpeg2000",
         "avif" => "av1",
-        // Audio fallbacks — rough but useful.
         "wav" | "wave" => "pcm_s16le",
-        "flac" => "flac",
-        "mp3" => "mp3",
         "ogg" | "oga" => "vorbis",
-        "opus" => "opus",
         // Video / container paths: let the pipeline decide per-track.
         _ => return None,
     };
@@ -207,9 +232,16 @@ mod tests {
         }
     }
 
+    /// Empty context — exercises the alias fallback table for
+    /// extensions like `jpg` (no registered container, but resolves
+    /// via the alias to `mjpeg`) and unknown extensions (`None`).
+    fn empty_ctx() -> RuntimeContext {
+        RuntimeContext::new()
+    }
+
     #[test]
     fn empty_plan_is_passthrough() {
-        let job = plan_to_job(&plan_with(vec![])).unwrap();
+        let job = plan_to_job(&plan_with(vec![]), &empty_ctx()).unwrap();
         assert_eq!(job.outputs.len(), 1);
         let (key, out) = job.outputs.iter().next().unwrap();
         assert_eq!(key, "out.jpg");
@@ -222,11 +254,14 @@ mod tests {
 
     #[test]
     fn resize_produces_filter_wrapper() {
-        let job = plan_to_job(&plan_with(vec![Op::Resize {
-            width: 64,
-            height: 32,
-            bang: false,
-        }]))
+        let job = plan_to_job(
+            &plan_with(vec![Op::Resize {
+                width: 64,
+                height: 32,
+                bang: false,
+            }]),
+            &empty_ctx(),
+        )
         .unwrap();
         let out = job.outputs.values().next().unwrap();
         match &out.all[0].input {
@@ -243,17 +278,20 @@ mod tests {
 
     #[test]
     fn chain_order_preserved() {
-        let job = plan_to_job(&plan_with(vec![
-            Op::Resize {
-                width: 64,
-                height: 64,
-                bang: false,
-            },
-            Op::Blur {
-                radius: 2,
-                sigma: 1.0,
-            },
-        ]))
+        let job = plan_to_job(
+            &plan_with(vec![
+                Op::Resize {
+                    width: 64,
+                    height: 64,
+                    bang: false,
+                },
+                Op::Blur {
+                    radius: 2,
+                    sigma: 1.0,
+                },
+            ]),
+            &empty_ctx(),
+        )
         .unwrap();
         let out = job.outputs.values().next().unwrap();
         // Ops apply outside-in on the recursive TrackInput: the
@@ -273,9 +311,121 @@ mod tests {
 
     #[test]
     fn quality_and_strip_land_in_codec_params() {
-        let job = plan_to_job(&plan_with(vec![Op::Quality(85), Op::Strip])).unwrap();
+        let job = plan_to_job(&plan_with(vec![Op::Quality(85), Op::Strip]), &empty_ctx()).unwrap();
         let track = &job.outputs.values().next().unwrap().all[0];
         assert_eq!(track.params["quality"], 85);
         assert_eq!(track.params["strip_metadata"], true);
+    }
+
+    // ---- codec_for_output coverage ----
+
+    #[test]
+    fn jpg_resolves_via_alias_fallback() {
+        // No registered container; alias table maps jpg → mjpeg.
+        let ctx = empty_ctx();
+        assert_eq!(
+            codec_for_output(None, "out.jpg", &ctx).as_deref(),
+            Some("mjpeg")
+        );
+        assert_eq!(
+            codec_for_output(None, "OUT.JPEG", &ctx).as_deref(),
+            Some("mjpeg")
+        );
+    }
+
+    #[test]
+    fn audio_aliases_resolve() {
+        let ctx = empty_ctx();
+        assert_eq!(
+            codec_for_output(None, "out.wav", &ctx).as_deref(),
+            Some("pcm_s16le")
+        );
+        assert_eq!(
+            codec_for_output(None, "out.WAVE", &ctx).as_deref(),
+            Some("pcm_s16le")
+        );
+        assert_eq!(
+            codec_for_output(None, "out.ogg", &ctx).as_deref(),
+            Some("vorbis")
+        );
+        assert_eq!(
+            codec_for_output(None, "out.oga", &ctx).as_deref(),
+            Some("vorbis")
+        );
+        assert_eq!(
+            codec_for_output(None, "out.avif", &ctx).as_deref(),
+            Some("av1")
+        );
+        assert_eq!(
+            codec_for_output(None, "out.ico", &ctx).as_deref(),
+            Some("png")
+        );
+        assert_eq!(
+            codec_for_output(None, "out.cur", &ctx).as_deref(),
+            Some("png")
+        );
+    }
+
+    #[test]
+    fn unknown_extension_returns_none() {
+        let ctx = empty_ctx();
+        assert!(codec_for_output(None, "out.mkv", &ctx).is_none());
+        assert!(codec_for_output(None, "out.unknown_ext_xyz", &ctx).is_none());
+    }
+
+    #[test]
+    fn registry_hit_takes_precedence_over_extension_lookup() {
+        // Register a synthetic container under an extension and
+        // confirm the resolver picks it up — this is the path that
+        // newly-published image-format crates ride (qoi, dds, exr,
+        // icer, pict, jxs, …) without any hard-coded change here.
+        let mut ctx = RuntimeContext::new();
+        ctx.containers.register_extension("foo", "foo_codec");
+        assert_eq!(
+            codec_for_output(None, "out.foo", &ctx).as_deref(),
+            Some("foo_codec")
+        );
+        // Case-insensitive on the input filename.
+        assert_eq!(
+            codec_for_output(None, "OUT.FOO", &ctx).as_deref(),
+            Some("foo_codec")
+        );
+    }
+
+    #[test]
+    fn format_override_uses_registry_first() {
+        let mut ctx = RuntimeContext::new();
+        ctx.containers.register_extension("bar", "bar_codec");
+        // -format BAR with output that ends in something else still
+        // lands on bar_codec.
+        assert_eq!(
+            codec_for_output(Some("BAR"), "out.unrelated", &ctx).as_deref(),
+            Some("bar_codec")
+        );
+    }
+
+    #[test]
+    fn format_override_falls_through_to_alias_table() {
+        // No container registered for jpg; -format jpg still resolves
+        // via the alias table.
+        let ctx = empty_ctx();
+        assert_eq!(
+            codec_for_output(Some("jpg"), "irrelevant.bin", &ctx).as_deref(),
+            Some("mjpeg")
+        );
+    }
+
+    #[test]
+    fn registry_overrides_alias_table_on_collision() {
+        // If a container were ever registered under "jpg" pointing at
+        // a different codec id, the registry path wins over the alias
+        // table — this guarantees the registry stays the source of
+        // truth as more crates land.
+        let mut ctx = RuntimeContext::new();
+        ctx.containers.register_extension("jpg", "shiny_jpg_codec");
+        assert_eq!(
+            codec_for_output(None, "out.jpg", &ctx).as_deref(),
+            Some("shiny_jpg_codec")
+        );
     }
 }

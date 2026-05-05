@@ -40,22 +40,25 @@ fn make_two_page_pdf() -> Vec<u8> {
     // what matters is that the PDF reader produces a Scene with
     // exactly 2 pages and that the convert verb writes 2 PNGs.
     let make_page = |paint_color: Rgba| {
-        let mut path = VPath::default();
-        path.commands = vec![
-            PathCommand::MoveTo(Point::new(10.0, 10.0)),
-            PathCommand::LineTo(Point::new(100.0, 10.0)),
-            PathCommand::LineTo(Point::new(100.0, 80.0)),
-            PathCommand::LineTo(Point::new(10.0, 80.0)),
-            PathCommand::Close,
-        ];
+        let path = VPath {
+            commands: vec![
+                PathCommand::MoveTo(Point::new(10.0, 10.0)),
+                PathCommand::LineTo(Point::new(100.0, 10.0)),
+                PathCommand::LineTo(Point::new(100.0, 80.0)),
+                PathCommand::LineTo(Point::new(10.0, 80.0)),
+                PathCommand::Close,
+            ],
+        };
         let node = PathNode {
             path,
             fill: Some(Paint::Solid(paint_color)),
             stroke: None,
             fill_rule: oxideav_core::vector::FillRule::NonZero,
         };
-        let mut group = Group::default();
-        group.children = vec![Node::Path(node)];
+        let group = Group {
+            children: vec![Node::Path(node)],
+            ..Group::default()
+        };
         let mut frame = VectorFrame::new(200.0, 100.0);
         frame.root = group;
         Page {
@@ -67,11 +70,13 @@ fn make_two_page_pdf() -> Vec<u8> {
         }
     };
 
-    let mut scene = Scene::default();
-    scene.pages = Some(vec![
-        make_page(Rgba::new(255, 0, 0, 255)),
-        make_page(Rgba::new(0, 0, 255, 255)),
-    ]);
+    let scene = Scene {
+        pages: Some(vec![
+            make_page(Rgba::new(255, 0, 0, 255)),
+            make_page(Rgba::new(0, 0, 255, 255)),
+        ]),
+        ..Scene::default()
+    };
     write_pdf_from_scene(&scene).expect("pdf encode")
 }
 

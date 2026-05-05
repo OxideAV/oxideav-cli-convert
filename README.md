@@ -66,7 +66,16 @@ routing:
 |---|---|---|
 | **Scene** | `.pdf` | writer consumes the whole `Scene` (vector preserved, multi-page) |
 | **Vector** | `.svg` | one `VectorFrame` per file (no rasterisation) |
-| **Raster** | `.png` `.jpg` `.bmp` `.webp` | render each page to RGBA, encode |
+| **Raster** | `.png` `.jpg` `.bmp` `.webp`, plus any other extension a registered container claims (`qoi`, `dds`, …) | render each page to RGBA, encode |
+
+Codec lookup goes through the caller's `RuntimeContext` —
+`ContainerRegistry::container_for_extension` is consulted first, so any
+sibling crate that registers itself (e.g. `oxideav_qoi::register`,
+`oxideav_dds::register`) extends the supported output set
+automatically. A small fallback table inside `plan_to_job` covers the
+aliasing cases where the canonical encoder name differs from the
+container name (`jpg` → `mjpeg`, `wav` → `pcm_s16le`, `ogg` →
+`vorbis`, `avif` → `av1`, `ico`/`cur` → `png`).
 
 ### Printf templates
 

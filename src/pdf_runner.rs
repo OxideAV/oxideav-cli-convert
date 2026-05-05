@@ -150,8 +150,10 @@ pub fn run(plan: &ConvertPlan) -> Result<()> {
             if !plan.ops.is_empty() && plan.ops.iter().any(|o| !matches!(o, Op::Density(_))) {
                 eprintln!("convert: note: raster ops ignored on Scene-aware output");
             }
-            let mut out_scene = Scene::default();
-            out_scene.pages = Some(selected.into_iter().cloned().collect());
+            let out_scene = Scene {
+                pages: Some(selected.into_iter().cloned().collect()),
+                ..Scene::default()
+            };
             let bytes = write_pdf_from_scene(&out_scene)
                 .map_err(|e| Error::invalid(format!("convert: failed to write PDF: {e:?}")))?;
             fs::write(&plan.output, bytes).map_err(|e| {
@@ -508,9 +510,9 @@ mod tests {
             classify_output("out.webp"),
             Ok(OutputClass::Raster(RasterFormat::Webp))
         ));
-        assert!(matches!(classify_output("out.tiff"), Err(_)));
-        assert!(matches!(classify_output("out.gif"), Err(_)));
-        assert!(matches!(classify_output("noext"), Err(_)));
+        assert!(classify_output("out.tiff").is_err());
+        assert!(classify_output("out.gif").is_err());
+        assert!(classify_output("noext").is_err());
     }
 
     #[test]

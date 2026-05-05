@@ -57,7 +57,7 @@ pub fn run(args: &[String], ctx: &RuntimeContext) -> Result<(), Error> {
         return pdf_runner::run(&plan);
     }
 
-    let job = plan_to_job::plan_to_job(&plan)?;
+    let job = plan_to_job::plan_to_job(&plan, ctx)?;
     let stats = oxideav_pipeline::Executor::new(&job, ctx).run()?;
     eprintln!(
         "convert: {} packet(s) read, {} frame(s) decoded, {} frame(s) written",
