@@ -107,7 +107,11 @@ fn pdf_two_pages_fans_out_to_two_pngs_with_printf_template() {
     // Sanity: both files are non-empty PNGs (signature 89 50 4e 47).
     for p in &[&out0, &out1] {
         let bytes = fs::read(p).unwrap();
-        assert!(bytes.len() > 8, "PNG {p:?} too small ({} bytes)", bytes.len());
+        assert!(
+            bytes.len() > 8,
+            "PNG {p:?} too small ({} bytes)",
+            bytes.len()
+        );
         assert_eq!(&bytes[..4], b"\x89PNG", "PNG {p:?} signature wrong");
     }
 }
@@ -128,7 +132,10 @@ fn pdf_multi_page_no_template_errors_with_helpful_message() {
     )
     .unwrap_err();
     let msg = format!("{err:?}");
-    assert!(msg.contains("%d"), "expected hint about printf template, got: {msg}");
+    assert!(
+        msg.contains("%d"),
+        "expected hint about printf template, got: {msg}"
+    );
 }
 
 #[test]
@@ -147,8 +154,10 @@ fn pdf_to_pdf_with_template_is_rejected() {
     )
     .unwrap_err();
     let msg = format!("{err:?}");
-    assert!(msg.contains("Scene-aware") && msg.contains("template"),
-            "expected scene-aware-with-template hint, got: {msg}");
+    assert!(
+        msg.contains("Scene-aware") && msg.contains("template"),
+        "expected scene-aware-with-template hint, got: {msg}"
+    );
 }
 
 #[test]
@@ -264,7 +273,10 @@ fn pdf_to_svg_multi_page_no_template_errors() {
         &ctx(),
     )
     .unwrap_err();
-    assert!(format!("{err:?}").contains("one-page-per-file") || format!("{err:?}").contains("`%d` template"));
+    assert!(
+        format!("{err:?}").contains("one-page-per-file")
+            || format!("{err:?}").contains("`%d` template")
+    );
 }
 
 #[test]

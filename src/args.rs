@@ -237,9 +237,11 @@ pub(crate) fn split_input_selector(s: &str) -> Result<(&str, Option<PageSelector
     }
     let sel = match body.split_once('-') {
         None => {
-            let n: usize = body
-                .parse()
-                .map_err(|_| Error::invalid(format!("convert: input '{s}': '{body}' is not a non-negative integer page index")))?;
+            let n: usize = body.parse().map_err(|_| {
+                Error::invalid(format!(
+                    "convert: input '{s}': '{body}' is not a non-negative integer page index"
+                ))
+            })?;
             PageSelector::Single(n)
         }
         Some((a, b)) => {
@@ -371,7 +373,10 @@ fn parse_hex_color(hex: &str) -> Result<[u8; 4], String> {
     }
     let h = hex.as_bytes();
     let pair = |a: u8, b: u8| -> Result<u8, String> { Ok(hex_digit(a)? * 16 + hex_digit(b)?) };
-    let dup = |a: u8| -> Result<u8, String> { let d = hex_digit(a)?; Ok(d * 16 + d) };
+    let dup = |a: u8| -> Result<u8, String> {
+        let d = hex_digit(a)?;
+        Ok(d * 16 + d)
+    };
     match h.len() {
         3 => Ok([dup(h[0])?, dup(h[1])?, dup(h[2])?, 255]),
         4 => Ok([dup(h[0])?, dup(h[1])?, dup(h[2])?, dup(h[3])?]),
@@ -619,7 +624,9 @@ mod tests {
     #[test]
     fn printf_template_absent_returns_none() {
         assert!(parse_printf_template("out.png").unwrap().is_none());
-        assert!(parse_printf_template("/some/dir/out.jpg").unwrap().is_none());
+        assert!(parse_printf_template("/some/dir/out.jpg")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

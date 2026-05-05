@@ -345,12 +345,7 @@ fn set_alpha(img: &mut RgbaImage, value: u8) {
 /// Encode a single rendered page to disk via the format-specific
 /// encoder. Format-side details (palette, YUV conversion, lossless
 /// vs lossy choice) live here so the routing in `run` stays simple.
-fn encode_raster_to_path(
-    img: &RgbaImage,
-    fmt: RasterFormat,
-    path: &str,
-    ops: &[Op],
-) -> Result<()> {
+fn encode_raster_to_path(img: &RgbaImage, fmt: RasterFormat, path: &str, ops: &[Op]) -> Result<()> {
     let bytes = match fmt {
         RasterFormat::Png => encode_png(img)?,
         RasterFormat::Bmp => encode_bmp(img)?,
@@ -418,10 +413,8 @@ fn encode_webp(img: &RgbaImage) -> Result<Vec<u8>> {
         }
     } else {
         for px in img.pixels.chunks_exact(3) {
-            let v = (0xff_u32 << 24)
-                | ((px[0] as u32) << 16)
-                | ((px[1] as u32) << 8)
-                | (px[2] as u32);
+            let v =
+                (0xff_u32 << 24) | ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | (px[2] as u32);
             argb.push(v);
         }
     }
@@ -464,8 +457,13 @@ fn encode_jpeg(img: &RgbaImage, ops: &[Op]) -> Result<Vec<u8>> {
         }],
     };
     let info = FrameInfo::new(src_format, img.width, img.height);
-    let yuv = pix_convert(&src_frame, info, PixelFormat::Yuv420P, &ConvertOptions::default())
-        .map_err(|e| Error::invalid(format!("convert: RGB→YUV420P conversion failed: {e:?}")))?;
+    let yuv = pix_convert(
+        &src_frame,
+        info,
+        PixelFormat::Yuv420P,
+        &ConvertOptions::default(),
+    )
+    .map_err(|e| Error::invalid(format!("convert: RGB→YUV420P conversion failed: {e:?}")))?;
     jpeg_encode(&yuv, img.width, img.height, PixelFormat::Yuv420P, quality)
         .map_err(|e| Error::invalid(format!("convert: JPEG encode failed: {e:?}")))
 }
@@ -486,12 +484,30 @@ mod tests {
     #[test]
     fn classify_output_covers_round2_targets() {
         assert!(matches!(classify_output("out.pdf"), Ok(OutputClass::Scene)));
-        assert!(matches!(classify_output("out.svg"), Ok(OutputClass::Vector)));
-        assert!(matches!(classify_output("out.png"), Ok(OutputClass::Raster(RasterFormat::Png))));
-        assert!(matches!(classify_output("out.jpg"), Ok(OutputClass::Raster(RasterFormat::Jpeg))));
-        assert!(matches!(classify_output("out.jpeg"), Ok(OutputClass::Raster(RasterFormat::Jpeg))));
-        assert!(matches!(classify_output("out.bmp"), Ok(OutputClass::Raster(RasterFormat::Bmp))));
-        assert!(matches!(classify_output("out.webp"), Ok(OutputClass::Raster(RasterFormat::Webp))));
+        assert!(matches!(
+            classify_output("out.svg"),
+            Ok(OutputClass::Vector)
+        ));
+        assert!(matches!(
+            classify_output("out.png"),
+            Ok(OutputClass::Raster(RasterFormat::Png))
+        ));
+        assert!(matches!(
+            classify_output("out.jpg"),
+            Ok(OutputClass::Raster(RasterFormat::Jpeg))
+        ));
+        assert!(matches!(
+            classify_output("out.jpeg"),
+            Ok(OutputClass::Raster(RasterFormat::Jpeg))
+        ));
+        assert!(matches!(
+            classify_output("out.bmp"),
+            Ok(OutputClass::Raster(RasterFormat::Bmp))
+        ));
+        assert!(matches!(
+            classify_output("out.webp"),
+            Ok(OutputClass::Raster(RasterFormat::Webp))
+        ));
         assert!(matches!(classify_output("out.tiff"), Err(_)));
         assert!(matches!(classify_output("out.gif"), Err(_)));
         assert!(matches!(classify_output("noext"), Err(_)));
@@ -503,10 +519,7 @@ mod tests {
             width: 2,
             height: 2,
             pixels: vec![
-                10, 20, 30, 40,
-                50, 60, 70, 80,
-                90, 100, 110, 120,
-                130, 140, 150, 160,
+                10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160,
             ],
             stride: 8,
         };
