@@ -21,13 +21,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CMYK, palette, mono).
 - `ConvertPlan::ping: bool`.
 
-### Fixed
-
-- `pdf_runner::encode_bmp` updated for the new `oxideav-bmp 0.1.x`
-  API (`palette: Option<BmpPalette>`, `encode_bmp` returns
-  `(Vec<u8>, EncodedBmpFormat)`). Drive-by — convert had been red on
-  the latest published BMP.
-
 ## [0.0.4](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.3...v0.0.4) - 2026-05-03
 
 ### Other
