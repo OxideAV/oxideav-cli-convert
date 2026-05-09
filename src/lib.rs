@@ -33,6 +33,7 @@
 pub mod args;
 pub mod op;
 pub mod pdf_runner;
+pub mod ping;
 pub mod plan_to_job;
 
 pub use op::{AlphaOp, ConvertPlan, Dither, Op, PrintfTemplate};
@@ -46,6 +47,15 @@ use oxideav_core::{Error, RuntimeContext};
 /// pass a narrower set.
 pub fn run(args: &[String], ctx: &RuntimeContext) -> Result<(), Error> {
     let plan = args::parse(args)?;
+
+    // `-ping` short-circuits everything: print one IM-format header
+    // line per "image" (page / video stream) to stdout and exit
+    // without any pixel decode or output write. Routed BEFORE the PDF
+    // side-channel so the ping module owns the PDF-vs-container split
+    // for itself.
+    if plan.ping {
+        return ping::run(&plan, ctx);
+    }
 
     // Side-channel: PDF inputs go through a Scene-aware runner that
     // bypasses the regular FrameSource pipeline. PDF pages don't fit

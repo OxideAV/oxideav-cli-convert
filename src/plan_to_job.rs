@@ -207,6 +207,7 @@ mod tests {
             ops,
             output: "out.jpg".into(),
             output_template: None,
+            ping: false,
         }
     }
 

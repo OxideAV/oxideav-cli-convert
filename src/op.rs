@@ -195,11 +195,16 @@ pub struct ConvertPlan {
     pub input_pages: Option<PageSelector>,
     /// Chain of operations in source order.
     pub ops: Vec<Op>,
-    /// Output path (literal).
+    /// Output path (literal). Empty string when `ping` is on and the
+    /// caller omitted it.
     pub output: String,
     /// Parsed printf template if `output` contains `%[0-9]*d`. Used by
     /// the convert runner to fan out per-page when the input is a
     /// Scene-shaped source (PDF) and the output codec doesn't natively
     /// accept Scenes.
     pub output_template: Option<PrintfTemplate>,
+    /// `-ping` mode — read only the headers, print one IM-format line
+    /// per "image" (page / video stream) to stdout, skip pixel decode
+    /// and any output write. Output positional becomes optional.
+    pub ping: bool,
 }

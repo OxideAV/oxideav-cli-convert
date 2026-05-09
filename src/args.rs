@@ -32,6 +32,7 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
     let mut ops: Vec<Op> = Vec::new();
     let mut positionals: Vec<String> = Vec::new();
     let mut pending_dither = Dither::None;
+    let mut ping = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -124,6 +125,10 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                 ops.push(Op::Strip);
                 i += 1;
             }
+            "-ping" => {
+                ping = true;
+                i += 1;
+            }
             "-density" => {
                 let v = val(i + 1)?;
                 let n: u32 = v.parse().map_err(|_| {
@@ -185,7 +190,7 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
             "convert: no input file given (usage: convert [-op VALUE]... INPUT [-op VALUE]... OUTPUT)",
         ));
     }
-    if positionals.len() < 2 {
+    if positionals.len() < 2 && !ping {
         return Err(Error::invalid(
             "convert: no output file given (usage: convert [-op VALUE]... INPUT [-op VALUE]... OUTPUT)",
         ));
@@ -199,8 +204,12 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
 
     let (raw_input, input_pages) = split_input_selector(&positionals[0])?;
     let input = translate_input_shorthand(raw_input);
-    let output = positionals[1].clone();
-    let output_template = parse_printf_template(&output)?;
+    let output = positionals.get(1).cloned().unwrap_or_default();
+    let output_template = if output.is_empty() {
+        None
+    } else {
+        parse_printf_template(&output)?
+    };
 
     Ok(ConvertPlan {
         input,
@@ -208,6 +217,7 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
         ops,
         output,
         output_template,
+        ping,
     })
 }
 
@@ -654,6 +664,33 @@ mod tests {
     fn parse_leaves_output_template_none_for_literal_path() {
         let p = parse(&to_vec(&["in.png", "out.jpg"])).unwrap();
         assert!(p.output_template.is_none());
+    }
+
+    #[test]
+    fn ping_flag_off_by_default() {
+        let p = parse(&to_vec(&["in.png", "out.jpg"])).unwrap();
+        assert!(!p.ping);
+    }
+
+    #[test]
+    fn ping_flag_set_when_present() {
+        let p = parse(&to_vec(&["-ping", "in.png", "out.jpg"])).unwrap();
+        assert!(p.ping);
+    }
+
+    #[test]
+    fn ping_makes_output_optional() {
+        let p = parse(&to_vec(&["-ping", "in.png"])).unwrap();
+        assert!(p.ping);
+        assert_eq!(p.output, "");
+        assert!(p.output_template.is_none());
+    }
+
+    #[test]
+    fn missing_output_without_ping_still_errors() {
+        let err = parse(&to_vec(&["in.png"])).unwrap_err();
+        // Should be Invalid, not Unsupported.
+        assert!(format!("{err:?}").contains("no output file"));
     }
 
     #[test]

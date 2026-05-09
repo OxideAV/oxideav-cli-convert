@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `-ping` flag — read only the headers of the input and print one
+  IM-format line per "image" (page / video stream) to stdout, then
+  exit without decoding pixels or writing any output. Output line
+  shape: `<path> <FORMAT> <W>x<H> <W>x<H>+0+0 <DEPTH>-bit
+  <COLORSPACE> <BYTES>B`. Multi-page PDFs emit one line per selected
+  page with `[N]` suffix. Output positional becomes optional when
+  `-ping` is on.
+- `ping` module with a `PixelFormat` → (depth, colorspace) mapping
+  table covering the common cases (8/10/12/16-bit YUV, RGB, Gray,
+  CMYK, palette, mono).
+- `ConvertPlan::ping: bool`.
+
+### Fixed
+
+- `pdf_runner::encode_bmp` updated for the new `oxideav-bmp 0.1.x`
+  API (`palette: Option<BmpPalette>`, `encode_bmp` returns
+  `(Vec<u8>, EncodedBmpFormat)`). Drive-by — convert had been red on
+  the latest published BMP.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.3...v0.0.4) - 2026-05-03
 
 ### Other
