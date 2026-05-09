@@ -383,3 +383,279 @@ fn pdf_range_selector_fans_out_to_two_pngs() {
     assert!(dir.join("p-0.png").exists());
     assert!(dir.join("p-1.png").exists());
 }
+
+// -------- Round-3 inline geometry / negate ops -------- //
+//
+// Each of these runs the full PDF→PNG path with a new op and checks
+// that the output PNG's IHDR width/height matches what the op should
+// produce. PNG IHDR sits at byte 16 (after the 8-byte signature +
+// 4-byte chunk-length + 4-byte chunk-type "IHDR"); width is bytes
+// 16..20, height 20..24, big-endian.
+
+fn png_dims(bytes: &[u8]) -> (u32, u32) {
+    assert_eq!(&bytes[..4], b"\x89PNG", "not a PNG");
+    let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    (w, h)
+}
+
+#[test]
+fn rotate_90_swaps_output_dimensions() {
+    let dir = temp_dir("rotate-90");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+
+    // First render plain, capture dims.
+    let plain = dir.join("plain.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            plain.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("plain render");
+    let (pw, ph) = png_dims(&fs::read(&plain).unwrap());
+
+    // Now render with -rotate 90; dims should swap.
+    let rotated = dir.join("rotated.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            "-rotate".into(),
+            "90".into(),
+            rotated.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("rotate render");
+    let (rw, rh) = png_dims(&fs::read(&rotated).unwrap());
+    assert_eq!((rw, rh), (ph, pw), "rotate 90 should swap dims");
+}
+
+#[test]
+fn rotate_180_preserves_output_dimensions() {
+    let dir = temp_dir("rotate-180");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+
+    let plain = dir.join("plain.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            plain.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("plain render");
+    let (pw, ph) = png_dims(&fs::read(&plain).unwrap());
+
+    let rotated = dir.join("rotated.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            "-rotate".into(),
+            "180".into(),
+            rotated.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("rotate 180 render");
+    let (rw, rh) = png_dims(&fs::read(&rotated).unwrap());
+    assert_eq!((rw, rh), (pw, ph), "rotate 180 should preserve dims");
+}
+
+#[test]
+fn flip_and_flop_preserve_output_dimensions() {
+    let dir = temp_dir("flip-flop");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+
+    let plain = dir.join("plain.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            plain.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("plain render");
+    let plain_bytes = fs::read(&plain).unwrap();
+    let (pw, ph) = png_dims(&plain_bytes);
+
+    let flipped = dir.join("flipped.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            "-flip".into(),
+            "-flop".into(),
+            flipped.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("flip+flop render");
+    let flipped_bytes = fs::read(&flipped).unwrap();
+    let (fw, fh) = png_dims(&flipped_bytes);
+    assert_eq!((fw, fh), (pw, ph), "-flip -flop should preserve dimensions");
+}
+
+#[test]
+fn crop_emits_smaller_output() {
+    let dir = temp_dir("crop");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+
+    // Plain render to capture full dims.
+    let plain = dir.join("plain.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            plain.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("plain render");
+    let (pw, ph) = png_dims(&fs::read(&plain).unwrap());
+    assert!(pw >= 50 && ph >= 30, "test fixture too small for crop");
+
+    let cropped = dir.join("cropped.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            "-crop".into(),
+            "50x30+0+0".into(),
+            cropped.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("crop render");
+    let (cw, ch) = png_dims(&fs::read(&cropped).unwrap());
+    assert_eq!((cw, ch), (50, 30));
+}
+
+#[test]
+fn crop_out_of_bounds_errors_cleanly() {
+    let dir = temp_dir("crop-oob");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("out.png");
+    let err = oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            "-crop".into(),
+            "10000x10000+0+0".into(),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("exceeds input"),
+        "expected exceeds-input message, got: {msg}"
+    );
+}
+
+#[test]
+fn negate_runs_through_full_pipeline() {
+    // Just check it returns Ok and the file is a valid PNG with the
+    // unchanged dimensions of the plain render. Pixel-level negate
+    // correctness is covered by the unit tests in pixel_xform.
+    let dir = temp_dir("negate");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+
+    let plain = dir.join("plain.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            plain.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("plain render");
+    let plain_bytes = fs::read(&plain).unwrap();
+
+    let negated = dir.join("negated.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            "-negate".into(),
+            negated.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("negate render");
+    let negated_bytes = fs::read(&negated).unwrap();
+
+    assert_eq!(png_dims(&plain_bytes), png_dims(&negated_bytes));
+    // The two encoded PNGs must NOT byte-match — negate would produce
+    // different pixel data, so the deflate-compressed IDAT chunks
+    // differ.
+    assert_ne!(
+        plain_bytes, negated_bytes,
+        "-negate produced byte-identical output (suggests it didn't run)"
+    );
+}
+
+#[test]
+fn rotate_90_then_270_round_trips_dims() {
+    // Chained ops in source order: 90° then 270° should be the
+    // identity. Spot-check the dims survive.
+    let dir = temp_dir("rotate-roundtrip");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+
+    let plain = dir.join("plain.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            plain.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("plain render");
+    let (pw, ph) = png_dims(&fs::read(&plain).unwrap());
+
+    let rt = dir.join("rt.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            "-rotate".into(),
+            "90".into(),
+            "-rotate".into(),
+            "270".into(),
+            rt.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("90+270 render");
+    let (rw, rh) = png_dims(&fs::read(&rt).unwrap());
+    assert_eq!((rw, rh), (pw, ph));
+}

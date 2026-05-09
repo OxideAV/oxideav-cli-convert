@@ -154,15 +154,46 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                 ops.push(Op::Alpha(a));
                 i += 2;
             }
+            "-rotate" => {
+                let v = val(i + 1)?;
+                let n: i32 = v.parse().map_err(|_| {
+                    Error::invalid(format!("convert: -rotate: '{v}' is not an integer"))
+                })?;
+                // Round-1 supports only quarter-turn rotations.
+                // Other angles need a real resampler (bilinear / lanczos
+                // sample at non-integer coordinates), which we'll wire
+                // through oxideav-image-filter once it lands.
+                if !matches!(n, 90 | 180 | 270 | -90 | -180 | -270) {
+                    return Err(Error::invalid(format!(
+                        "convert: -rotate: only multiples of 90 supported (got {n})"
+                    )));
+                }
+                ops.push(Op::Rotate { degrees: n });
+                i += 2;
+            }
+            "-flip" => {
+                ops.push(Op::Flip);
+                i += 1;
+            }
+            "-flop" => {
+                ops.push(Op::Flop);
+                i += 1;
+            }
+            "-negate" => {
+                ops.push(Op::Negate);
+                i += 1;
+            }
+            "-crop" => {
+                let v = val(i + 1)?;
+                let (w, h, x, y) =
+                    parse_crop(v).map_err(|e| Error::invalid(format!("convert: -crop: {e}")))?;
+                ops.push(Op::Crop { x, y, w, h });
+                i += 2;
+            }
             // Known IM ops we don't yet have a primitive for. Friendly
             // message so users know what's missing, not a generic
             // parse failure.
-            "-rotate"
-            | "-crop"
-            | "-flip"
-            | "-flop"
-            | "-negate"
-            | "-brightness-contrast"
+            "-brightness-contrast"
             | "-contrast"
             | "-gamma"
             | "-sepia"
@@ -436,6 +467,47 @@ fn parse_wxh(s: &str) -> Result<(u32, u32), String> {
     Ok((w, h))
 }
 
+/// Parse `-crop WxH+X+Y` (and the simpler `WxH+X+Y` permutations IM
+/// also accepts). All four numbers are required; IM-style geometry
+/// modifiers (`%`, `!`, `^`, `<`, `>`, `@`, `-X-Y` negative offsets)
+/// are NOT yet supported in round-1 — they'd need centering / aspect
+/// math we don't have. Bbox bounds checking against the actual image
+/// dims happens at apply time, not here.
+fn parse_crop(s: &str) -> Result<(u32, u32, u32, u32), String> {
+    // Reject IM modifiers up front with a clear message, otherwise
+    // they'd be silently swallowed by parse() of `0` etc.
+    for mark in ['%', '!', '^', '<', '>', '@'] {
+        if s.contains(mark) {
+            return Err(format!(
+                "'{s}' uses IM modifier '{mark}' (round-1 supports plain WxH+X+Y only)"
+            ));
+        }
+    }
+    // IM also accepts `-X` for negative offsets; round-1 sticks to
+    // `+X+Y` only.
+    let mut parts = s.split('+');
+    let wh = parts
+        .next()
+        .ok_or_else(|| format!("'{s}' is missing the WxH component"))?;
+    let x_str = parts
+        .next()
+        .ok_or_else(|| format!("'{s}' is missing the +X offset (expected WxH+X+Y)"))?;
+    let y_str = parts
+        .next()
+        .ok_or_else(|| format!("'{s}' is missing the +Y offset (expected WxH+X+Y)"))?;
+    if parts.next().is_some() {
+        return Err(format!("'{s}' has more than two `+` separators"));
+    }
+    let (w, h) = parse_wxh(wh)?;
+    let x: u32 = x_str
+        .parse()
+        .map_err(|_| format!("'{x_str}' is not a non-negative integer X offset"))?;
+    let y: u32 = y_str
+        .parse()
+        .map_err(|_| format!("'{y_str}' is not a non-negative integer Y offset"))?;
+    Ok((w, h, x, y))
+}
+
 /// Parse `-blur RxS` or `-blur R`. When sigma is omitted we follow
 /// IM's convention of `sigma = radius / 2.0`. Unlike IM we don't
 /// accept floats for radius — `Blur::new` takes `u32`.
@@ -540,9 +612,92 @@ mod tests {
     }
 
     #[test]
-    fn rotate_is_unsupported() {
-        let err = parse(&to_vec(&["a.png", "-rotate", "90", "b.png"])).unwrap_err();
-        assert!(format!("{err:?}").contains("-rotate is not yet implemented"));
+    fn rotate_90_parses() {
+        let p = parse(&to_vec(&["a.png", "-rotate", "90", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Rotate { degrees: 90 }]);
+    }
+
+    #[test]
+    fn rotate_negative_270_parses() {
+        let p = parse(&to_vec(&["a.png", "-rotate", "-270", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Rotate { degrees: -270 }]);
+    }
+
+    #[test]
+    fn rotate_45_rejected() {
+        let err = parse(&to_vec(&["a.png", "-rotate", "45", "b.png"])).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("only multiples of 90 supported"),
+            "unexpected message: {msg}"
+        );
+        assert!(msg.contains("got 45"));
+    }
+
+    #[test]
+    fn rotate_non_integer_rejected() {
+        let err = parse(&to_vec(&["a.png", "-rotate", "abc", "b.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("not an integer"));
+    }
+
+    #[test]
+    fn flip_and_flop_are_valueless() {
+        let p = parse(&to_vec(&["a.png", "-flip", "-flop", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Flip, Op::Flop]);
+    }
+
+    #[test]
+    fn negate_is_valueless() {
+        let p = parse(&to_vec(&["a.png", "-negate", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Negate]);
+    }
+
+    #[test]
+    fn crop_basic() {
+        let p = parse(&to_vec(&["a.png", "-crop", "10x20+3+4", "b.png"])).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::Crop {
+                x: 3,
+                y: 4,
+                w: 10,
+                h: 20
+            }]
+        );
+    }
+
+    #[test]
+    fn crop_zero_offset() {
+        let p = parse(&to_vec(&["a.png", "-crop", "32x32+0+0", "b.png"])).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::Crop {
+                x: 0,
+                y: 0,
+                w: 32,
+                h: 32
+            }]
+        );
+    }
+
+    #[test]
+    fn crop_missing_offset_rejected() {
+        let err = parse(&to_vec(&["a.png", "-crop", "32x32", "b.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("missing the +X offset"));
+    }
+
+    #[test]
+    fn crop_im_modifier_rejected() {
+        let err = parse(&to_vec(&["a.png", "-crop", "50%+0+0", "b.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("IM modifier"));
+    }
+
+    #[test]
+    fn brightness_contrast_still_unsupported() {
+        // Round-1 leaves these for a future round once
+        // oxideav-image-filter publishes their factories.
+        let err = parse(&to_vec(&["a.png", "-brightness-contrast", "10x5", "b.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("-brightness-contrast is not yet implemented"));
     }
 
     #[test]

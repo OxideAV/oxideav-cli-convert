@@ -34,6 +34,7 @@ pub mod args;
 pub mod op;
 pub mod pdf_runner;
 pub mod ping;
+pub mod pixel_xform;
 pub mod plan_to_job;
 
 pub use op::{AlphaOp, ConvertPlan, Dither, Op, PrintfTemplate};

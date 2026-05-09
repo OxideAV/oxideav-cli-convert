@@ -103,6 +103,23 @@ pub enum Op {
     Background([u8; 4]),
     /// `-alpha SUBCOMMAND` — see [`AlphaOp`].
     Alpha(AlphaOp),
+    /// `-rotate N` — rotate by N degrees. Round-1 supports only
+    /// multiples of 90 (90/180/270 and the negatives). Other angles
+    /// are rejected by the args parser with a "only multiples of 90
+    /// supported" message.
+    Rotate { degrees: i32 },
+    /// `-flip` — vertical flip (reverse row order).
+    Flip,
+    /// `-flop` — horizontal flip (reverse column order within each row).
+    Flop,
+    /// `-crop WxH+X+Y` — extract a `WxH` bounding box at offset `(X,Y)`.
+    /// The args parser accepts the IM grammar; runtime checks that the
+    /// bbox fits inside the input dimensions and errors cleanly when
+    /// it doesn't.
+    Crop { x: u32, y: u32, w: u32, h: u32 },
+    /// `-negate` — per-pixel `out = 255 - in` on the colour channels;
+    /// alpha (when present) is unchanged.
+    Negate,
 }
 
 /// A printf-style multi-output template. Detected by the args parser

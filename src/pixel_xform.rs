@@ -1,0 +1,543 @@
+//! Inline pixel transforms for the IM-style geometry / negate ops.
+//!
+//! Round-1 covers the "no resampler needed" subset:
+//! `-rotate {±90,±180,±270}`, `-flip`, `-flop`, `-crop WxH+X+Y`,
+//! `-negate`. They all reduce to either:
+//!
+//! - a per-pixel 1:1 substitution (negate), or
+//! - a row/column reshuffle (flip / flop / quarter-turn rotate / crop).
+//!
+//! Each transform takes ownership of an [`RgbaImage`] (3- or 4-byte
+//! packed) and returns a re-laid-out image.  Width/height/stride are
+//! recomputed at each step so a chained call sequence Just Works
+//! (`flip` → `rotate 90` → `crop` walks a coherent buffer at every
+//! stage).
+//!
+//! The module is consumed by [`crate::pdf_runner`] today; once the
+//! non-PDF pipeline path grows the same hook the executor will call
+//! straight in here too.
+
+use crate::op::Op;
+use crate::pdf_runner::RgbaImage;
+
+/// Bytes per packed pixel (3 = Rgb24, 4 = Rgba). Computed off
+/// `stride / width` since `RgbaImage` doesn't carry the format tag
+/// directly.
+fn bpp(img: &RgbaImage) -> usize {
+    let w = img.width as usize;
+    if w == 0 {
+        // Defensive: a zero-width image can't be transformed; treat
+        // it as RGBA so downstream array math doesn't divide by zero.
+        return 4;
+    }
+    img.stride / w
+}
+
+/// Apply each `Op` in source order, mutating `img` in place where
+/// possible and re-allocating where the layout changes (rotate/crop).
+/// Ops the inline path doesn't own (Resize/Blur/Edge/Colors/etc.) are
+/// silently skipped — they're handled upstream / downstream.
+///
+/// Returns `Err` for ops with bounds problems (out-of-range crop bbox)
+/// so the user gets a clean message instead of a panic.
+pub fn apply_pixel_transform_chain(mut img: RgbaImage, ops: &[Op]) -> Result<RgbaImage, String> {
+    for op in ops {
+        match op {
+            Op::Rotate { degrees } => {
+                img = rotate(img, *degrees);
+            }
+            Op::Flip => {
+                flip(&mut img);
+            }
+            Op::Flop => {
+                flop(&mut img);
+            }
+            Op::Crop { x, y, w, h } => {
+                img = crop(img, *x, *y, *w, *h)?;
+            }
+            Op::Negate => {
+                negate(&mut img);
+            }
+            // Other ops aren't ours: rasteriser / encoder / pipeline
+            // applies them.
+            _ => {}
+        }
+    }
+    Ok(img)
+}
+
+/// Vertical flip — reverse row order. Width / height / stride
+/// unchanged.
+pub fn flip(img: &mut RgbaImage) {
+    let h = img.height as usize;
+    if h < 2 {
+        return;
+    }
+    let stride = img.stride;
+    // Swap row i with row (h-1-i). Pulled out into a temp buffer
+    // because Rust borrow checker won't let us index two mutable
+    // slices at once.
+    let mut tmp = vec![0u8; stride];
+    for i in 0..h / 2 {
+        let j = h - 1 - i;
+        let (lo, hi) = img.pixels.split_at_mut(j * stride);
+        let row_i = &mut lo[i * stride..i * stride + stride];
+        let row_j = &mut hi[..stride];
+        tmp.copy_from_slice(row_i);
+        row_i.copy_from_slice(row_j);
+        row_j.copy_from_slice(&tmp);
+    }
+}
+
+/// Horizontal flip — reverse column order within each row.
+pub fn flop(img: &mut RgbaImage) {
+    let w = img.width as usize;
+    let h = img.height as usize;
+    if w < 2 {
+        return;
+    }
+    let bpp = bpp(img);
+    let stride = img.stride;
+    for row in 0..h {
+        let base = row * stride;
+        // Swap pixel at column c with column (w-1-c).
+        for c in 0..w / 2 {
+            let lo = base + c * bpp;
+            let hi = base + (w - 1 - c) * bpp;
+            for k in 0..bpp {
+                img.pixels.swap(lo + k, hi + k);
+            }
+        }
+    }
+}
+
+/// Per-pixel `out = 255 - in` on the colour channels (R/G/B). Alpha
+/// (when present) is left unchanged.
+pub fn negate(img: &mut RgbaImage) {
+    let bpp = bpp(img);
+    if bpp == 4 {
+        for px in img.pixels.chunks_exact_mut(4) {
+            px[0] = 255 - px[0];
+            px[1] = 255 - px[1];
+            px[2] = 255 - px[2];
+            // px[3] (alpha) untouched.
+        }
+    } else {
+        for px in img.pixels.chunks_exact_mut(3) {
+            px[0] = 255 - px[0];
+            px[1] = 255 - px[1];
+            px[2] = 255 - px[2];
+        }
+    }
+}
+
+/// Quarter-turn rotation. `degrees` must be one of `{±90,±180,±270}`.
+/// 90/270 swap width and height (and rebuild the stride).
+pub fn rotate(img: RgbaImage, degrees: i32) -> RgbaImage {
+    // Normalise to {0, 90, 180, 270}. Inputs outside this set are
+    // already rejected by args::parse, so any deviation here is a
+    // contract violation; treat as identity rather than panic.
+    let n = degrees.rem_euclid(360);
+    match n {
+        0 => img,
+        180 => rotate_180(img),
+        90 => rotate_90_cw(img),
+        270 => rotate_270_cw(img),
+        _ => img,
+    }
+}
+
+fn rotate_180(mut img: RgbaImage) -> RgbaImage {
+    flip(&mut img);
+    flop(&mut img);
+    img
+}
+
+fn rotate_90_cw(img: RgbaImage) -> RgbaImage {
+    let w = img.width as usize;
+    let h = img.height as usize;
+    let bpp = bpp(&img);
+    let new_w = h;
+    let new_h = w;
+    let new_stride = new_w * bpp;
+    let mut out = vec![0u8; new_h * new_stride];
+    // Source (x, y) → destination (h - 1 - y, x).
+    for y in 0..h {
+        for x in 0..w {
+            let src = y * img.stride + x * bpp;
+            let dst_x = h - 1 - y;
+            let dst_y = x;
+            let dst = dst_y * new_stride + dst_x * bpp;
+            out[dst..dst + bpp].copy_from_slice(&img.pixels[src..src + bpp]);
+        }
+    }
+    RgbaImage {
+        width: new_w as u32,
+        height: new_h as u32,
+        pixels: out,
+        stride: new_stride,
+    }
+}
+
+fn rotate_270_cw(img: RgbaImage) -> RgbaImage {
+    let w = img.width as usize;
+    let h = img.height as usize;
+    let bpp = bpp(&img);
+    let new_w = h;
+    let new_h = w;
+    let new_stride = new_w * bpp;
+    let mut out = vec![0u8; new_h * new_stride];
+    // Source (x, y) → destination (y, w - 1 - x).
+    for y in 0..h {
+        for x in 0..w {
+            let src = y * img.stride + x * bpp;
+            let dst_x = y;
+            let dst_y = w - 1 - x;
+            let dst = dst_y * new_stride + dst_x * bpp;
+            out[dst..dst + bpp].copy_from_slice(&img.pixels[src..src + bpp]);
+        }
+    }
+    RgbaImage {
+        width: new_w as u32,
+        height: new_h as u32,
+        pixels: out,
+        stride: new_stride,
+    }
+}
+
+/// Extract a `WxH` bbox at offset `(x, y)`. Errors when the bbox runs
+/// past the input dimensions — the caller surfaces the IM-style
+/// "bbox WxH+X+Y exceeds input W'xH'" message verbatim.
+pub fn crop(img: RgbaImage, x: u32, y: u32, w: u32, h: u32) -> Result<RgbaImage, String> {
+    if w == 0 || h == 0 {
+        return Err(format!("bbox {w}x{h}+{x}+{y} has zero width/height"));
+    }
+    let in_w = img.width;
+    let in_h = img.height;
+    let x_end = x
+        .checked_add(w)
+        .ok_or_else(|| format!("bbox {w}x{h}+{x}+{y} arithmetic overflow"))?;
+    let y_end = y
+        .checked_add(h)
+        .ok_or_else(|| format!("bbox {w}x{h}+{x}+{y} arithmetic overflow"))?;
+    if x_end > in_w || y_end > in_h {
+        return Err(format!("bbox {w}x{h}+{x}+{y} exceeds input {in_w}x{in_h}"));
+    }
+    let bpp = bpp(&img);
+    let new_stride = (w as usize) * bpp;
+    let mut out = vec![0u8; (h as usize) * new_stride];
+    for row in 0..(h as usize) {
+        let src_y = (y as usize) + row;
+        let src_x_byte = (x as usize) * bpp;
+        let src_off = src_y * img.stride + src_x_byte;
+        let dst_off = row * new_stride;
+        out[dst_off..dst_off + new_stride]
+            .copy_from_slice(&img.pixels[src_off..src_off + new_stride]);
+    }
+    Ok(RgbaImage {
+        width: w,
+        height: h,
+        pixels: out,
+        stride: new_stride,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a 2x2 RGBA image with a unique colour per pixel so any
+    /// reshuffle is detectable by inspecting one byte per pixel.
+    /// Layout (row-major):
+    ///   (0,0) = [0x10, 0x11, 0x12, 0xff]
+    ///   (1,0) = [0x20, 0x21, 0x22, 0xff]
+    ///   (0,1) = [0x30, 0x31, 0x32, 0xff]
+    ///   (1,1) = [0x40, 0x41, 0x42, 0xff]
+    fn img_2x2_rgba() -> RgbaImage {
+        RgbaImage {
+            width: 2,
+            height: 2,
+            pixels: vec![
+                0x10, 0x11, 0x12, 0xff, 0x20, 0x21, 0x22, 0xff, 0x30, 0x31, 0x32, 0xff, 0x40, 0x41,
+                0x42, 0xff,
+            ],
+            stride: 8,
+        }
+    }
+
+    /// 4x4 checkerboard of two colours — used to probe flip-flop
+    /// idempotence.
+    fn checkerboard_4x4() -> RgbaImage {
+        let a = [0x10, 0x20, 0x30, 0xff];
+        let b = [0xc0, 0xd0, 0xe0, 0xff];
+        let mut data = Vec::with_capacity(64);
+        for y in 0..4 {
+            for x in 0..4 {
+                let p = if (x + y) % 2 == 0 { &a } else { &b };
+                data.extend_from_slice(p);
+            }
+        }
+        RgbaImage {
+            width: 4,
+            height: 4,
+            pixels: data,
+            stride: 16,
+        }
+    }
+
+    fn pixel(img: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
+        let bpp = bpp(img);
+        let off = (y as usize) * img.stride + (x as usize) * bpp;
+        [
+            img.pixels[off],
+            img.pixels[off + 1],
+            img.pixels[off + 2],
+            img.pixels[off + 3],
+        ]
+    }
+
+    // ---- flip / flop ----
+
+    #[test]
+    fn flip_swaps_rows() {
+        let mut img = img_2x2_rgba();
+        flip(&mut img);
+        // Row 0 should now hold what row 1 used to hold.
+        assert_eq!(pixel(&img, 0, 0), [0x30, 0x31, 0x32, 0xff]);
+        assert_eq!(pixel(&img, 1, 0), [0x40, 0x41, 0x42, 0xff]);
+        assert_eq!(pixel(&img, 0, 1), [0x10, 0x11, 0x12, 0xff]);
+        assert_eq!(pixel(&img, 1, 1), [0x20, 0x21, 0x22, 0xff]);
+    }
+
+    #[test]
+    fn flop_swaps_columns() {
+        let mut img = img_2x2_rgba();
+        flop(&mut img);
+        assert_eq!(pixel(&img, 0, 0), [0x20, 0x21, 0x22, 0xff]);
+        assert_eq!(pixel(&img, 1, 0), [0x10, 0x11, 0x12, 0xff]);
+        assert_eq!(pixel(&img, 0, 1), [0x40, 0x41, 0x42, 0xff]);
+        assert_eq!(pixel(&img, 1, 1), [0x30, 0x31, 0x32, 0xff]);
+    }
+
+    #[test]
+    fn flip_is_self_inverse() {
+        let original = img_2x2_rgba().pixels.clone();
+        let mut img = img_2x2_rgba();
+        flip(&mut img);
+        flip(&mut img);
+        assert_eq!(img.pixels, original);
+    }
+
+    #[test]
+    fn flip_then_flop_equals_rotate_180() {
+        let original = checkerboard_4x4();
+        // Checkerboard: every diagonal alternation means rotating 180°
+        // produces the SAME pattern (the 4x4 is symmetric under that
+        // shuffle). Confirm flip+flop matches.
+        let mut a = checkerboard_4x4();
+        flip(&mut a);
+        flop(&mut a);
+        assert_eq!(
+            a.pixels, original.pixels,
+            "flip+flop on a checkerboard should round-trip back to itself"
+        );
+        // And independently confirm rotate(180) does the same.
+        let b = rotate(checkerboard_4x4(), 180);
+        assert_eq!(b.pixels, original.pixels);
+    }
+
+    // ---- rotate ----
+
+    #[test]
+    fn rotate_90_swaps_dims() {
+        let img = img_2x2_rgba();
+        let r = rotate(img, 90);
+        assert_eq!(r.width, 2);
+        assert_eq!(r.height, 2);
+        // (0,0) of the source ends up at (h-1, 0) = (1, 0) after 90°cw.
+        assert_eq!(pixel(&r, 1, 0), [0x10, 0x11, 0x12, 0xff]);
+        // (1,0) → (1, 1).
+        assert_eq!(pixel(&r, 1, 1), [0x20, 0x21, 0x22, 0xff]);
+        // (0,1) → (0, 0).
+        assert_eq!(pixel(&r, 0, 0), [0x30, 0x31, 0x32, 0xff]);
+        // (1,1) → (0, 1).
+        assert_eq!(pixel(&r, 0, 1), [0x40, 0x41, 0x42, 0xff]);
+    }
+
+    #[test]
+    fn rotate_90_then_270_round_trips() {
+        let original = img_2x2_rgba().pixels.clone();
+        let r = rotate(rotate(img_2x2_rgba(), 90), 270);
+        assert_eq!(r.pixels, original);
+        assert_eq!(r.width, 2);
+        assert_eq!(r.height, 2);
+    }
+
+    #[test]
+    fn rotate_180_preserves_dims() {
+        let r = rotate(img_2x2_rgba(), 180);
+        assert_eq!(r.width, 2);
+        assert_eq!(r.height, 2);
+        assert_eq!(pixel(&r, 1, 1), [0x10, 0x11, 0x12, 0xff]);
+        assert_eq!(pixel(&r, 0, 0), [0x40, 0x41, 0x42, 0xff]);
+    }
+
+    #[test]
+    fn rotate_negative_90_equals_270() {
+        let a = rotate(img_2x2_rgba(), -90);
+        let b = rotate(img_2x2_rgba(), 270);
+        assert_eq!(a.pixels, b.pixels);
+        assert_eq!((a.width, a.height), (b.width, b.height));
+    }
+
+    #[test]
+    fn rotate_360_is_identity() {
+        let original = img_2x2_rgba().pixels.clone();
+        let r = rotate(img_2x2_rgba(), -360);
+        assert_eq!(r.pixels, original);
+    }
+
+    #[test]
+    fn rotate_90_on_non_square_swaps_width_and_height() {
+        // 3 wide × 1 tall RGBA strip.
+        let img = RgbaImage {
+            width: 3,
+            height: 1,
+            pixels: vec![0xaa, 0, 0, 0xff, 0xbb, 0, 0, 0xff, 0xcc, 0, 0, 0xff],
+            stride: 12,
+        };
+        let r = rotate(img, 90);
+        assert_eq!(r.width, 1);
+        assert_eq!(r.height, 3);
+        // Rows top-to-bottom should be the original columns
+        // right-to-left: cc, bb, aa.
+        assert_eq!(pixel(&r, 0, 0), [0xaa, 0, 0, 0xff]);
+        assert_eq!(pixel(&r, 0, 1), [0xbb, 0, 0, 0xff]);
+        assert_eq!(pixel(&r, 0, 2), [0xcc, 0, 0, 0xff]);
+    }
+
+    // ---- crop ----
+
+    #[test]
+    fn crop_extracts_inner_pixel() {
+        let img = img_2x2_rgba();
+        let c = crop(img, 1, 1, 1, 1).unwrap();
+        assert_eq!(c.width, 1);
+        assert_eq!(c.height, 1);
+        assert_eq!(c.pixels, vec![0x40, 0x41, 0x42, 0xff]);
+    }
+
+    #[test]
+    fn crop_full_image_is_identity() {
+        let img = img_2x2_rgba();
+        let original = img.pixels.clone();
+        let c = crop(img, 0, 0, 2, 2).unwrap();
+        assert_eq!(c.pixels, original);
+        assert_eq!((c.width, c.height), (2, 2));
+    }
+
+    #[test]
+    fn crop_out_of_bounds_errors() {
+        let err = crop(img_2x2_rgba(), 1, 1, 2, 2).unwrap_err();
+        assert!(err.contains("exceeds input"));
+        assert!(err.contains("2x2"));
+    }
+
+    #[test]
+    fn crop_zero_size_errors() {
+        let err = crop(img_2x2_rgba(), 0, 0, 0, 1).unwrap_err();
+        assert!(err.contains("zero width/height"));
+    }
+
+    // ---- negate ----
+
+    #[test]
+    fn negate_inverts_rgb_channels_keeps_alpha() {
+        let mut img = img_2x2_rgba();
+        negate(&mut img);
+        assert_eq!(pixel(&img, 0, 0), [0xef, 0xee, 0xed, 0xff]);
+        assert_eq!(pixel(&img, 1, 0), [0xdf, 0xde, 0xdd, 0xff]);
+        assert_eq!(pixel(&img, 0, 1), [0xcf, 0xce, 0xcd, 0xff]);
+        assert_eq!(pixel(&img, 1, 1), [0xbf, 0xbe, 0xbd, 0xff]);
+    }
+
+    #[test]
+    fn negate_is_self_inverse() {
+        let original = img_2x2_rgba().pixels.clone();
+        let mut img = img_2x2_rgba();
+        negate(&mut img);
+        negate(&mut img);
+        assert_eq!(img.pixels, original);
+    }
+
+    #[test]
+    fn negate_handles_rgb24_no_alpha() {
+        // 1x1 Rgb24 image (stride = 3, no alpha byte).
+        let mut img = RgbaImage {
+            width: 1,
+            height: 1,
+            pixels: vec![0x10, 0x20, 0x30],
+            stride: 3,
+        };
+        negate(&mut img);
+        assert_eq!(img.pixels, vec![0xef, 0xdf, 0xcf]);
+    }
+
+    // ---- chain ----
+
+    #[test]
+    fn apply_chain_runs_in_source_order() {
+        // Negate then flip — the negate should land on the original
+        // pixels and the flip should reorder rows of the negated
+        // image.
+        let img = img_2x2_rgba();
+        let out = apply_pixel_transform_chain(img, &[Op::Negate, Op::Flip]).unwrap();
+        // Original (0,1) was [0x30,0x31,0x32]; negated → [0xcf,0xce,0xcd];
+        // flip moves row 1 to row 0.
+        assert_eq!(pixel(&out, 0, 0), [0xcf, 0xce, 0xcd, 0xff]);
+    }
+
+    #[test]
+    fn apply_chain_flip_flop_round_trips_checkerboard() {
+        let original = checkerboard_4x4();
+        let out = apply_pixel_transform_chain(checkerboard_4x4(), &[Op::Flip, Op::Flop]).unwrap();
+        assert_eq!(out.pixels, original.pixels);
+    }
+
+    #[test]
+    fn apply_chain_skips_unhandled_ops() {
+        // Resize / Blur / Edge / Colors / etc. should pass through
+        // unchanged — they're owned by the pipeline / pdf_runner /
+        // encoder side.
+        let img = img_2x2_rgba();
+        let original = img.pixels.clone();
+        let out = apply_pixel_transform_chain(
+            img,
+            &[
+                Op::Resize {
+                    width: 99,
+                    height: 99,
+                    bang: false,
+                },
+                Op::Strip,
+            ],
+        )
+        .unwrap();
+        assert_eq!(out.pixels, original);
+    }
+
+    #[test]
+    fn apply_chain_propagates_crop_error() {
+        let err = apply_pixel_transform_chain(
+            img_2x2_rgba(),
+            &[Op::Crop {
+                x: 0,
+                y: 0,
+                w: 5,
+                h: 5,
+            }],
+        )
+        .unwrap_err();
+        assert!(err.contains("exceeds input"));
+    }
+}

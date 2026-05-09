@@ -40,6 +40,7 @@ use oxideav_scene::{Page, Scene};
 use oxideav_svg::write_svg;
 
 use crate::op::{AlphaOp, ConvertPlan, Op};
+use crate::pixel_xform::apply_pixel_transform_chain;
 
 /// What kind of output the convert verb is producing — drives the
 /// routing decision in [`run`]. Add new arms when new formats are
@@ -221,11 +222,12 @@ pub fn run(plan: &ConvertPlan) -> Result<()> {
 /// Owned packed RGBA / RGB24 buffer with explicit dimensions. Lives
 /// only long enough to hand off to an encoder. The pixel-format side
 /// is encoded by `stride / width` (4 = Rgba, 3 = Rgb24).
-pub(crate) struct RgbaImage {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) pixels: Vec<u8>,
-    pub(crate) stride: usize,
+#[derive(Debug, Clone)]
+pub struct RgbaImage {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+    pub stride: usize,
 }
 
 impl RgbaImage {
@@ -252,12 +254,19 @@ fn render_page_to_rgba(page: &Page, ops: &[Op]) -> Result<RgbaImage> {
         .into_iter()
         .next()
         .ok_or_else(|| Error::invalid("convert: raster renderer returned no planes"))?;
-    let mut img = RgbaImage {
+    let img = RgbaImage {
         width: width_px,
         height: height_px,
         pixels: plane.data,
         stride: plane.stride,
     };
+
+    // Geometry / negate ops walk between rasterisation and the alpha
+    // grammar. IM applies them in source order; we follow suit.
+    // Crop bbox-out-of-range surfaces here as Error::invalid so the
+    // user sees the IM-style "bbox WxH+X+Y exceeds input W'xH'" line.
+    let mut img = apply_pixel_transform_chain(img, ops)
+        .map_err(|e| Error::invalid(format!("convert: -crop: {e}")))?;
 
     apply_alpha_ops(&mut img, ops, bg_arr);
     Ok(img)

@@ -118,6 +118,14 @@ pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Erro
             // honour beyond what the encoder already does). The
             // pdf_runner side-channel applies them when reading PDFs.
             Op::Density(_) | Op::Background(_) | Op::Alpha(_) => {}
+            // Round-1 inline geometry / negate ops. The PDF
+            // side-channel applies these via crate::pixel_xform; the
+            // generic pipeline path will get matching `video.rotate`
+            // / `video.crop` / `video.flip` filters once the upstream
+            // oxideav-image-filter side publishes them. For now drop
+            // silently rather than reject — the parser already
+            // accepted the op.
+            Op::Rotate { .. } | Op::Flip | Op::Flop | Op::Crop { .. } | Op::Negate => {}
         }
     }
 

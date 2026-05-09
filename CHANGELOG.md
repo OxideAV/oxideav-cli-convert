@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Inline geometry / negate ops on the PDF→raster path:
+  - `-rotate N` for `N ∈ {±90, ±180, ±270}` (other angles rejected
+    cleanly with "only multiples of 90 supported (got N)"). 90/270
+    swap output width and height.
+  - `-flip` — vertical flip (rows reversed).
+  - `-flop` — horizontal flip (columns reversed within each row).
+  - `-crop WxH+X+Y` — extract a `WxH` bbox at offset `(X,Y)`. Bbox
+    that overruns the input dims errors with "bbox WxH+X+Y exceeds
+    input W'xH'". IM geometry modifiers (`%`, `!`, `^`, `<`, `>`, `@`)
+    are rejected with a clear "round-1 supports plain WxH+X+Y only"
+    message.
+  - `-negate` — per-pixel `out = 255 - in` on the colour channels;
+    alpha (when present) is unchanged.
+- `pixel_xform` module exposing the underlying `flip`, `flop`,
+  `negate`, `rotate`, `crop`, and `apply_pixel_transform_chain`
+  primitives so callers can drive the same transforms directly on an
+  `RgbaImage`.
+- `RgbaImage` is now `pub` (was `pub(crate)`) so external callers can
+  build inputs for the pixel-transform primitives.
 - `-ping` flag — read only the headers of the input and print one
   IM-format line per "image" (page / video stream) to stdout, then
   exit without decoding pixels or writing any output. Output line

@@ -23,6 +23,16 @@ rest of the workspace already knows how to do.
 | `-density N` | DPI for vector→raster (default 72; PDF / SVG inputs only) |
 | `-background COLOR` | canvas + alpha-flatten background (CSS L3 named + `#hex` 3/4/6/8) |
 | `-alpha {on\|off\|activate\|deactivate\|remove\|set\|opaque\|transparent}` | full IM grammar |
+| `-rotate N` | quarter-turn only (`N ∈ {±90, ±180, ±270}`); 90/270 swap dims |
+| `-flip` | vertical flip (rows reversed) |
+| `-flop` | horizontal flip (columns reversed) |
+| `-crop WxH+X+Y` | extract bbox; bbox-out-of-range errors cleanly |
+| `-negate` | per-pixel `255 - in` on RGB channels (alpha unchanged) |
+
+The five geometry/negate ops apply on the PDF→raster path today
+(via `pixel_xform`). The non-PDF pipeline path will pick them up
+once `oxideav-image-filter` publishes the matching `video.rotate` /
+`video.flip` / `video.crop` / `video.negate` filters.
 
 Anything else reports `unsupported: convert: -<op> is not yet
 implemented` and exits cleanly — no silent misbehaviour.
