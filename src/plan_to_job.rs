@@ -120,12 +120,131 @@ pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Erro
             Op::Density(_) | Op::Background(_) | Op::Alpha(_) => {}
             // Round-1 inline geometry / negate ops. The PDF
             // side-channel applies these via crate::pixel_xform; the
-            // generic pipeline path will get matching `video.rotate`
-            // / `video.crop` / `video.flip` filters once the upstream
-            // oxideav-image-filter side publishes them. For now drop
-            // silently rather than reject — the parser already
-            // accepted the op.
-            Op::Rotate { .. } | Op::Flip | Op::Flop | Op::Crop { .. } | Op::Negate => {}
+            // generic pipeline path now also wires them through to
+            // the matching `oxideav-image-filter` factory so non-PDF
+            // input paths (PNG/JPG/MP4/…) honour them too.
+            Op::Rotate { degrees } => {
+                chain = wrap(chain, "video.rotate", json!({ "degrees": degrees }));
+            }
+            Op::Flip => {
+                chain = wrap(chain, "video.flip", json!({}));
+            }
+            Op::Flop => {
+                chain = wrap(chain, "video.flop", json!({}));
+            }
+            Op::Crop { x, y, w, h } => {
+                chain = wrap(
+                    chain,
+                    "video.crop",
+                    json!({ "x": x, "y": y, "width": w, "height": h }),
+                );
+            }
+            Op::Negate => {
+                chain = wrap(chain, "video.negate", json!({}));
+            }
+            // ---- Round-next: tonal / colour-grading ops wired to
+            // the matching `oxideav-image-filter` factory. ----
+            Op::Sharpen { radius, sigma } => {
+                chain = wrap(
+                    chain,
+                    "video.sharpen",
+                    json!({ "radius": radius, "sigma": sigma }),
+                );
+            }
+            Op::Unsharp {
+                radius,
+                sigma,
+                amount,
+                threshold,
+            } => {
+                chain = wrap(
+                    chain,
+                    "video.unsharp",
+                    json!({
+                        "radius": radius,
+                        "sigma": sigma,
+                        "amount": amount,
+                        "threshold": threshold,
+                    }),
+                );
+            }
+            Op::Gamma { value } => {
+                chain = wrap(chain, "video.gamma", json!({ "value": value }));
+            }
+            Op::BrightnessContrast {
+                brightness,
+                contrast,
+            } => {
+                chain = wrap(
+                    chain,
+                    "video.brightness-contrast",
+                    json!({ "brightness": brightness, "contrast": contrast }),
+                );
+            }
+            Op::Contrast { delta } => {
+                // IM's bare `-contrast` flag bumps contrast by a single
+                // 5%-of-range step. Multiple `-contrast` accumulate
+                // linearly. Map to the brightness-contrast factory's
+                // contrast-only knob so the executor can fold this into
+                // a single LUT pass alongside any explicit
+                // `-brightness-contrast` already in the chain.
+                let pct = (*delta as f32) * 5.0;
+                chain = wrap(chain, "video.contrast", json!({ "value": pct }));
+            }
+            Op::Sepia { threshold } => {
+                chain = wrap(chain, "video.sepia", json!({ "threshold": threshold }));
+            }
+            Op::Modulate {
+                brightness,
+                saturation,
+                hue,
+            } => {
+                // IM's hue is "percent-of-base around 100" — 0 is
+                // -180°, 100 is identity, 200 is +180°. The
+                // image-filter factory accepts degrees directly via
+                // `hue_degrees`, so translate.
+                let hue_degrees = (hue - 100.0) * 1.8;
+                chain = wrap(
+                    chain,
+                    "video.modulate",
+                    json!({
+                        "brightness": brightness,
+                        "saturation": saturation,
+                        "hue_degrees": hue_degrees,
+                    }),
+                );
+            }
+            Op::Level {
+                black,
+                gamma,
+                white,
+            } => {
+                chain = wrap(
+                    chain,
+                    "video.level",
+                    json!({ "black": black, "gamma": gamma, "white": white }),
+                );
+            }
+            Op::Normalize => {
+                chain = wrap(chain, "video.normalize", json!({}));
+            }
+            Op::Threshold { value } => {
+                chain = wrap(chain, "video.threshold", json!({ "value": value }));
+            }
+            Op::Posterize { levels } => {
+                chain = wrap(chain, "video.posterize", json!({ "levels": levels }));
+            }
+            Op::Solarize { value } => {
+                chain = wrap(chain, "video.solarize", json!({ "value": value }));
+            }
+            Op::Colorspace(cs) => {
+                let lower = cs.to_ascii_lowercase();
+                if lower == "gray" || lower == "grey" {
+                    chain = wrap(chain, "video.grayscale", json!({ "preserve_alpha": true }));
+                }
+                // `rgb` / `srgb` are recorded no-ops — input keeps its
+                // colourspace, downstream encoder converts as needed.
+            }
         }
     }
 
@@ -331,6 +450,606 @@ mod tests {
         assert_eq!(
             codec_for_output(None, "OUT.FOO", &ctx).as_deref(),
             Some("foo_codec")
+        );
+    }
+
+    /// Walk the recursive TrackInput chain and collect every filter
+    /// node's name in source order (innermost first → applied first).
+    fn collect_filter_names(input: &TrackInput) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut cur = input;
+        while let TrackInput::Filter(f) = cur {
+            names.push(f.filter.clone());
+            cur = f.input.as_ref();
+        }
+        names.reverse();
+        names
+    }
+
+    /// Pull out the filter node matching `name` (first match found).
+    fn find_filter<'a>(input: &'a TrackInput, name: &str) -> Option<&'a FilterNode> {
+        let mut cur = input;
+        while let TrackInput::Filter(f) = cur {
+            if f.filter == name {
+                return Some(f);
+            }
+            cur = f.input.as_ref();
+        }
+        None
+    }
+
+    #[test]
+    fn sharpen_wires_to_video_sharpen_factory() {
+        let job = plan_to_job(
+            &plan_with(vec![Op::Sharpen {
+                radius: 2,
+                sigma: 1.0,
+            }]),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.sharpen").expect("video.sharpen node");
+        assert_eq!(f.params["radius"], 2);
+        assert!((f.params["sigma"].as_f64().unwrap() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn unsharp_wires_full_params() {
+        let job = plan_to_job(
+            &plan_with(vec![Op::Unsharp {
+                radius: 3,
+                sigma: 1.5,
+                amount: 0.8,
+                threshold: 7,
+            }]),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.unsharp").expect("video.unsharp node");
+        assert_eq!(f.params["radius"], 3);
+        assert!((f.params["sigma"].as_f64().unwrap() - 1.5).abs() < 1e-6);
+        assert!((f.params["amount"].as_f64().unwrap() - 0.8).abs() < 1e-6);
+        assert_eq!(f.params["threshold"], 7);
+    }
+
+    #[test]
+    fn gamma_wires_value_key() {
+        let job = plan_to_job(&plan_with(vec![Op::Gamma { value: 2.2 }]), &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.gamma").expect("video.gamma node");
+        assert!((f.params["value"].as_f64().unwrap() - 2.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn brightness_contrast_wires_both_keys() {
+        let job = plan_to_job(
+            &plan_with(vec![Op::BrightnessContrast {
+                brightness: 10.0,
+                contrast: -5.0,
+            }]),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.brightness-contrast")
+            .expect("video.brightness-contrast node");
+        assert!((f.params["brightness"].as_f64().unwrap() - 10.0).abs() < 1e-6);
+        assert!((f.params["contrast"].as_f64().unwrap() - (-5.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn contrast_step_translates_to_factor() {
+        let job = plan_to_job(&plan_with(vec![Op::Contrast { delta: 1 }]), &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.contrast").expect("video.contrast node");
+        // delta=1 → 5% contrast bump.
+        assert!((f.params["value"].as_f64().unwrap() - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn modulate_translates_hue_to_degrees() {
+        // IM hue=200 (max) → +180°; hue=0 → -180°; hue=100 → 0°.
+        let job = plan_to_job(
+            &plan_with(vec![Op::Modulate {
+                brightness: 100.0,
+                saturation: 100.0,
+                hue: 200.0,
+            }]),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.modulate").expect("video.modulate node");
+        assert!((f.params["brightness"].as_f64().unwrap() - 100.0).abs() < 1e-6);
+        assert!((f.params["saturation"].as_f64().unwrap() - 100.0).abs() < 1e-6);
+        assert!((f.params["hue_degrees"].as_f64().unwrap() - 180.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn level_wires_all_three_endpoints() {
+        let job = plan_to_job(
+            &plan_with(vec![Op::Level {
+                black: 16,
+                gamma: 1.2,
+                white: 235,
+            }]),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.level").expect("video.level node");
+        assert_eq!(f.params["black"], 16);
+        assert!((f.params["gamma"].as_f64().unwrap() - 1.2).abs() < 1e-6);
+        assert_eq!(f.params["white"], 235);
+    }
+
+    #[test]
+    fn normalize_wires_empty_params() {
+        let job = plan_to_job(&plan_with(vec![Op::Normalize]), &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.normalize").expect("video.normalize node");
+        // Defaults — empty object.
+        assert!(f.params.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn threshold_wires_value() {
+        let job =
+            plan_to_job(&plan_with(vec![Op::Threshold { value: 200 }]), &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.threshold").expect("video.threshold node");
+        assert_eq!(f.params["value"], 200);
+    }
+
+    #[test]
+    fn posterize_wires_levels() {
+        let job = plan_to_job(&plan_with(vec![Op::Posterize { levels: 6 }]), &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.posterize").expect("video.posterize node");
+        assert_eq!(f.params["levels"], 6);
+    }
+
+    #[test]
+    fn solarize_wires_value() {
+        let job = plan_to_job(&plan_with(vec![Op::Solarize { value: 100 }]), &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.solarize").expect("video.solarize node");
+        assert_eq!(f.params["value"], 100);
+    }
+
+    #[test]
+    fn sepia_wires_threshold() {
+        let job =
+            plan_to_job(&plan_with(vec![Op::Sepia { threshold: 0.8 }]), &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.sepia").expect("video.sepia node");
+        assert!((f.params["threshold"].as_f64().unwrap() - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn colorspace_gray_wires_grayscale_factory() {
+        let job = plan_to_job(
+            &plan_with(vec![Op::Colorspace("Gray".into())]),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.grayscale").expect("video.grayscale node");
+        assert_eq!(f.params["preserve_alpha"], true);
+    }
+
+    #[test]
+    fn colorspace_rgb_is_pure_passthrough() {
+        let job =
+            plan_to_job(&plan_with(vec![Op::Colorspace("RGB".into())]), &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        // No filter wrapping the source — `Op::Colorspace("rgb")` is
+        // a recorded no-op.
+        match &track.input {
+            TrackInput::Source(_) => {}
+            other => panic!("expected raw source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rotate_wires_video_rotate_factory() {
+        let job = plan_to_job(&plan_with(vec![Op::Rotate { degrees: 90 }]), &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.rotate").expect("video.rotate node");
+        assert_eq!(f.params["degrees"], 90);
+    }
+
+    #[test]
+    fn flip_flop_wire_independent_factories() {
+        let job = plan_to_job(&plan_with(vec![Op::Flip, Op::Flop]), &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let names = collect_filter_names(&track.input);
+        assert_eq!(
+            names,
+            vec!["video.flip".to_string(), "video.flop".to_string()]
+        );
+    }
+
+    #[test]
+    fn crop_wires_xywh() {
+        let job = plan_to_job(
+            &plan_with(vec![Op::Crop {
+                x: 1,
+                y: 2,
+                w: 10,
+                h: 20,
+            }]),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.crop").expect("video.crop node");
+        assert_eq!(f.params["x"], 1);
+        assert_eq!(f.params["y"], 2);
+        assert_eq!(f.params["width"], 10);
+        assert_eq!(f.params["height"], 20);
+    }
+
+    #[test]
+    fn negate_wires_video_negate_factory() {
+        let job = plan_to_job(&plan_with(vec![Op::Negate]), &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        find_filter(&track.input, "video.negate").expect("video.negate node");
+    }
+
+    /// End-to-end shape check: build a plan with a sharpen op,
+    /// translate to a Job, then take the JSON params we emitted and
+    /// hand them to the **real** image-filter factory (registered in
+    /// the test ctx). The factory must accept them — confirming the
+    /// CLI side speaks the same JSON dialect the registry expects.
+    ///
+    /// NOTE: this verifies the JSON-dialect contract once the new
+    /// image-filter factories land in the published registry. The
+    /// published 0.1.1 image-filter only registers `blur`, `edge`,
+    /// `resize`; the round-next factories (sharpen / gamma / etc.)
+    /// are on master and pending publish. We skip the assertion in
+    /// the standalone-published path to avoid flapping; inside the
+    /// workspace (where image-filter is path-patched to in-tree),
+    /// the assertion runs and proves the contract.
+    #[test]
+    fn sharpen_emitted_params_are_accepted_by_image_filter_registry() {
+        use oxideav_core::{PixelFormat, PortSpec, TimeBase};
+
+        let job = plan_to_job(
+            &plan_with(vec![Op::Sharpen {
+                radius: 1,
+                sigma: 0.5,
+            }]),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.sharpen").expect("video.sharpen node");
+
+        // Stand up a real ctx with the image-filter factories wired.
+        let mut filter_ctx = RuntimeContext::new();
+        oxideav_image_filter::register(&mut filter_ctx);
+
+        // Skip the registry assertion when the build saw an older
+        // image-filter that hasn't published the round-next factories
+        // yet. The `wrap()`-produced JSON is the same in either case.
+        if !filter_ctx.filters.contains("sharpen") {
+            return;
+        }
+
+        // Pretend we're the executor: ask the registry to build a
+        // StreamFilter from the JSON params we just emitted.
+        let inputs = [PortSpec::video(
+            "in",
+            4,
+            4,
+            PixelFormat::Rgba,
+            TimeBase::new(1, 30),
+        )];
+        filter_ctx
+            .filters
+            .make("video.sharpen", &f.params, &inputs)
+            .expect("registry must accept the JSON params we emit");
+    }
+
+    /// Same shape check for every newly-wired round-next factory.
+    /// Driving them all through one test keeps the test count modest
+    /// while still catching the "we emitted a key the factory doesn't
+    /// recognise" class of bugs.
+    ///
+    /// Same caveat as `sharpen_emitted_params_…`: skipped on
+    /// standalone-published until image-filter publishes the new
+    /// factories.
+    #[test]
+    fn every_round_next_op_round_trips_through_image_filter_registry() {
+        use oxideav_core::{PixelFormat, PortSpec, TimeBase};
+
+        // A representative input port; most factories ignore the dim
+        // values but Crop reads `width`/`height` so we use 16x16.
+        let make_inputs = |w: u32, h: u32, fmt: PixelFormat| {
+            [PortSpec::video("in", w, h, fmt, TimeBase::new(1, 30))]
+        };
+
+        let mut filter_ctx = RuntimeContext::new();
+        oxideav_image_filter::register(&mut filter_ctx);
+
+        // Skip the registry-build assertion when the linked image-filter
+        // pre-dates the round-next factories. JSON-shape coverage (the
+        // other tests) still runs.
+        if !filter_ctx.filters.contains("sharpen") {
+            return;
+        }
+
+        // (op, expected filter-id, inputs)
+        let cases: Vec<(Op, &str, [PortSpec; 1])> = vec![
+            (
+                Op::Sharpen {
+                    radius: 1,
+                    sigma: 0.5,
+                },
+                "video.sharpen",
+                make_inputs(4, 4, PixelFormat::Rgba),
+            ),
+            (
+                Op::Unsharp {
+                    radius: 1,
+                    sigma: 0.5,
+                    amount: 1.0,
+                    threshold: 0,
+                },
+                "video.unsharp",
+                make_inputs(4, 4, PixelFormat::Rgba),
+            ),
+            (
+                Op::Gamma { value: 1.8 },
+                "video.gamma",
+                make_inputs(4, 4, PixelFormat::Rgba),
+            ),
+            (
+                Op::BrightnessContrast {
+                    brightness: 10.0,
+                    contrast: -5.0,
+                },
+                "video.brightness-contrast",
+                make_inputs(4, 4, PixelFormat::Rgba),
+            ),
+            (
+                Op::Contrast { delta: 1 },
+                "video.contrast",
+                make_inputs(4, 4, PixelFormat::Rgba),
+            ),
+            (
+                Op::Sepia { threshold: 0.8 },
+                "video.sepia",
+                make_inputs(4, 4, PixelFormat::Rgb24),
+            ),
+            (
+                Op::Modulate {
+                    brightness: 100.0,
+                    saturation: 100.0,
+                    hue: 100.0,
+                },
+                "video.modulate",
+                make_inputs(4, 4, PixelFormat::Rgba),
+            ),
+            (
+                Op::Level {
+                    black: 16,
+                    gamma: 1.2,
+                    white: 235,
+                },
+                "video.level",
+                make_inputs(4, 4, PixelFormat::Gray8),
+            ),
+            (
+                Op::Normalize,
+                "video.normalize",
+                make_inputs(4, 4, PixelFormat::Gray8),
+            ),
+            (
+                Op::Threshold { value: 128 },
+                "video.threshold",
+                make_inputs(4, 4, PixelFormat::Gray8),
+            ),
+            (
+                Op::Posterize { levels: 4 },
+                "video.posterize",
+                make_inputs(4, 4, PixelFormat::Gray8),
+            ),
+            (
+                Op::Solarize { value: 100 },
+                "video.solarize",
+                make_inputs(4, 4, PixelFormat::Gray8),
+            ),
+            (
+                Op::Colorspace("Gray".into()),
+                "video.grayscale",
+                make_inputs(4, 4, PixelFormat::Rgba),
+            ),
+            (
+                Op::Rotate { degrees: 90 },
+                "video.rotate",
+                make_inputs(4, 4, PixelFormat::Rgba),
+            ),
+            (Op::Flip, "video.flip", make_inputs(4, 4, PixelFormat::Rgba)),
+            (Op::Flop, "video.flop", make_inputs(4, 4, PixelFormat::Rgba)),
+            (
+                Op::Crop {
+                    x: 1,
+                    y: 1,
+                    w: 2,
+                    h: 2,
+                },
+                "video.crop",
+                make_inputs(16, 16, PixelFormat::Rgba),
+            ),
+            (
+                Op::Negate,
+                "video.negate",
+                make_inputs(4, 4, PixelFormat::Rgba),
+            ),
+        ];
+
+        for (op, expected_name, inputs) in cases {
+            let job = plan_to_job(&plan_with(vec![op.clone()]), &empty_ctx()).unwrap();
+            let track = &job.outputs.values().next().unwrap().all[0];
+            let f = find_filter(&track.input, expected_name)
+                .unwrap_or_else(|| panic!("expected node {expected_name} for {op:?}"));
+            filter_ctx
+                .filters
+                .make(expected_name, &f.params, &inputs)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "registry rejected emitted params for {op:?}: {e:?} \
+                         (json: {})",
+                        f.params
+                    )
+                });
+        }
+    }
+
+    /// True end-to-end on a 4x4 RGBA fixture: synthesise a frame, run
+    /// it through `image_filter::Sharpen` directly to get the expected
+    /// output bytes, then walk the same JSON params through the
+    /// registry-built filter and compare. This locks down the
+    /// "factory takes the same params we emit" contract at a pixel
+    /// level, not just at a build-success level.
+    ///
+    /// Skipped on standalone-published until the image-filter sharpen
+    /// factory publishes (today's published 0.1.1 doesn't have it).
+    #[test]
+    fn sharpen_4x4_pixel_match_through_registry() {
+        use oxideav_core::{
+            filter::FilterContext, Frame, PixelFormat, PortSpec, Result as CoreResult, TimeBase,
+            VideoFrame, VideoPlane,
+        };
+        use oxideav_image_filter::{ImageFilter, Sharpen, VideoStreamParams};
+
+        // 4x4 RGBA fixture with an obvious horizontal edge so sharpen
+        // produces a visible delta.
+        let make_frame = || {
+            let mut data = Vec::with_capacity(4 * 4 * 4);
+            for _y in 0..4 {
+                for x in 0..4 {
+                    let v = if x < 2 { 60 } else { 200 };
+                    data.extend_from_slice(&[v, v, v, 255]);
+                }
+            }
+            VideoFrame {
+                pts: None,
+                planes: vec![VideoPlane { stride: 16, data }],
+            }
+        };
+
+        // Reference: call the library directly with the same params
+        // the CLI translates `-sharpen 1x0.5` to.
+        let reference = Sharpen::new(1, 0.5)
+            .apply(
+                &make_frame(),
+                VideoStreamParams {
+                    format: PixelFormat::Rgba,
+                    width: 4,
+                    height: 4,
+                },
+            )
+            .expect("library Sharpen apply");
+
+        // Through the registry: build the plan, translate to a Job,
+        // grab the JSON, build the filter via the registry, run.
+        let plan = ConvertPlan {
+            input: "in.png".into(),
+            input_pages: None,
+            ops: vec![Op::Sharpen {
+                radius: 1,
+                sigma: 0.5,
+            }],
+            output: "out.png".into(),
+            output_template: None,
+            ping: false,
+        };
+        let job = plan_to_job(&plan, &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.sharpen").expect("video.sharpen node");
+
+        let mut filter_ctx = RuntimeContext::new();
+        oxideav_image_filter::register(&mut filter_ctx);
+
+        // Skip when the linked image-filter pre-dates the sharpen
+        // factory (published 0.1.1 only registers blur/edge/resize).
+        if !filter_ctx.filters.contains("sharpen") {
+            return;
+        }
+
+        let inputs = [PortSpec::video(
+            "in",
+            4,
+            4,
+            PixelFormat::Rgba,
+            TimeBase::new(1, 30),
+        )];
+        let mut built = filter_ctx
+            .filters
+            .make("video.sharpen", &f.params, &inputs)
+            .expect("factory build");
+
+        struct Collect {
+            out: Vec<Frame>,
+        }
+        impl FilterContext for Collect {
+            fn emit(&mut self, _port: usize, frame: Frame) -> CoreResult<()> {
+                self.out.push(frame);
+                Ok(())
+            }
+        }
+        let mut col = Collect { out: Vec::new() };
+        built
+            .push(&mut col, 0, &Frame::Video(make_frame()))
+            .expect("filter push");
+        let registry_out = match col.out.into_iter().next().unwrap() {
+            Frame::Video(v) => v,
+            other => panic!("expected video frame, got {other:?}"),
+        };
+
+        // Pixel-exact match: same params, same input → same output.
+        assert_eq!(
+            registry_out.planes[0].data, reference.planes[0].data,
+            "registry-built sharpen must match library Sharpen byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn long_chain_preserves_source_order() {
+        // Sanity that all the new filters interleave with existing
+        // ones in source order (innermost = first parsed).
+        let job = plan_to_job(
+            &plan_with(vec![
+                Op::Resize {
+                    width: 64,
+                    height: 64,
+                    bang: false,
+                },
+                Op::Sharpen {
+                    radius: 1,
+                    sigma: 0.5,
+                },
+                Op::Gamma { value: 1.8 },
+                Op::Negate,
+            ]),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let names = collect_filter_names(&track.input);
+        assert_eq!(
+            names,
+            vec![
+                "video.resize".to_string(),
+                "video.sharpen".to_string(),
+                "video.gamma".to_string(),
+                "video.negate".to_string(),
+            ]
         );
     }
 

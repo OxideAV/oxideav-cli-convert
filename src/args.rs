@@ -190,23 +190,132 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                 ops.push(Op::Crop { x, y, w, h });
                 i += 2;
             }
-            // Known IM ops we don't yet have a primitive for. Friendly
-            // message so users know what's missing, not a generic
-            // parse failure.
-            "-brightness-contrast"
-            | "-contrast"
-            | "-gamma"
-            | "-sepia"
-            | "-modulate"
-            | "-colorspace"
-            | "-level"
-            | "-normalize"
-            | "-sharpen"
-            | "-unsharp"
-            | "-threshold" => {
-                return Err(Error::unsupported(format!(
-                    "convert: {flag} is not yet implemented"
-                )));
+            // ---- Round-next: IM-style image-filter flags wired
+            // through to the matching `oxideav-image-filter` factory. ----
+            "-sharpen" => {
+                let v = val(i + 1)?;
+                let (radius, sigma) =
+                    parse_blur(v).map_err(|e| Error::invalid(format!("convert: -sharpen: {e}")))?;
+                ops.push(Op::Sharpen { radius, sigma });
+                i += 2;
+            }
+            "-unsharp" => {
+                let v = val(i + 1)?;
+                let (radius, sigma, amount, threshold) = parse_unsharp(v)
+                    .map_err(|e| Error::invalid(format!("convert: -unsharp: {e}")))?;
+                ops.push(Op::Unsharp {
+                    radius,
+                    sigma,
+                    amount,
+                    threshold,
+                });
+                i += 2;
+            }
+            "-gamma" => {
+                let v = val(i + 1)?;
+                let g: f32 = v.parse().map_err(|_| {
+                    Error::invalid(format!("convert: -gamma: '{v}' is not a finite float"))
+                })?;
+                if !g.is_finite() || g <= 0.0 {
+                    return Err(Error::invalid(format!(
+                        "convert: -gamma: value must be > 0 (got {g})"
+                    )));
+                }
+                ops.push(Op::Gamma { value: g });
+                i += 2;
+            }
+            "-brightness-contrast" => {
+                let v = val(i + 1)?;
+                let (b, c) = parse_brightness_contrast(v)
+                    .map_err(|e| Error::invalid(format!("convert: -brightness-contrast: {e}")))?;
+                ops.push(Op::BrightnessContrast {
+                    brightness: b,
+                    contrast: c,
+                });
+                i += 2;
+            }
+            "-contrast" => {
+                // IM's `-contrast` takes no arg and applies a single
+                // small contrast bump. Repeated `-contrast` accumulates.
+                ops.push(Op::Contrast { delta: 1 });
+                i += 1;
+            }
+            "-sepia" => {
+                let v = val(i + 1)?;
+                let t = parse_percent_or_unit(v)
+                    .map_err(|e| Error::invalid(format!("convert: -sepia: {e}")))?;
+                ops.push(Op::Sepia { threshold: t });
+                i += 2;
+            }
+            "-modulate" => {
+                let v = val(i + 1)?;
+                let (b, s, h) = parse_modulate(v)
+                    .map_err(|e| Error::invalid(format!("convert: -modulate: {e}")))?;
+                ops.push(Op::Modulate {
+                    brightness: b,
+                    saturation: s,
+                    hue: h,
+                });
+                i += 2;
+            }
+            "-level" => {
+                let v = val(i + 1)?;
+                let (b, g, w) =
+                    parse_level(v).map_err(|e| Error::invalid(format!("convert: -level: {e}")))?;
+                ops.push(Op::Level {
+                    black: b,
+                    gamma: g,
+                    white: w,
+                });
+                i += 2;
+            }
+            "-normalize" => {
+                ops.push(Op::Normalize);
+                i += 1;
+            }
+            "-threshold" => {
+                let v = val(i + 1)?;
+                let n = parse_threshold_pct(v)
+                    .map_err(|e| Error::invalid(format!("convert: -threshold: {e}")))?;
+                ops.push(Op::Threshold { value: n });
+                i += 2;
+            }
+            "-posterize" => {
+                let v = val(i + 1)?;
+                let n: u32 = v.parse().map_err(|_| {
+                    Error::invalid(format!(
+                        "convert: -posterize: '{v}' is not a non-negative integer"
+                    ))
+                })?;
+                if n < 2 {
+                    return Err(Error::invalid(format!(
+                        "convert: -posterize: levels must be >= 2 (got {n})"
+                    )));
+                }
+                ops.push(Op::Posterize { levels: n });
+                i += 2;
+            }
+            "-solarize" => {
+                let v = val(i + 1)?;
+                let n = parse_threshold_pct(v)
+                    .map_err(|e| Error::invalid(format!("convert: -solarize: {e}")))?;
+                ops.push(Op::Solarize { value: n });
+                i += 2;
+            }
+            "-colorspace" => {
+                let v = val(i + 1)?;
+                let cs = v.trim().to_string();
+                // Round-1 only routes `gray`/`grey` to the grayscale
+                // factory; other colourspaces become a recorded no-op
+                // (the input keeps its native colourspace).
+                let lower = cs.to_ascii_lowercase();
+                if !matches!(lower.as_str(), "gray" | "grey" | "rgb" | "srgb") {
+                    return Err(Error::unsupported(format!(
+                        "convert: -colorspace '{cs}' is not yet wired (round-1 supports gray/grey/rgb/srgb)"
+                    )));
+                }
+                ops.push(Op::Colorspace(cs));
+                i += 2;
             }
             other => {
                 // Reach here only on `-`-prefixed args (non-`-` was
@@ -528,6 +637,173 @@ fn parse_blur(s: &str) -> Result<(u32, f32), String> {
     Ok((radius, sigma))
 }
 
+/// Parse `-unsharp RxS+amount+threshold` (any subset accepted in
+/// source order: `R`, `RxS`, `RxS+A`, `RxS+A+T`).
+///
+/// Defaults match `oxideav_image_filter::Unsharp`'s conventions:
+/// sigma = radius/2, amount = 1.0, threshold = 0 (out of 255).
+fn parse_unsharp(s: &str) -> Result<(u32, f32, f32, u8), String> {
+    // `+` separates the three optional tail components. Keep the
+    // first chunk (radius / sigma) intact.
+    let mut parts = s.splitn(3, '+');
+    let head = parts.next().unwrap_or(s);
+    let amount_str = parts.next();
+    let threshold_str = parts.next();
+    let (radius, sigma) = parse_blur(head)?;
+    let amount: f32 = match amount_str {
+        Some(a) => a
+            .parse()
+            .map_err(|_| format!("'{a}' is not a finite float"))?,
+        None => 1.0,
+    };
+    let threshold: u8 = match threshold_str {
+        // IM lets the threshold be either an integer 0..=255 or a
+        // percentage. Accept both shapes; cap to u8.
+        Some(t) => parse_threshold_pct(t)?,
+        None => 0,
+    };
+    Ok((radius, sigma, amount, threshold))
+}
+
+/// Parse `-brightness-contrast B[xC]` / `B[,C]` / `B`. IM uses both
+/// `x` and `,` as separators in different docs; accept either.
+/// Range is `[-100..=100]` per IM.
+fn parse_brightness_contrast(s: &str) -> Result<(f32, f32), String> {
+    let (bs, cs) = match s.split_once(['x', 'X', ',']) {
+        Some((a, b)) => (a, Some(b)),
+        None => (s, None),
+    };
+    let b: f32 = bs
+        .parse()
+        .map_err(|_| format!("'{bs}' is not a finite float"))?;
+    let c: f32 = match cs {
+        Some(s) if !s.is_empty() => s
+            .parse()
+            .map_err(|_| format!("'{s}' is not a finite float"))?,
+        _ => 0.0,
+    };
+    if !(-100.0..=100.0).contains(&b) {
+        return Err(format!("brightness {b} out of range (-100..=100)"));
+    }
+    if !(-100.0..=100.0).contains(&c) {
+        return Err(format!("contrast {c} out of range (-100..=100)"));
+    }
+    Ok((b, c))
+}
+
+/// Parse a value that's either a percentage (`50%`) or a unit-range
+/// scalar (`0.5`). Used by `-sepia`. Returns the scalar in 0..=1.
+fn parse_percent_or_unit(s: &str) -> Result<f32, String> {
+    let s = s.trim();
+    if let Some(p) = s.strip_suffix('%') {
+        let v: f32 = p
+            .parse()
+            .map_err(|_| format!("'{p}' is not a finite float"))?;
+        if !(0.0..=100.0).contains(&v) {
+            return Err(format!("'{s}' is out of range (0%..=100%)"));
+        }
+        return Ok(v / 100.0);
+    }
+    let v: f32 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a finite float"))?;
+    if !(0.0..=1.0).contains(&v) {
+        return Err(format!("'{s}' is out of range (0.0..=1.0)"));
+    }
+    Ok(v)
+}
+
+/// Parse `-modulate B[,S[,H]]`. Each element is percent-of-base
+/// (100 = identity). Missing tail elements default to 100 / 100 / 100.
+fn parse_modulate(s: &str) -> Result<(f32, f32, f32), String> {
+    let mut parts = s.split(',').map(|p| p.trim());
+    let b = parts
+        .next()
+        .ok_or_else(|| format!("'{s}' is missing the brightness value"))?;
+    let s_field = parts.next();
+    let h_field = parts.next();
+    if parts.next().is_some() {
+        return Err(format!(
+            "'{s}' has more than 3 components (expected B[,S[,H]])"
+        ));
+    }
+    let bv: f32 = b
+        .parse()
+        .map_err(|_| format!("'{b}' is not a finite float"))?;
+    let sv: f32 = match s_field {
+        Some(t) if !t.is_empty() => t
+            .parse()
+            .map_err(|_| format!("'{t}' is not a finite float"))?,
+        _ => 100.0,
+    };
+    let hv: f32 = match h_field {
+        Some(t) if !t.is_empty() => t
+            .parse()
+            .map_err(|_| format!("'{t}' is not a finite float"))?,
+        _ => 100.0,
+    };
+    Ok((bv, sv, hv))
+}
+
+/// Parse `-level B[/G[/W]]` or `-level B,G,W`. IM accepts both
+/// separators. Black/white are 0..=255 (or `N%` for a percentage).
+/// Gamma is `> 0`.
+fn parse_level(s: &str) -> Result<(u8, f32, u8), String> {
+    let parts: Vec<&str> = s.split(['/', ',']).map(|p| p.trim()).collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return Err(format!("'{s}' is not in B[/G[/W]] form (1..=3 components)"));
+    }
+    let black = parse_byte_or_percent(parts[0])?;
+    let gamma: f32 = if parts.len() >= 2 && !parts[1].is_empty() {
+        let g: f32 = parts[1]
+            .parse()
+            .map_err(|_| format!("'{}' is not a finite float", parts[1]))?;
+        if !g.is_finite() || g <= 0.0 {
+            return Err(format!("gamma {g} must be > 0"));
+        }
+        g
+    } else {
+        1.0
+    };
+    let white = if parts.len() == 3 && !parts[2].is_empty() {
+        parse_byte_or_percent(parts[2])?
+    } else {
+        255
+    };
+    if black > white {
+        return Err(format!(
+            "black point ({black}) must be <= white point ({white})"
+        ));
+    }
+    Ok((black, gamma, white))
+}
+
+/// Parse `0..=255` or `N%` → byte. Used by `-level`.
+fn parse_byte_or_percent(s: &str) -> Result<u8, String> {
+    if let Some(p) = s.strip_suffix('%') {
+        let v: f32 = p
+            .parse()
+            .map_err(|_| format!("'{p}' is not a finite float"))?;
+        if !(0.0..=100.0).contains(&v) {
+            return Err(format!("'{s}' is out of range (0%..=100%)"));
+        }
+        return Ok((v * 2.55).round().clamp(0.0, 255.0) as u8);
+    }
+    let n: u32 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a non-negative integer"))?;
+    if n > 255 {
+        return Err(format!("'{s}' is out of range (0..=255)"));
+    }
+    Ok(n as u8)
+}
+
+/// Parse `-threshold N%` / `-threshold N` / `-solarize N%` —
+/// returns the resulting 0..=255 byte value.
+fn parse_threshold_pct(s: &str) -> Result<u8, String> {
+    parse_byte_or_percent(s.trim())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,11 +969,286 @@ mod tests {
     }
 
     #[test]
-    fn brightness_contrast_still_unsupported() {
-        // Round-1 leaves these for a future round once
-        // oxideav-image-filter publishes their factories.
-        let err = parse(&to_vec(&["a.png", "-brightness-contrast", "10x5", "b.png"])).unwrap_err();
-        assert!(format!("{err:?}").contains("-brightness-contrast is not yet implemented"));
+    fn sharpen_basic() {
+        let p = parse(&to_vec(&["a.png", "-sharpen", "1x0.5", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Sharpen { radius: 1, sigma }] => assert!((sigma - 0.5).abs() < 1e-6),
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sharpen_radius_only_defaults_sigma() {
+        let p = parse(&to_vec(&["a.png", "-sharpen", "4", "b.png"])).unwrap();
+        // Sigma defaults to radius/2 (matches IM and parse_blur).
+        assert_eq!(
+            p.ops,
+            vec![Op::Sharpen {
+                radius: 4,
+                sigma: 2.0
+            }]
+        );
+    }
+
+    #[test]
+    fn unsharp_full_grammar() {
+        let p = parse(&to_vec(&["a.png", "-unsharp", "2x1.5+0.8+5", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Unsharp {
+                radius: 2,
+                sigma,
+                amount,
+                threshold: 5,
+            }] => {
+                assert!((sigma - 1.5).abs() < 1e-6);
+                assert!((amount - 0.8).abs() < 1e-6);
+            }
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsharp_partial_defaults() {
+        let p = parse(&to_vec(&["a.png", "-unsharp", "3", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Unsharp {
+                radius: 3,
+                sigma,
+                amount,
+                threshold: 0,
+            }] => {
+                assert!((sigma - 1.5).abs() < 1e-6, "sigma = {sigma}");
+                assert!((amount - 1.0).abs() < 1e-6, "amount = {amount}");
+            }
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gamma_basic() {
+        let p = parse(&to_vec(&["a.png", "-gamma", "1.8", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Gamma { value }] => assert!((value - 1.8).abs() < 1e-6),
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gamma_zero_rejected() {
+        let err = parse(&to_vec(&["a.png", "-gamma", "0", "b.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("must be > 0"));
+    }
+
+    #[test]
+    fn gamma_negative_rejected() {
+        let err = parse(&to_vec(&["a.png", "-gamma", "-1.5", "b.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("must be > 0"));
+    }
+
+    #[test]
+    fn brightness_contrast_basic_comma() {
+        let p = parse(&to_vec(&["a.png", "-brightness-contrast", "10,5", "b.png"])).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::BrightnessContrast {
+                brightness: 10.0,
+                contrast: 5.0
+            }]
+        );
+    }
+
+    #[test]
+    fn brightness_contrast_basic_x_separator() {
+        let p = parse(&to_vec(&[
+            "a.png",
+            "-brightness-contrast",
+            "20x-15",
+            "b.png",
+        ]))
+        .unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::BrightnessContrast {
+                brightness: 20.0,
+                contrast: -15.0
+            }]
+        );
+    }
+
+    #[test]
+    fn brightness_contrast_brightness_only() {
+        let p = parse(&to_vec(&["a.png", "-brightness-contrast", "30", "b.png"])).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::BrightnessContrast {
+                brightness: 30.0,
+                contrast: 0.0
+            }]
+        );
+    }
+
+    #[test]
+    fn brightness_contrast_out_of_range_rejected() {
+        let err = parse(&to_vec(&[
+            "a.png",
+            "-brightness-contrast",
+            "150,0",
+            "b.png",
+        ]))
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("out of range"));
+    }
+
+    #[test]
+    fn contrast_step_default_one() {
+        let p = parse(&to_vec(&["a.png", "-contrast", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Contrast { delta: 1 }]);
+    }
+
+    #[test]
+    fn contrast_repeated_accumulates_via_chain() {
+        // IM accumulates `-contrast` across repeated flags. We capture
+        // each as a separate Op; the executor sums them.
+        let p = parse(&to_vec(&["a.png", "-contrast", "-contrast", "b.png"])).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::Contrast { delta: 1 }, Op::Contrast { delta: 1 }]
+        );
+    }
+
+    #[test]
+    fn sepia_percent_form() {
+        let p = parse(&to_vec(&["a.png", "-sepia", "80%", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Sepia { threshold }] => assert!((threshold - 0.8).abs() < 1e-6),
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sepia_unit_form() {
+        let p = parse(&to_vec(&["a.png", "-sepia", "0.5", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Sepia { threshold }] => assert!((threshold - 0.5).abs() < 1e-6),
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn modulate_full_triplet() {
+        let p = parse(&to_vec(&["a.png", "-modulate", "120,80,150", "b.png"])).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::Modulate {
+                brightness: 120.0,
+                saturation: 80.0,
+                hue: 150.0,
+            }]
+        );
+    }
+
+    #[test]
+    fn modulate_brightness_only_defaults_other_components() {
+        let p = parse(&to_vec(&["a.png", "-modulate", "150", "b.png"])).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::Modulate {
+                brightness: 150.0,
+                saturation: 100.0,
+                hue: 100.0,
+            }]
+        );
+    }
+
+    #[test]
+    fn level_full_triplet() {
+        let p = parse(&to_vec(&["a.png", "-level", "10/1.2/250", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Level {
+                black: 10,
+                gamma,
+                white: 250,
+            }] => assert!((gamma - 1.2).abs() < 1e-6),
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn level_percent_endpoints() {
+        let p = parse(&to_vec(&["a.png", "-level", "10%/1.0/90%", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Level {
+                black,
+                gamma: _,
+                white,
+            }] => {
+                // 10% of 255 ≈ 26; 90% ≈ 230.
+                assert_eq!(*black, 26);
+                assert_eq!(*white, 230);
+            }
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn level_inverted_endpoints_rejected() {
+        let err = parse(&to_vec(&["a.png", "-level", "200/1.0/100", "b.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("must be <="));
+    }
+
+    #[test]
+    fn normalize_is_valueless() {
+        let p = parse(&to_vec(&["a.png", "-normalize", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Normalize]);
+    }
+
+    #[test]
+    fn threshold_percent() {
+        let p = parse(&to_vec(&["a.png", "-threshold", "50%", "b.png"])).unwrap();
+        // 50% of 255 ≈ 128.
+        assert_eq!(p.ops, vec![Op::Threshold { value: 128 }]);
+    }
+
+    #[test]
+    fn threshold_byte() {
+        let p = parse(&to_vec(&["a.png", "-threshold", "200", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Threshold { value: 200 }]);
+    }
+
+    #[test]
+    fn posterize_basic() {
+        let p = parse(&to_vec(&["a.png", "-posterize", "4", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Posterize { levels: 4 }]);
+    }
+
+    #[test]
+    fn posterize_one_rejected() {
+        let err = parse(&to_vec(&["a.png", "-posterize", "1", "b.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("levels must be >= 2"));
+    }
+
+    #[test]
+    fn solarize_percent() {
+        let p = parse(&to_vec(&["a.png", "-solarize", "100", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Solarize { value: 100 }]);
+    }
+
+    #[test]
+    fn colorspace_gray_recognised() {
+        let p = parse(&to_vec(&["a.png", "-colorspace", "Gray", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Colorspace("Gray".into())]);
+    }
+
+    #[test]
+    fn colorspace_rgb_recognised() {
+        let p = parse(&to_vec(&["a.png", "-colorspace", "rgb", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Colorspace("rgb".into())]);
+    }
+
+    #[test]
+    fn colorspace_unsupported_rejected() {
+        let err = parse(&to_vec(&["a.png", "-colorspace", "CMYK", "b.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("not yet wired"));
     }
 
     #[test]

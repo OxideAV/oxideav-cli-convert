@@ -120,6 +120,62 @@ pub enum Op {
     /// `-negate` — per-pixel `out = 255 - in` on the colour channels;
     /// alpha (when present) is unchanged.
     Negate,
+    /// `-sharpen RxS` — unsharp-mask sharpening with radius / sigma
+    /// (amount defaults to 1.0 in the factory). Sigma defaults to
+    /// `radius / 2.0` when only `R` is given.
+    Sharpen { radius: u32, sigma: f32 },
+    /// `-unsharp RxS+amount+threshold` — full unsharp-mask grammar.
+    /// Amount and threshold each default to a sensible value when
+    /// omitted (`amount = 1.0`, `threshold = 0`).
+    Unsharp {
+        radius: u32,
+        sigma: f32,
+        amount: f32,
+        threshold: u8,
+    },
+    /// `-gamma G` — power-law gamma correction. `G > 0`.
+    Gamma { value: f32 },
+    /// `-brightness-contrast B[,C]` — brightness in `[-100..=100]`,
+    /// contrast in `[-100..=100]` (both percent-of-range). Either
+    /// argument may be omitted; the IM grammar tolerates `B`,
+    /// `Bx`, `BxC`, `B,C`.
+    BrightnessContrast { brightness: f32, contrast: f32 },
+    /// `-contrast` (no value) — IM applies a tiny per-channel contrast
+    /// step. Multiple `-contrast` flags accumulate; we collapse them
+    /// into a single delta carried on the op (positive for `-contrast`,
+    /// negative for `+contrast`, which IM uses for the inverse). The
+    /// factory wires this to `BrightnessContrast::new(0, 5*delta)` —
+    /// a 5-percent step matching IM's "single contrast bump" feel.
+    Contrast { delta: i32 },
+    /// `-sepia THRESHOLD%` — warm-tint mapping. `threshold` is a
+    /// scalar in `0.0..=1.0` (IM expresses it as a percentage of the
+    /// dynamic range; we accept either form on parse).
+    Sepia { threshold: f32 },
+    /// `-modulate B,S,H` — IM's HSL-style triplet. Each component is
+    /// percent-of-base around 100 (so `100,100,0` is identity, `200`
+    /// doubles, `0` zeros, etc.). The hue field is "hue offset
+    /// percent" but image-filter takes degrees; we translate.
+    Modulate {
+        brightness: f32,
+        saturation: f32,
+        hue: f32,
+    },
+    /// `-level B/G/W` — input black point, gamma, white point. Black
+    /// and white are 0..=255; gamma must be `> 0`.
+    Level { black: u8, gamma: f32, white: u8 },
+    /// `-normalize` — stretch the histogram to fill 0..=255.
+    Normalize,
+    /// `-threshold N%` — binarise: pixels below `value` map to 0,
+    /// pixels at or above map to 255.
+    Threshold { value: u8 },
+    /// `-posterize N` — collapse to `N` levels per channel.
+    Posterize { levels: u32 },
+    /// `-solarize N%` — invert pixels above the threshold.
+    Solarize { value: u8 },
+    /// `-colorspace gray|grey|rgb|srgb` — round-1 covers only the
+    /// grayscale conversion (everything else is treated as a
+    /// pass-through, keeping the input colourspace).
+    Colorspace(String),
 }
 
 /// A printf-style multi-output template. Detected by the args parser

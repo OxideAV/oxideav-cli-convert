@@ -28,11 +28,27 @@ rest of the workspace already knows how to do.
 | `-flop` | horizontal flip (columns reversed) |
 | `-crop WxH+X+Y` | extract bbox; bbox-out-of-range errors cleanly |
 | `-negate` | per-pixel `255 - in` on RGB channels (alpha unchanged) |
+| `-sharpen RxS` | unsharp-mask sharpening (`S` defaults to `R/2`) |
+| `-unsharp RxS+amount+threshold` | full unsharp-mask grammar (`amount`/`threshold` optional) |
+| `-gamma G` | power-law gamma (`G > 0`) |
+| `-brightness-contrast B[,C]` | both in `[-100..=100]`; `BxC` separator also accepted |
+| `-contrast` | bare flag; bumps contrast by 5%; repeats accumulate |
+| `-sepia THRESHOLD` | accepts `N%` or `0.0..=1.0` |
+| `-modulate B[,S[,H]]` | percent-of-base around 100; hue 0..200 → ±180° |
+| `-level B[/G[/W]]` | endpoints accept `N` or `N%`; gamma > 0; black ≤ white |
+| `-normalize` | stretch histogram to 0..=255 |
+| `-threshold N[%]` | binarise around `N` |
+| `-posterize N` | collapse to `N >= 2` levels per channel |
+| `-solarize N[%]` | invert above threshold |
+| `-colorspace gray\|grey\|rgb\|srgb` | `gray`/`grey` → grayscale factory; `rgb`/`srgb` no-op |
 
-The five geometry/negate ops apply on the PDF→raster path today
-(via `pixel_xform`). The non-PDF pipeline path will pick them up
-once `oxideav-image-filter` publishes the matching `video.rotate` /
-`video.flip` / `video.crop` / `video.negate` filters.
+The geometry / negate / tonal ops above all wire through to the
+matching `oxideav-image-filter` factory on the regular pipeline path
+(`video.rotate`, `video.sharpen`, `video.gamma`, …). The PDF
+side-channel keeps its inline `pixel_xform` implementation for the
+five geometry / negate ops; the new tonal ops are pipeline-only on
+the PDF path today (a follow-up will route them through the same
+inline pre-encode hook).
 
 Anything else reports `unsupported: convert: -<op> is not yet
 implemented` and exits cleanly — no silent misbehaviour.

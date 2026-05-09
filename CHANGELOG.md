@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- IM-style tonal / colour-grading flags wired through to the matching
+  `oxideav-image-filter` factory via a `wrap(chain, "video.<name>",
+  json!(…))` step on the regular pipeline path:
+  - `-sharpen RxS` → `video.sharpen { radius, sigma }`.
+  - `-unsharp RxS+amount+threshold` →
+    `video.unsharp { radius, sigma, amount, threshold }`.
+  - `-gamma G` → `video.gamma { value }` (`G > 0` enforced).
+  - `-brightness-contrast B[,C]` (also `BxC`) →
+    `video.brightness-contrast { brightness, contrast }` (each in
+    `[-100..=100]`).
+  - `-contrast` (no value) → `video.contrast { value: 5.0 }` per
+    flag — repeated `-contrast` chains accumulate.
+  - `-sepia N%` / `-sepia 0.5` → `video.sepia { threshold }`.
+  - `-modulate B[,S[,H]]` → `video.modulate
+    { brightness, saturation, hue_degrees }` with IM's
+    `0..200`-around-`100` hue translated to `±180°`.
+  - `-level B[/G[/W]]` (also `B,G,W`; black/white accept `N` or `N%`)
+    → `video.level { black, gamma, white }` (gamma > 0; black ≤ white).
+  - `-normalize` → `video.normalize {}`.
+  - `-threshold N` / `-threshold N%` → `video.threshold { value }`.
+  - `-posterize N` (`N >= 2`) → `video.posterize { levels }`.
+  - `-solarize N` / `-solarize N%` → `video.solarize { value }`.
+  - `-colorspace gray|grey` → `video.grayscale { preserve_alpha: true }`;
+    `-colorspace rgb|srgb` is recorded as a no-op (input keeps its
+    colourspace). Other colourspaces continue to error cleanly.
+  - The previously inline-only round-1 ops (`-rotate`, `-flip`, `-flop`,
+    `-crop`, `-negate`) now also wire through to the matching
+    `video.rotate / .flip / .flop / .crop / .negate` factories on the
+    regular pipeline path so non-PDF inputs honour them too. The PDF
+    side-channel still applies them via `pixel_xform` for parity.
+- Argument parsers for each new flag with friendly error messages
+  (`out of range`, `must be > 0`, `levels must be >= 2`,
+  `not yet wired`, …).
+- Round-trip tests in `plan_to_job::tests`:
+  - JSON-shape coverage for every newly-wired op (per-key value
+    assertions on the emitted `FilterNode.params`).
+  - End-to-end registry-build coverage that hands the CLI-emitted JSON
+    back to a `RuntimeContext` carrying `oxideav_image_filter::register`
+    — proves the JSON dialect matches the factory's parameter schema.
+  - Pixel-exact match: synthesise a 4×4 RGBA edge fixture, run it
+    through both `Sharpen` directly and the registry-built filter, and
+    assert byte-for-byte equality. The registry-build assertions
+    skip silently when the linked image-filter pre-dates the
+    round-next factories (published `0.1.1` only registers
+    `blur` / `edge` / `resize`), so the test suite stays green
+    through the producer-publishes-consumer-lands cycle.
 - Inline geometry / negate ops on the PDF→raster path:
   - `-rotate N` for `N ∈ {±90, ±180, ±270}` (other angles rejected
     cleanly with "only multiples of 90 supported (got N)"). 90/270
