@@ -176,6 +176,30 @@ pub enum Op {
     /// grayscale conversion (everything else is treated as a
     /// pass-through, keeping the input colourspace).
     Colorspace(String),
+    /// `-vignette R+S+X+Y` — Gaussian radial darkening centred at
+    /// `(x, y)`. `radius`/`sigma` are in pixels (`sigma` defaults to
+    /// `radius / 2.0` when omitted, matching IM); `x`/`y` are
+    /// **normalised** image-relative offsets in `[0.0, 1.0]` (the
+    /// image-filter factory takes them this way to stay
+    /// resolution-independent), defaulting to `0.5 / 0.5` (image
+    /// centre) when omitted.
+    Vignette {
+        radius: f32,
+        sigma: f32,
+        x: f32,
+        y: f32,
+    },
+    /// `-colorize C[xC[xC]]/A%` — linear blend toward a target colour
+    /// by `amount`. `color` is `[R, G, B, A]` (alpha defaults to
+    /// `255`); `amount` is a unit scalar in `[0.0, 1.0]` (IM expresses
+    /// it as a percentage of the dynamic range).
+    Colorize { color: [u8; 4], amount: f32 },
+    /// `-equalize` (no value) — per-channel histogram equalisation via
+    /// CDF mapping.
+    Equalize,
+    /// `-auto-gamma` (no value) — auto-gamma: pick a per-channel gamma
+    /// so the geometric mean lands at `0.5`.
+    AutoGamma,
 }
 
 /// A printf-style multi-output template. Detected by the args parser

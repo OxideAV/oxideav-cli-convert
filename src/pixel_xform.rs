@@ -1,11 +1,25 @@
-//! Inline pixel transforms for the IM-style geometry / negate ops.
+//! Inline pixel transforms for the IM-style geometry / negate / tonal ops.
 //!
-//! Round-1 covers the "no resampler needed" subset:
+//! Round-1 covered the "no resampler needed" subset:
 //! `-rotate {±90,±180,±270}`, `-flip`, `-flop`, `-crop WxH+X+Y`,
-//! `-negate`. They all reduce to either:
+//! `-negate`. Round-after-next extends this to the round-37 tonal /
+//! colour-grading ops (`-sharpen`, `-unsharp`, `-gamma`,
+//! `-brightness-contrast`, `-contrast`, `-sepia`, `-modulate`,
+//! `-level`, `-normalize`, `-threshold`, `-posterize`, `-solarize`,
+//! `-grayscale`) so PDF inputs honour them on the side-channel render
+//! path.
+//!
+//! Geometry / negate ops reduce to either:
 //!
 //! - a per-pixel 1:1 substitution (negate), or
 //! - a row/column reshuffle (flip / flop / quarter-turn rotate / crop).
+//!
+//! Tonal ops dispatch into [`oxideav_image_filter`]'s pure-Rust
+//! single-frame factories (`Sharpen`, `Gamma`, …) by wrapping the
+//! [`RgbaImage`] in a [`VideoFrame`], applying the filter, and copying
+//! back. Same factories the regular pipeline path uses via the JSON
+//! registry — keeps the PDF side-channel pixel-identical to non-PDF
+//! inputs at the same op chain.
 //!
 //! Each transform takes ownership of an [`RgbaImage`] (3- or 4-byte
 //! packed) and returns a re-laid-out image.  Width/height/stride are
@@ -16,6 +30,12 @@
 //! The module is consumed by [`crate::pdf_runner`] today; once the
 //! non-PDF pipeline path grows the same hook the executor will call
 //! straight in here too.
+
+use oxideav_core::{Error, PixelFormat, VideoFrame, VideoPlane};
+use oxideav_image_filter::{
+    BrightnessContrast, Gamma, Grayscale, ImageFilter, Level, Modulate, Normalize, Posterize,
+    Sepia, Sharpen, Solarize, Threshold, Unsharp, VideoStreamParams,
+};
 
 use crate::op::Op;
 use crate::pdf_runner::RgbaImage;
@@ -58,12 +78,121 @@ pub fn apply_pixel_transform_chain(mut img: RgbaImage, ops: &[Op]) -> Result<Rgb
             Op::Negate => {
                 negate(&mut img);
             }
+            // ---- Tonal / colour-grading ops dispatched into
+            // oxideav-image-filter. The factories take a VideoFrame; we
+            // wrap-and-unwrap the RgbaImage so the side-channel sees the
+            // same pixel-output the non-PDF pipeline path produces. ----
+            Op::Sharpen { radius, sigma } => {
+                img = run_image_filter(img, &Sharpen::new(*radius, *sigma))?;
+            }
+            Op::Unsharp {
+                radius,
+                sigma,
+                amount,
+                threshold,
+            } => {
+                img = run_image_filter(img, &Unsharp::new(*radius, *sigma, *amount, *threshold))?;
+            }
+            Op::Gamma { value } => {
+                img = run_image_filter(img, &Gamma::new(*value))?;
+            }
+            Op::BrightnessContrast {
+                brightness,
+                contrast,
+            } => {
+                img = run_image_filter(img, &BrightnessContrast::new(*brightness, *contrast))?;
+            }
+            Op::Contrast { delta } => {
+                let pct = (*delta as f32) * 5.0;
+                img = run_image_filter(img, &BrightnessContrast::new(0.0, pct))?;
+            }
+            Op::Sepia { threshold } => {
+                img = run_image_filter(img, &Sepia::new(*threshold))?;
+            }
+            Op::Modulate {
+                brightness,
+                saturation,
+                hue,
+            } => {
+                // IM hue is "percent-of-base around 100" — translate to
+                // degrees the same way plan_to_job does.
+                let hue_degrees = (hue - 100.0) * 1.8;
+                img = run_image_filter(img, &Modulate::new(*brightness, *saturation, hue_degrees))?;
+            }
+            Op::Level {
+                black,
+                gamma,
+                white,
+            } => {
+                img = run_image_filter(img, &Level::new(*black, *white, *gamma))?;
+            }
+            Op::Normalize => {
+                img = run_image_filter(img, &Normalize::new(0.0, 0.0))?;
+            }
+            Op::Threshold { value } => {
+                img = run_image_filter(img, &Threshold::new(*value))?;
+            }
+            Op::Posterize { levels } => {
+                img = run_image_filter(img, &Posterize::new(*levels))?;
+            }
+            Op::Solarize { value } => {
+                img = run_image_filter(img, &Solarize::new(*value))?;
+            }
+            Op::Colorspace(cs) => {
+                let lower = cs.to_ascii_lowercase();
+                if lower == "gray" || lower == "grey" {
+                    img = run_image_filter(
+                        img,
+                        &Grayscale::new()
+                            .with_preserve_alpha(true)
+                            .with_output_gray8(false),
+                    )?;
+                }
+                // `rgb` / `srgb` are recorded no-ops.
+            }
             // Other ops aren't ours: rasteriser / encoder / pipeline
             // applies them.
             _ => {}
         }
     }
     Ok(img)
+}
+
+/// Run a single image-filter on the RgbaImage by converting to
+/// VideoFrame, applying, and copying back. Errors from the filter are
+/// surfaced as the IM-style `String` shape the caller expects.
+fn run_image_filter(img: RgbaImage, filter: &dyn ImageFilter) -> Result<RgbaImage, String> {
+    let format = if img.is_rgb() {
+        PixelFormat::Rgb24
+    } else {
+        PixelFormat::Rgba
+    };
+    let frame = VideoFrame {
+        pts: None,
+        planes: vec![VideoPlane {
+            stride: img.stride,
+            data: img.pixels,
+        }],
+    };
+    let params = VideoStreamParams {
+        format,
+        width: img.width,
+        height: img.height,
+    };
+    let out = filter
+        .apply(&frame, params)
+        .map_err(|e: Error| format!("{e:?}"))?;
+    let plane = out
+        .planes
+        .into_iter()
+        .next()
+        .ok_or_else(|| "image-filter returned no planes".to_string())?;
+    Ok(RgbaImage {
+        width: img.width,
+        height: img.height,
+        pixels: plane.data,
+        stride: plane.stride,
+    })
 }
 
 /// Vertical flip — reverse row order. Width / height / stride

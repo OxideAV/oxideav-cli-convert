@@ -245,6 +245,38 @@ pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Erro
                 // `rgb` / `srgb` are recorded no-ops — input keeps its
                 // colourspace, downstream encoder converts as needed.
             }
+            // ---- Round-after-next: vignette / colorize / equalize /
+            // auto-gamma. JSON shape mirrors the image-filter factories
+            // (resolves to identity defaults when the value is absent). ----
+            Op::Vignette {
+                radius,
+                sigma,
+                x,
+                y,
+            } => {
+                chain = wrap(
+                    chain,
+                    "video.vignette",
+                    json!({ "x": x, "y": y, "radius": radius, "sigma": sigma }),
+                );
+            }
+            Op::Colorize { color, amount } => {
+                // Factory wants a 4-element JSON array for `color`.
+                chain = wrap(
+                    chain,
+                    "video.colorize",
+                    json!({
+                        "color": [color[0], color[1], color[2], color[3]],
+                        "amount": amount,
+                    }),
+                );
+            }
+            Op::Equalize => {
+                chain = wrap(chain, "video.equalize", json!({}));
+            }
+            Op::AutoGamma => {
+                chain = wrap(chain, "video.auto-gamma", json!({}));
+            }
         }
     }
 
@@ -892,6 +924,45 @@ mod tests {
             ),
         ];
 
+        // Round-after-next factories. Skip them as a group when the
+        // linked image-filter pre-dates the vignette/colorize/equalize/
+        // auto-gamma additions (published 0.1.1 only registers up to the
+        // round-prev set). We piggy-back on the same skip pattern as
+        // above — if `vignette` isn't in the registry, none of the new
+        // four are.
+        let mut later_cases: Vec<(Op, &str, [PortSpec; 1])> = Vec::new();
+        if filter_ctx.filters.contains("vignette") {
+            later_cases.push((
+                Op::Vignette {
+                    radius: 50.0,
+                    sigma: 25.0,
+                    x: 0.5,
+                    y: 0.5,
+                },
+                "video.vignette",
+                make_inputs(4, 4, PixelFormat::Rgba),
+            ));
+            later_cases.push((
+                Op::Colorize {
+                    color: [200, 100, 50, 255],
+                    amount: 0.4,
+                },
+                "video.colorize",
+                make_inputs(4, 4, PixelFormat::Rgba),
+            ));
+            later_cases.push((
+                Op::Equalize,
+                "video.equalize",
+                make_inputs(4, 4, PixelFormat::Gray8),
+            ));
+            later_cases.push((
+                Op::AutoGamma,
+                "video.auto-gamma",
+                make_inputs(4, 4, PixelFormat::Gray8),
+            ));
+        }
+        let cases: Vec<(Op, &str, [PortSpec; 1])> = cases.into_iter().chain(later_cases).collect();
+
         for (op, expected_name, inputs) in cases {
             let job = plan_to_job(&plan_with(vec![op.clone()]), &empty_ctx()).unwrap();
             let track = &job.outputs.values().next().unwrap().all[0];
@@ -1017,6 +1088,63 @@ mod tests {
             registry_out.planes[0].data, reference.planes[0].data,
             "registry-built sharpen must match library Sharpen byte-for-byte"
         );
+    }
+
+    #[test]
+    fn vignette_wires_centre_radius_sigma() {
+        let job = plan_to_job(
+            &plan_with(vec![Op::Vignette {
+                radius: 50.0,
+                sigma: 25.0,
+                x: 0.5,
+                y: 0.5,
+            }]),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.vignette").expect("video.vignette node");
+        assert!((f.params["x"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+        assert!((f.params["y"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+        assert!((f.params["radius"].as_f64().unwrap() - 50.0).abs() < 1e-6);
+        assert!((f.params["sigma"].as_f64().unwrap() - 25.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn colorize_wires_color_array_and_amount() {
+        let job = plan_to_job(
+            &plan_with(vec![Op::Colorize {
+                color: [200, 100, 50, 255],
+                amount: 0.4,
+            }]),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.colorize").expect("video.colorize node");
+        let arr = f.params["color"].as_array().expect("color is array");
+        assert_eq!(arr.len(), 4);
+        assert_eq!(arr[0], 200);
+        assert_eq!(arr[1], 100);
+        assert_eq!(arr[2], 50);
+        assert_eq!(arr[3], 255);
+        assert!((f.params["amount"].as_f64().unwrap() - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn equalize_wires_empty_params() {
+        let job = plan_to_job(&plan_with(vec![Op::Equalize]), &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.equalize").expect("video.equalize node");
+        assert!(f.params.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn auto_gamma_wires_empty_params() {
+        let job = plan_to_job(&plan_with(vec![Op::AutoGamma]), &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.auto-gamma").expect("video.auto-gamma node");
+        assert!(f.params.as_object().unwrap().is_empty());
     }
 
     #[test]

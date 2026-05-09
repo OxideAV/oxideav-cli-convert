@@ -302,6 +302,33 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                 ops.push(Op::Solarize { value: n });
                 i += 2;
             }
+            "-vignette" => {
+                let v = val(i + 1)?;
+                let (radius, sigma, x, y) = parse_vignette(v)
+                    .map_err(|e| Error::invalid(format!("convert: -vignette: {e}")))?;
+                ops.push(Op::Vignette {
+                    radius,
+                    sigma,
+                    x,
+                    y,
+                });
+                i += 2;
+            }
+            "-colorize" => {
+                let v = val(i + 1)?;
+                let (color, amount) = parse_colorize(v)
+                    .map_err(|e| Error::invalid(format!("convert: -colorize: {e}")))?;
+                ops.push(Op::Colorize { color, amount });
+                i += 2;
+            }
+            "-equalize" => {
+                ops.push(Op::Equalize);
+                i += 1;
+            }
+            "-auto-gamma" => {
+                ops.push(Op::AutoGamma);
+                i += 1;
+            }
             "-colorspace" => {
                 let v = val(i + 1)?;
                 let cs = v.trim().to_string();
@@ -802,6 +829,121 @@ fn parse_byte_or_percent(s: &str) -> Result<u8, String> {
 /// returns the resulting 0..=255 byte value.
 fn parse_threshold_pct(s: &str) -> Result<u8, String> {
     parse_byte_or_percent(s.trim())
+}
+
+/// Parse `-vignette R[+S][+X[+Y]]`.
+///
+/// Mirrors IM's `-vignette geometry`-style argument. `R+S` are the
+/// Gaussian radius and sigma in pixels; `S` defaults to `R / 2.0` when
+/// omitted (matching IM and our `-blur RxS` convention). `+X+Y` are the
+/// **normalised** image-relative centre offsets in `[0.0, 1.0]`
+/// (default `0.5 / 0.5` = image centre). IM's `-vignette R+S+X+Y` uses
+/// pixel offsets for `X+Y`, but the image-filter `Vignette` factory is
+/// resolution-independent and takes them normalised; document the
+/// difference here. To target the centre — by far the common case —
+/// pass just `R` (e.g. `-vignette 50`).
+fn parse_vignette(s: &str) -> Result<(f32, f32, f32, f32), String> {
+    let mut parts = s.split('+');
+    let r_str = parts
+        .next()
+        .ok_or_else(|| format!("'{s}' is missing the radius component"))?;
+    let radius: f32 = r_str
+        .parse()
+        .map_err(|_| format!("'{r_str}' is not a finite float radius"))?;
+    if !radius.is_finite() || radius < 0.0 {
+        return Err(format!("radius {radius} must be >= 0"));
+    }
+    let s_part = parts.next();
+    let sigma: f32 = match s_part {
+        Some(t) if !t.is_empty() => t
+            .parse()
+            .map_err(|_| format!("'{t}' is not a finite float sigma"))?,
+        _ => radius / 2.0,
+    };
+    if !sigma.is_finite() || sigma < 0.0 {
+        return Err(format!("sigma {sigma} must be >= 0"));
+    }
+    let x: f32 = match parts.next() {
+        Some(t) if !t.is_empty() => t
+            .parse()
+            .map_err(|_| format!("'{t}' is not a finite float x"))?,
+        _ => 0.5,
+    };
+    let y: f32 = match parts.next() {
+        Some(t) if !t.is_empty() => t
+            .parse()
+            .map_err(|_| format!("'{t}' is not a finite float y"))?,
+        _ => 0.5,
+    };
+    if parts.next().is_some() {
+        return Err(format!("'{s}' has more than 4 components"));
+    }
+    if !x.is_finite() || !y.is_finite() {
+        return Err(format!("x/y must be finite (got x={x}, y={y})"));
+    }
+    Ok((radius, sigma, x, y))
+}
+
+/// Parse `-colorize C[xC[xC]]/A%`.
+///
+/// The colour part `C[xC[xC]]` accepts the same grammar as
+/// [`parse_color`] — CSS L3 named colours and `#hex` 3/4/6/8 forms —
+/// PLUS the IM-style `R[xG[xB]]` per-channel byte triplet. When only
+/// `/A%` is given (no colour part), the target defaults to white. The
+/// `A%` portion is a percentage in `[0%..=100%]`; we accept either
+/// `N%` or a unit scalar `0.0..=1.0`.
+fn parse_colorize(s: &str) -> Result<([u8; 4], f32), String> {
+    let s = s.trim();
+    let (color_part, amount_part) = match s.split_once('/') {
+        Some((c, a)) => (c, a),
+        // No `/A%` — interpret the whole string as the amount, with a
+        // white default colour. IM's rare "single-arg" form.
+        None => ("", s),
+    };
+    let color = if color_part.is_empty() {
+        [255, 255, 255, 255]
+    } else if color_part.contains('x') || color_part.contains('X') {
+        // R[xG[xB]] per-channel byte triplet.
+        let mut parts = color_part.split(['x', 'X']);
+        let r_str = parts
+            .next()
+            .ok_or_else(|| format!("'{color_part}' is missing the R component"))?;
+        let r: u32 = r_str
+            .parse()
+            .map_err(|_| format!("'{r_str}' is not a non-negative integer"))?;
+        if r > 255 {
+            return Err(format!("R component {r} out of range (0..=255)"));
+        }
+        let g: u32 = match parts.next() {
+            Some(t) if !t.is_empty() => t
+                .parse()
+                .map_err(|_| format!("'{t}' is not a non-negative integer"))?,
+            _ => r,
+        };
+        if g > 255 {
+            return Err(format!("G component {g} out of range (0..=255)"));
+        }
+        let b: u32 = match parts.next() {
+            Some(t) if !t.is_empty() => t
+                .parse()
+                .map_err(|_| format!("'{t}' is not a non-negative integer"))?,
+            _ => g,
+        };
+        if b > 255 {
+            return Err(format!("B component {b} out of range (0..=255)"));
+        }
+        if parts.next().is_some() {
+            return Err(format!(
+                "'{color_part}' has more than 3 components (expected R[xG[xB]])"
+            ));
+        }
+        [r as u8, g as u8, b as u8, 255]
+    } else {
+        // CSS named / `#hex`.
+        parse_color(color_part)?
+    };
+    let amount = parse_percent_or_unit(amount_part)?;
+    Ok((color, amount))
 }
 
 #[cfg(test)]
@@ -1449,5 +1591,192 @@ mod tests {
         assert_eq!(p.input, "in.pdf");
         assert_eq!(p.input_pages, Some(PageSelector::Range(2, 4)));
         assert!(p.output_template.is_some());
+    }
+
+    // ---- Round-after-next: -vignette / -colorize / -equalize / -auto-gamma ----
+
+    #[test]
+    fn vignette_radius_only_defaults_sigma_and_centre() {
+        let p = parse(&to_vec(&["a.png", "-vignette", "50", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Vignette {
+                radius,
+                sigma,
+                x,
+                y,
+            }] => {
+                assert!((radius - 50.0).abs() < 1e-6);
+                // Sigma defaults to radius / 2.
+                assert!((sigma - 25.0).abs() < 1e-6);
+                // X/Y default to image centre (0.5, 0.5).
+                assert!((x - 0.5).abs() < 1e-6);
+                assert!((y - 0.5).abs() < 1e-6);
+            }
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vignette_radius_and_sigma() {
+        let p = parse(&to_vec(&["a.png", "-vignette", "50+10", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Vignette {
+                radius,
+                sigma,
+                x,
+                y,
+            }] => {
+                assert!((radius - 50.0).abs() < 1e-6);
+                assert!((sigma - 10.0).abs() < 1e-6);
+                assert!((x - 0.5).abs() < 1e-6);
+                assert!((y - 0.5).abs() < 1e-6);
+            }
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vignette_full_grammar_with_xy() {
+        let p = parse(&to_vec(&["a.png", "-vignette", "50+10+0.25+0.75", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Vignette {
+                radius,
+                sigma,
+                x,
+                y,
+            }] => {
+                assert!((radius - 50.0).abs() < 1e-6);
+                assert!((sigma - 10.0).abs() < 1e-6);
+                assert!((x - 0.25).abs() < 1e-6);
+                assert!((y - 0.75).abs() < 1e-6);
+            }
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vignette_too_many_components_rejected() {
+        let err = parse(&to_vec(&["a.png", "-vignette", "1+2+3+4+5", "b.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("more than 4"));
+    }
+
+    #[test]
+    fn vignette_negative_radius_rejected() {
+        let err = parse(&to_vec(&["a.png", "-vignette", "-5", "b.png"])).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("not a finite float radius") || msg.contains("must be >= 0"));
+    }
+
+    #[test]
+    fn colorize_named_color_with_percent_amount() {
+        let p = parse(&to_vec(&["a.png", "-colorize", "red/40%", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Colorize { color, amount }] => {
+                assert_eq!(*color, [255, 0, 0, 255]);
+                assert!((amount - 0.4).abs() < 1e-6);
+            }
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn colorize_hex_color() {
+        let p = parse(&to_vec(&["a.png", "-colorize", "#ff8000/50%", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Colorize { color, amount }] => {
+                assert_eq!(*color, [255, 128, 0, 255]);
+                assert!((amount - 0.5).abs() < 1e-6);
+            }
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn colorize_per_channel_triplet() {
+        let p = parse(&to_vec(&["a.png", "-colorize", "200x100x50/25%", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Colorize { color, amount }] => {
+                assert_eq!(*color, [200, 100, 50, 255]);
+                assert!((amount - 0.25).abs() < 1e-6);
+            }
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn colorize_single_channel_replicated() {
+        // `100/50%` → no `x`, but contains `/`. The colour is the
+        // string before `/`; "100" lacks `x`, so we fall through to
+        // parse_color which won't match (it's not named / hex). Test
+        // that we get a clean error.
+        let err = parse(&to_vec(&["a.png", "-colorize", "100/50%", "b.png"])).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("unknown colour") || msg.contains("not a valid hex"));
+    }
+
+    #[test]
+    fn colorize_per_channel_one_value_replicates() {
+        // `100x` (or `100xx`) — single value means R = G = B = 100.
+        let p = parse(&to_vec(&["a.png", "-colorize", "100x100x100/30%", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Colorize { color, amount: _ }] => {
+                assert_eq!(*color, [100, 100, 100, 255]);
+            }
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn colorize_amount_only_defaults_white() {
+        // `/40%` form — IM accepts it; default colour is white.
+        let p = parse(&to_vec(&["a.png", "-colorize", "/40%", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Colorize { color, amount }] => {
+                assert_eq!(*color, [255, 255, 255, 255]);
+                assert!((amount - 0.4).abs() < 1e-6);
+            }
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn colorize_amount_unit_scalar() {
+        // Without `%`, parse_percent_or_unit accepts a unit scalar.
+        let p = parse(&to_vec(&["a.png", "-colorize", "red/0.6", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Colorize { color, amount }] => {
+                assert_eq!(*color, [255, 0, 0, 255]);
+                assert!((amount - 0.6).abs() < 1e-6);
+            }
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn colorize_out_of_range_channel_rejected() {
+        let err = parse(&to_vec(&["a.png", "-colorize", "300x0x0/50%", "b.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("out of range"));
+    }
+
+    #[test]
+    fn equalize_is_valueless() {
+        let p = parse(&to_vec(&["a.png", "-equalize", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Equalize]);
+    }
+
+    #[test]
+    fn auto_gamma_is_valueless() {
+        let p = parse(&to_vec(&["a.png", "-auto-gamma", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::AutoGamma]);
+    }
+
+    #[test]
+    fn vignette_rejects_negative_sigma() {
+        let err = parse(&to_vec(&["a.png", "-vignette", "5+-1", "b.png"])).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("not a finite float sigma") || msg.contains("must be >= 0"),
+            "unexpected message: {msg}"
+        );
     }
 }

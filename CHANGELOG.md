@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Four more IM colour-grading flags wired to the matching
+  `oxideav-image-filter` factory (registers as `vignette` / `colorize` /
+  `equalize` / `auto-gamma` once the consumer pulls a published
+  image-filter that includes them; the CLI emits the JSON dialect
+  unconditionally):
+  - `-vignette R[+S][+X[+Y]]` → `video.vignette { x, y, radius, sigma }`
+    (`S` defaults to `R/2`; `X`/`Y` default to image centre — passed
+    as normalised `[0.0, 1.0]` offsets to stay resolution-independent).
+  - `-colorize C[xC[xC]]/A%` → `video.colorize { color: [R,G,B,A],
+    amount }`. Colour part accepts CSS L3 named, `#hex` 3/4/6/8, and
+    IM's per-channel `R[xG[xB]]` triplet (single-component value
+    replicates); `/A%` accepts a percentage or unit-scalar amount.
+  - `-equalize` (no value) → `video.equalize {}`.
+  - `-auto-gamma` (no value) → `video.auto-gamma {}`.
+- PDF→raster side-channel now honours the round-37 tonal /
+  colour-grading ops (`-sharpen`, `-unsharp`, `-gamma`,
+  `-brightness-contrast`, `-contrast`, `-sepia`, `-modulate`, `-level`,
+  `-normalize`, `-threshold`, `-posterize`, `-solarize`,
+  `-colorspace gray|grey`). `pixel_xform::apply_pixel_transform_chain`
+  dispatches to the matching `oxideav-image-filter` constructor on the
+  rendered RGBA buffer before alpha-grammar / encode, keeping PDF
+  inputs pixel-identical to non-PDF inputs at the same op chain.
+  Locked down by an integration test that decodes a `-sharpen 1x0.5`
+  PDF render and asserts byte-for-byte match against the standalone
+  `Sharpen` filter applied to the plain render.
+- `RgbaImage::is_rgb` is now `pub` (was private to `pdf_runner`) so the
+  `pixel_xform` tonal dispatch can pick the right `PixelFormat` tag.
+
 - IM-style tonal / colour-grading flags wired through to the matching
   `oxideav-image-filter` factory via a `wrap(chain, "video.<name>",
   json!(…))` step on the regular pipeline path:

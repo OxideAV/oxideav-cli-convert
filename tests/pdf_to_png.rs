@@ -621,6 +621,89 @@ fn negate_runs_through_full_pipeline() {
 }
 
 #[test]
+fn sharpen_through_pdf_side_channel_matches_image_filter_standalone() {
+    // End-to-end: render a PDF page through `convert` with `-sharpen`,
+    // then run the same image-filter `Sharpen` directly on the
+    // un-sharpened render and assert the byte-for-byte output matches.
+    // Locks down the "PDF side-channel honours tonal ops via image-filter"
+    // contract from round-after-next: the sharpened PDF render must be
+    // pixel-identical to what the standalone Sharpen filter produces on
+    // the plain render.
+    use oxideav_core::{PixelFormat, VideoFrame, VideoPlane};
+    use oxideav_image_filter::{ImageFilter, Sharpen, VideoStreamParams};
+    use oxideav_png::decode_png;
+
+    let dir = temp_dir("sharpen-side-channel");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+
+    // Plain render — gives us the un-sharpened reference RGBA buffer.
+    let plain = dir.join("plain.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            plain.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("plain render");
+
+    // Side-channel render with `-sharpen 1x0.5`.
+    let sharpened = dir.join("sharpened.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            "-sharpen".into(),
+            "1x0.5".into(),
+            sharpened.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("sharpen render");
+
+    // Decode both PNGs and run Sharpen standalone on the plain pixels.
+    let plain_png = decode_png(&fs::read(&plain).unwrap()).expect("decode plain PNG");
+    let sharp_png = decode_png(&fs::read(&sharpened).unwrap()).expect("decode sharpened PNG");
+    assert_eq!(plain_png.width, sharp_png.width);
+    assert_eq!(plain_png.height, sharp_png.height);
+
+    // PNG decode emits Rgba (4 bpp) for our test fixture's alpha-bearing
+    // render; if it happened to land on Rgb24 the stride-vs-width math
+    // would still hold but the filter would need a different format tag.
+    let bpp = plain_png.stride / plain_png.width as usize;
+    let format = match bpp {
+        4 => PixelFormat::Rgba,
+        3 => PixelFormat::Rgb24,
+        other => panic!("unexpected bpp {other} from decoded PNG"),
+    };
+    let plain_frame = VideoFrame {
+        pts: None,
+        planes: vec![VideoPlane {
+            stride: plain_png.stride,
+            data: plain_png.data.clone(),
+        }],
+    };
+    let reference = Sharpen::new(1, 0.5)
+        .apply(
+            &plain_frame,
+            VideoStreamParams {
+                format,
+                width: plain_png.width,
+                height: plain_png.height,
+            },
+        )
+        .expect("standalone Sharpen apply");
+    assert_eq!(
+        sharp_png.data, reference.planes[0].data,
+        "PDF side-channel sharpen output must match standalone Sharpen byte-for-byte"
+    );
+}
+
+#[test]
 fn rotate_90_then_270_round_trips_dims() {
     // Chained ops in source order: 90° then 270° should be the
     // identity. Spot-check the dims survive.

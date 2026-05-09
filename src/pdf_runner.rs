@@ -231,7 +231,10 @@ pub struct RgbaImage {
 }
 
 impl RgbaImage {
-    fn is_rgb(&self) -> bool {
+    /// True when the buffer is packed Rgb24 (3 bytes per pixel) rather
+    /// than Rgba (4 bytes). Inferred off `stride` since the struct
+    /// doesn't carry an explicit pixel-format tag.
+    pub fn is_rgb(&self) -> bool {
         self.stride == (self.width as usize) * 3
     }
 }
