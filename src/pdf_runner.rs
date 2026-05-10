@@ -148,7 +148,12 @@ pub fn run(plan: &ConvertPlan) -> Result<()> {
 
         // Scene → Scene: pass selected pages through.
         (OutputClass::Scene, false, _) => {
-            if !plan.ops.is_empty() && plan.ops.iter().any(|o| !matches!(o, Op::Density(_))) {
+            if !plan.ops.is_empty()
+                && plan
+                    .ops
+                    .iter()
+                    .any(|o| !matches!(o, Op::Density(_) | Op::Define { .. }))
+            {
                 eprintln!("convert: note: raster ops ignored on Scene-aware output");
             }
             let out_scene = Scene {

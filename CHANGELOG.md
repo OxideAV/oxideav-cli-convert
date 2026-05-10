@@ -9,6 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- IM-style geometry-modifier suffixes on `-resize` (and on the new
+  `-thumbnail`):
+  - `WxH!` — force exact dimensions, ignore aspect ratio (was
+    `bang = true`; now `ResizeMode::Force`).
+  - `WxH^` — fill the box: scale both axes by the LARGER of
+    `(req_w/src_w, req_h/src_h)` so neither output dim is below the
+    request. Pairs naturally with a follow-up `-crop` to land on
+    exactly `WxH`.
+  - `WxH>` — only resize when the input is LARGER than `WxH`;
+    otherwise pass through unchanged.
+  - `WxH<` — only resize when the input is SMALLER than `WxH`;
+    otherwise pass through unchanged.
+  - `WxH%` — interpret `W` and `H` as integer percentages of the
+    source dimensions (`50%` halves both axes; `200x100%` doubles
+    width and leaves height alone). The bare `N%` form replicates,
+    matching IM.
+  - `WxH@` — interpret `W*H` as the TARGET pixel area; both output
+    dims scale by `sqrt(target_area / source_area)` so the aspect
+    ratio is preserved AND the output area matches the request.
+- `Op::Resize { width, height, mode: ResizeMode }` (was `bang: bool`).
+  The PDF side-channel resolves every mode against the actual source
+  dims; the regular pipeline path forwards a stable lowercase tag
+  (`default` / `force` / `fill` / `shrink` / `grow` / `percent` /
+  `area`) on the resize filter's JSON params so a future executor
+  pass can resolve the source-aware variants too.
+- `-thumbnail WxH[!^<>%@]` — IM convenience flag. Same geometry
+  grammar as `-resize`. Unrolls into a `Resize` plus `Strip` pair
+  (auto-orient is a documented follow-up — needs an EXIF reader on
+  the source side).
+- `-define KEY[=VALUE]` — opaque codec-specific tunable forwarded
+  literally onto the sink track's `params` bag. Keys keep their `:`
+  namespace separator (e.g. `jpeg:dct-method=float` lands as
+  `params["jpeg:dct-method"] = "float"`); bare `-define KEY` (no
+  `=VALUE`) becomes `params[KEY] = true`. Multiple `-define` flags
+  all stack onto the same params object. Sink encoders that don't
+  recognise a key silently ignore it, mirroring IM's
+  tolerant-of-irrelevant-options posture.
+- `pixel_xform` learns to honour `Op::Resize` / `Op::Thumbnail`
+  end-to-end (it already knew the source dims, so the `Fill` /
+  `Shrink` / `Grow` / `Percent` / `Area` modes work today on the
+  PDF side-channel — no waiting on the regular-pipeline executor
+  pass).
+- New `run_image_filter_resize` helper in `pixel_xform` that lets
+  shape-changing filters (Resize) declare the output dimensions
+  directly, fixing a latent bug where `run_image_filter` always
+  inherited the input width/height.
+- `op::ResizeMode` enum + helpers (`split_suffix`, `as_tag`,
+  `resolve(req_w, req_h, src_w, src_h)`) re-exported from the
+  crate root.
+- 16 new unit tests covering the geometry parsing (`-resize 200x100^`
+  / `100x100>` / `1024x1024<` / `50x200%` / `75%` / `640x480@` /
+  `-thumbnail 128x128^` / etc.), the `-define` grammar
+  (`KEY=VALUE` / bare `KEY` / empty-`KEY` rejection), and the
+  pixel-transform chain dispatch (`apply_chain_resize_*`).
+- 7 new end-to-end tests in `tests/pdf_to_png.rs` proving the
+  geometry modes, `-thumbnail`, and `-define` all work on the PDF
+  → PNG / JPG path with byte-level checks on the output dimensions.
+
 - `--probe` extensions surfacing more upstream metadata that the
   round-40 baseline left on the table:
   - **PDF**: `is_encrypted` (always present), and the `/Info` dictionary

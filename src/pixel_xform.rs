@@ -34,7 +34,7 @@
 use oxideav_core::{Error, PixelFormat, VideoFrame, VideoPlane};
 use oxideav_image_filter::{
     BrightnessContrast, Gamma, Grayscale, ImageFilter, Level, Modulate, Normalize, Posterize,
-    Sepia, Sharpen, Solarize, Threshold, Unsharp, VideoStreamParams,
+    Resize, Sepia, Sharpen, Solarize, Threshold, Unsharp, VideoStreamParams,
 };
 
 use crate::op::Op;
@@ -150,6 +150,38 @@ pub fn apply_pixel_transform_chain(mut img: RgbaImage, ops: &[Op]) -> Result<Rgb
                 }
                 // `rgb` / `srgb` are recorded no-ops.
             }
+            // Geometry-aware resize. We know the source dims here, so
+            // every [`ResizeMode`] is honoured; the pipeline path is
+            // limited to `Default` / `Force` until the executor learns
+            // to resolve the source-aware variants too.
+            Op::Resize {
+                width,
+                height,
+                mode,
+            } => {
+                let (out_w, out_h) = mode.resolve(*width, *height, img.width, img.height);
+                if out_w == img.width && out_h == img.height {
+                    // No-op for shrink-only / grow-only when the input
+                    // already fits the policy; skip the resampler pass.
+                    continue;
+                }
+                img = run_image_filter_resize(img, &Resize::new(out_w, out_h), out_w, out_h)?;
+            }
+            // Same shape as Resize for the side-channel; the Strip
+            // half is honoured at encode time when a future
+            // metadata-emitting raster encoder lands.
+            Op::Thumbnail {
+                width,
+                height,
+                mode,
+            } => {
+                let (out_w, out_h) = mode.resolve(*width, *height, img.width, img.height);
+                if !(out_w == img.width && out_h == img.height) {
+                    img = run_image_filter_resize(img, &Resize::new(out_w, out_h), out_w, out_h)?;
+                }
+            }
+            // `-define` is a sink-side concern, not a pixel transform.
+            Op::Define { .. } => {}
             // Other ops aren't ours: rasteriser / encoder / pipeline
             // applies them.
             _ => {}
@@ -161,12 +193,40 @@ pub fn apply_pixel_transform_chain(mut img: RgbaImage, ops: &[Op]) -> Result<Rgb
 /// Run a single image-filter on the RgbaImage by converting to
 /// VideoFrame, applying, and copying back. Errors from the filter are
 /// surfaced as the IM-style `String` shape the caller expects.
+///
+/// Output width/height are inherited from the input. Filters that
+/// change shape (Resize, Edge → Gray8) MUST go through
+/// [`run_image_filter_resize`] instead, which lets the caller declare
+/// the new dimensions.
 fn run_image_filter(img: RgbaImage, filter: &dyn ImageFilter) -> Result<RgbaImage, String> {
+    run_image_filter_inner(img, filter, None)
+}
+
+/// Same as [`run_image_filter`] but the output uses the supplied
+/// `(out_w, out_h)` dimensions. Used by the geometry-aware
+/// [`Op::Resize`] / [`Op::Thumbnail`] arms which know the target size
+/// before the filter runs.
+fn run_image_filter_resize(
+    img: RgbaImage,
+    filter: &dyn ImageFilter,
+    out_w: u32,
+    out_h: u32,
+) -> Result<RgbaImage, String> {
+    run_image_filter_inner(img, filter, Some((out_w, out_h)))
+}
+
+fn run_image_filter_inner(
+    img: RgbaImage,
+    filter: &dyn ImageFilter,
+    out_dims: Option<(u32, u32)>,
+) -> Result<RgbaImage, String> {
     let format = if img.is_rgb() {
         PixelFormat::Rgb24
     } else {
         PixelFormat::Rgba
     };
+    let in_w = img.width;
+    let in_h = img.height;
     let frame = VideoFrame {
         pts: None,
         planes: vec![VideoPlane {
@@ -176,8 +236,8 @@ fn run_image_filter(img: RgbaImage, filter: &dyn ImageFilter) -> Result<RgbaImag
     };
     let params = VideoStreamParams {
         format,
-        width: img.width,
-        height: img.height,
+        width: in_w,
+        height: in_h,
     };
     let out = filter
         .apply(&frame, params)
@@ -187,9 +247,10 @@ fn run_image_filter(img: RgbaImage, filter: &dyn ImageFilter) -> Result<RgbaImag
         .into_iter()
         .next()
         .ok_or_else(|| "image-filter returned no planes".to_string())?;
+    let (w, h) = out_dims.unwrap_or((in_w, in_h));
     Ok(RgbaImage {
-        width: img.width,
-        height: img.height,
+        width: w,
+        height: h,
         pixels: plane.data,
         stride: plane.stride,
     })
@@ -374,6 +435,7 @@ pub fn crop(img: RgbaImage, x: u32, y: u32, w: u32, h: u32) -> Result<RgbaImage,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::op::ResizeMode;
 
     /// Build a 2x2 RGBA image with a unique colour per pixel so any
     /// reshuffle is detectable by inspecting one byte per pixel.
@@ -635,21 +697,134 @@ mod tests {
 
     #[test]
     fn apply_chain_skips_unhandled_ops() {
-        // Resize / Blur / Edge / Colors / etc. should pass through
-        // unchanged — they're owned by the pipeline / pdf_runner /
-        // encoder side.
+        // Blur / Edge / Colors / etc. pass through unchanged. Resize
+        // IS now handled by pixel_xform (the source dims are known
+        // here), so test those separately below.
+        let img = img_2x2_rgba();
+        let original = img.pixels.clone();
+        let out = apply_pixel_transform_chain(img, &[Op::Strip]).unwrap();
+        assert_eq!(out.pixels, original);
+    }
+
+    #[test]
+    fn apply_chain_resize_default_aspect_fit() {
+        // 2×2 source, target 4×8 default (fit-inside) → both axes scale by
+        // 2.0 (limited by width), so output is 4×4.
+        let img = img_2x2_rgba();
+        let out = apply_pixel_transform_chain(
+            img,
+            &[Op::Resize {
+                width: 4,
+                height: 8,
+                mode: ResizeMode::Default,
+            }],
+        )
+        .unwrap();
+        assert_eq!(out.width, 4);
+        assert_eq!(out.height, 4);
+    }
+
+    #[test]
+    fn apply_chain_resize_force_ignores_aspect() {
+        // 2×2 source, target 4×8 force → exact 4×8.
+        let img = img_2x2_rgba();
+        let out = apply_pixel_transform_chain(
+            img,
+            &[Op::Resize {
+                width: 4,
+                height: 8,
+                mode: ResizeMode::Force,
+            }],
+        )
+        .unwrap();
+        assert_eq!(out.width, 4);
+        assert_eq!(out.height, 8);
+    }
+
+    #[test]
+    fn apply_chain_resize_fill_picks_larger_scale() {
+        // 2×2 source, target 4×8 fill → scale = max(4/2, 8/2) = 4 → 8×8.
+        let img = img_2x2_rgba();
+        let out = apply_pixel_transform_chain(
+            img,
+            &[Op::Resize {
+                width: 4,
+                height: 8,
+                mode: ResizeMode::Fill,
+            }],
+        )
+        .unwrap();
+        assert_eq!(out.width, 8);
+        assert_eq!(out.height, 8);
+    }
+
+    #[test]
+    fn apply_chain_resize_shrink_only_passes_through_smaller() {
+        // 2×2 source, target 100×100 shrink-only → input is already
+        // smaller than target → no-op.
         let img = img_2x2_rgba();
         let original = img.pixels.clone();
         let out = apply_pixel_transform_chain(
             img,
-            &[
-                Op::Resize {
-                    width: 99,
-                    height: 99,
-                    bang: false,
-                },
-                Op::Strip,
-            ],
+            &[Op::Resize {
+                width: 100,
+                height: 100,
+                mode: ResizeMode::Shrink,
+            }],
+        )
+        .unwrap();
+        assert_eq!(out.width, 2);
+        assert_eq!(out.height, 2);
+        assert_eq!(out.pixels, original);
+    }
+
+    #[test]
+    fn apply_chain_resize_percent_50_halves_dims() {
+        // 2×2 source, percent 50% on both axes → 1×1.
+        let img = img_2x2_rgba();
+        let out = apply_pixel_transform_chain(
+            img,
+            &[Op::Resize {
+                width: 50,
+                height: 50,
+                mode: ResizeMode::Percent,
+            }],
+        )
+        .unwrap();
+        assert_eq!(out.width, 1);
+        assert_eq!(out.height, 1);
+    }
+
+    #[test]
+    fn apply_chain_thumbnail_resizes_and_drops_metadata_op() {
+        // Thumbnail in pixel_xform reduces to a resize at the resolved
+        // dims; the Strip half is the encoder's job.
+        let img = img_2x2_rgba();
+        let out = apply_pixel_transform_chain(
+            img,
+            &[Op::Thumbnail {
+                width: 4,
+                height: 4,
+                mode: ResizeMode::Default,
+            }],
+        )
+        .unwrap();
+        assert_eq!(out.width, 4);
+        assert_eq!(out.height, 4);
+    }
+
+    #[test]
+    fn apply_chain_define_is_sink_side_no_op() {
+        // -define is a sink-side hint; the pixel transform chain leaves
+        // the pixels alone.
+        let img = img_2x2_rgba();
+        let original = img.pixels.clone();
+        let out = apply_pixel_transform_chain(
+            img,
+            &[Op::Define {
+                key: "jpeg:dct-method".into(),
+                value: Some("float".into()),
+            }],
         )
         .unwrap();
         assert_eq!(out.pixels, original);

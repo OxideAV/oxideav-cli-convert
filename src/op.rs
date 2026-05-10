@@ -64,15 +64,176 @@ impl AlphaOp {
     }
 }
 
+/// `-resize` / `-thumbnail` geometry-modifier suffix.
+///
+/// ImageMagick's geometry grammar tags the literal `WxH` with a single
+/// trailing character that selects the scaling policy. We honour the
+/// six common ones; everything else (`%@` combos, gravity flags, …)
+/// is a documented follow-up.
+///
+/// The runtime sees the original `WxH` plus this tag and resolves the
+/// final pixel dimensions against the actual source size — most modes
+/// can't be eagerly resolved at parse time because we don't yet know
+/// the source dims.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResizeMode {
+    /// No suffix — preserve aspect ratio and FIT inside the `WxH` box
+    /// (the larger of the two scale factors wins, so neither output
+    /// dimension exceeds the request). IM's default geometry policy.
+    #[default]
+    Default,
+    /// `WxH!` — IGNORE aspect ratio, force the exact `WxH` dimensions.
+    /// Equivalent to the original `bang = true`.
+    Force,
+    /// `WxH^` — preserve aspect ratio and FILL the `WxH` box (the
+    /// smaller of the two scale factors wins, so both output
+    /// dimensions are at least the request). Common pairing with a
+    /// follow-up `-crop` to land on exact `WxH`.
+    Fill,
+    /// `WxH>` — only resize when the input is LARGER than `WxH`
+    /// (otherwise pass through unchanged). IM's "shrink-only" policy.
+    Shrink,
+    /// `WxH<` — only resize when the input is SMALLER than `WxH`
+    /// (otherwise pass through unchanged). IM's "enlarge-only" policy.
+    Grow,
+    /// `WxH%` — interpret `W` and `H` as percentages of the source
+    /// dimensions (independent X / Y scale). `WxH` are still parsed as
+    /// integer percentages by `parse_wxh`; if only one number is given
+    /// it applies to both axes (handled at parse time).
+    Percent,
+    /// `WxH@` — interpret `W*H` as the TARGET pixel area; both output
+    /// dims are scaled by `sqrt(target_area / source_area)` so the
+    /// aspect ratio is preserved AND the output area matches the
+    /// request.
+    Area,
+}
+
+impl ResizeMode {
+    /// Strip an IM geometry-modifier suffix off `WxH`.
+    /// Returns `(mode, geometry-without-suffix)`. No suffix means
+    /// `Default` plus the input verbatim. Multiple suffix chars
+    /// (e.g. `WxH^!`) are rejected by the args parser layer; here we
+    /// only peel the LAST one and report what we found.
+    pub fn split_suffix(s: &str) -> (ResizeMode, &str) {
+        if let Some(core) = s.strip_suffix('!') {
+            return (ResizeMode::Force, core);
+        }
+        if let Some(core) = s.strip_suffix('^') {
+            return (ResizeMode::Fill, core);
+        }
+        if let Some(core) = s.strip_suffix('>') {
+            return (ResizeMode::Shrink, core);
+        }
+        if let Some(core) = s.strip_suffix('<') {
+            return (ResizeMode::Grow, core);
+        }
+        if let Some(core) = s.strip_suffix('%') {
+            return (ResizeMode::Percent, core);
+        }
+        if let Some(core) = s.strip_suffix('@') {
+            return (ResizeMode::Area, core);
+        }
+        (ResizeMode::Default, s)
+    }
+
+    /// Lowercase tag string used in JSON params handed to the resize
+    /// factory. Stable identifiers — codecs that grow geometry-mode
+    /// awareness can branch off these.
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            ResizeMode::Default => "default",
+            ResizeMode::Force => "force",
+            ResizeMode::Fill => "fill",
+            ResizeMode::Shrink => "shrink",
+            ResizeMode::Grow => "grow",
+            ResizeMode::Percent => "percent",
+            ResizeMode::Area => "area",
+        }
+    }
+
+    /// Resolve the final `(out_w, out_h)` for a request of `(req_w,
+    /// req_h)` against a source size of `(src_w, src_h)`.
+    ///
+    /// Output is always >= 1 on both axes; clipping to source dims for
+    /// `Shrink` / `Grow` modes happens here so the caller can blindly
+    /// hand the result to the resize filter without re-checking.
+    pub fn resolve(self, req_w: u32, req_h: u32, src_w: u32, src_h: u32) -> (u32, u32) {
+        let sw = src_w.max(1) as f64;
+        let sh = src_h.max(1) as f64;
+        let rw = req_w.max(1) as f64;
+        let rh = req_h.max(1) as f64;
+        let (out_w, out_h) = match self {
+            ResizeMode::Default => {
+                // Aspect-preserving fit: pick the smaller scale.
+                let s = (rw / sw).min(rh / sh);
+                ((sw * s).round(), (sh * s).round())
+            }
+            ResizeMode::Force => (rw, rh),
+            ResizeMode::Fill => {
+                let s = (rw / sw).max(rh / sh);
+                ((sw * s).round(), (sh * s).round())
+            }
+            ResizeMode::Shrink => {
+                if (src_w <= req_w) && (src_h <= req_h) {
+                    (sw, sh)
+                } else {
+                    let s = (rw / sw).min(rh / sh);
+                    ((sw * s).round(), (sh * s).round())
+                }
+            }
+            ResizeMode::Grow => {
+                if (src_w >= req_w) && (src_h >= req_h) {
+                    (sw, sh)
+                } else {
+                    let s = (rw / sw).min(rh / sh);
+                    ((sw * s).round(), (sh * s).round())
+                }
+            }
+            ResizeMode::Percent => {
+                // req_w / req_h are percentages: 50 → half, 200 → double.
+                ((sw * rw / 100.0).round(), (sh * rh / 100.0).round())
+            }
+            ResizeMode::Area => {
+                let target_area = rw * rh;
+                let src_area = sw * sh;
+                let s = (target_area / src_area).sqrt();
+                ((sw * s).round(), (sh * s).round())
+            }
+        };
+        ((out_w as i64).max(1) as u32, (out_h as i64).max(1) as u32)
+    }
+}
+
 /// One convert operation.
 ///
 /// Operations apply in source order — same as `imagemagick convert`,
 /// even though we don't yet support IM's stack-reset semantics.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
-    /// `-resize WxH[!]`. `bang = true` means the `!` was present:
-    /// force exact dimensions without preserving aspect ratio.
-    Resize { width: u32, height: u32, bang: bool },
+    /// `-resize WxH[!^<>%@]`. The trailing modifier selects the
+    /// scaling policy via [`ResizeMode`]; absence of any modifier is
+    /// `ResizeMode::Default` (aspect-preserving fit-inside).
+    Resize {
+        width: u32,
+        height: u32,
+        mode: ResizeMode,
+    },
+    /// `-thumbnail WxH[!^<>%@]` — IM convenience flag. Same geometry
+    /// grammar as `-resize`; the runner unrolls it into a Resize plus
+    /// Strip pair (and, eventually, an auto-orient pass) so the
+    /// downstream pipeline doesn't need a dedicated thumbnail node.
+    Thumbnail {
+        width: u32,
+        height: u32,
+        mode: ResizeMode,
+    },
+    /// `-define KEY[=VALUE]` — opaque codec-specific tunable forwarded
+    /// to the sink. Keys keep their literal form (e.g.
+    /// `jpeg:dct-method`); the sink encoder picks up keys it
+    /// recognises and silently ignores the rest, mirroring IM's
+    /// "tolerant of irrelevant options" posture. Bare `-define KEY`
+    /// (no `=VALUE`) sets the key to JSON `true`.
+    Define { key: String, value: Option<String> },
     /// `-blur RxS`. Sigma defaults to `radius / 2.0` when the `xS`
     /// portion is omitted (matches IM's convention).
     Blur { radius: u32, sigma: f32 },

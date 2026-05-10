@@ -50,23 +50,62 @@ pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Erro
             Op::Resize {
                 width,
                 height,
-                bang,
+                mode,
             } => {
-                // IM's `!` skips aspect-ratio preservation. Our
-                // Resize always takes literal target dims, so bang vs
-                // non-bang maps to the same filter for now.  When we
-                // add aspect-preserving Resize mode the non-bang path
-                // gates it.
-                let _ = bang;
+                // The pipeline's resize factory takes literal target
+                // dims today. We forward `width`/`height` along with
+                // the geometry mode tag so a future executor pass can
+                // resolve the source-aware variants (Fill/Shrink/Grow/
+                // Percent/Area) against the actual frame size at
+                // DAG-build time. Until that lands, only `Default` and
+                // `Force` are pixel-accurate on the pipeline path —
+                // the source-aware modes degrade to `Default` semantics
+                // when the executor sees a mode it doesn't understand.
+                // The PDF side-channel (which already knows the source
+                // dims) honours every mode today.
                 chain = wrap(
                     chain,
                     "video.resize",
                     json!({
                         "width": width,
                         "height": height,
-                        "interpolation": "bilinear"
+                        "interpolation": "bilinear",
+                        "mode": mode.as_tag(),
                     }),
                 );
+            }
+            Op::Thumbnail {
+                width,
+                height,
+                mode,
+            } => {
+                // `-thumbnail` is sugar for `Resize + Strip` (and, on a
+                // future pass, EXIF auto-orient). Emit both downstream
+                // ops so the executor sees the same shape as a
+                // hand-written `-resize ... -strip`.
+                chain = wrap(
+                    chain,
+                    "video.resize",
+                    json!({
+                        "width": width,
+                        "height": height,
+                        "interpolation": "bilinear",
+                        "mode": mode.as_tag(),
+                    }),
+                );
+                strip_metadata = true;
+            }
+            Op::Define { key, value } => {
+                // Forward the literal key (preserving any `:` namespace
+                // separator) onto the codec params bag. Values that
+                // parse as integers / floats / booleans still come
+                // through as JSON strings — codecs that care about
+                // type can re-parse from the string. Bare `-define KEY`
+                // (no `=VALUE`) becomes `{"KEY": true}`.
+                match value {
+                    Some(v) => codec_params[key.clone()] = json!(v),
+                    None => codec_params[key.clone()] = json!(true),
+                }
             }
             Op::Blur { radius, sigma } => {
                 chain = wrap(
@@ -358,6 +397,7 @@ fn ext_of(path: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::op::ResizeMode;
 
     fn plan_with(ops: Vec<Op>) -> ConvertPlan {
         ConvertPlan {
@@ -399,7 +439,7 @@ mod tests {
             &plan_with(vec![Op::Resize {
                 width: 64,
                 height: 32,
-                bang: false,
+                mode: ResizeMode::Default,
             }]),
             &empty_ctx(),
         )
@@ -424,7 +464,7 @@ mod tests {
                 Op::Resize {
                     width: 64,
                     height: 64,
-                    bang: false,
+                    mode: ResizeMode::Default,
                 },
                 Op::Blur {
                     radius: 2,
@@ -456,6 +496,116 @@ mod tests {
         let track = &job.outputs.values().next().unwrap().all[0];
         assert_eq!(track.params["quality"], 85);
         assert_eq!(track.params["strip_metadata"], true);
+    }
+
+    #[test]
+    fn resize_mode_tag_emitted_in_filter_params() {
+        // Each ResizeMode round-trips through the JSON params as a
+        // stable lowercase tag. Future executor passes can branch off
+        // these without us re-shaping the IR.
+        for (mode, tag) in [
+            (ResizeMode::Default, "default"),
+            (ResizeMode::Force, "force"),
+            (ResizeMode::Fill, "fill"),
+            (ResizeMode::Shrink, "shrink"),
+            (ResizeMode::Grow, "grow"),
+            (ResizeMode::Percent, "percent"),
+            (ResizeMode::Area, "area"),
+        ] {
+            let job = plan_to_job(
+                &plan_with(vec![Op::Resize {
+                    width: 100,
+                    height: 100,
+                    mode,
+                }]),
+                &empty_ctx(),
+            )
+            .unwrap();
+            let track = &job.outputs.values().next().unwrap().all[0];
+            let f = match &track.input {
+                TrackInput::Filter(f) => f,
+                other => panic!("expected resize filter, got {other:?}"),
+            };
+            assert_eq!(f.params["mode"], tag, "mode={mode:?}");
+        }
+    }
+
+    #[test]
+    fn thumbnail_unrolls_into_resize_plus_strip() {
+        let job = plan_to_job(
+            &plan_with(vec![Op::Thumbnail {
+                width: 200,
+                height: 200,
+                mode: ResizeMode::Fill,
+            }]),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        // Resize node present with mode=fill.
+        let f = match &track.input {
+            TrackInput::Filter(f) => f,
+            other => panic!("expected outer resize filter, got {other:?}"),
+        };
+        assert_eq!(f.filter, "video.resize");
+        assert_eq!(f.params["mode"], "fill");
+        // And strip_metadata also set on the codec params side.
+        assert_eq!(track.params["strip_metadata"], true);
+    }
+
+    #[test]
+    fn define_with_value_lands_in_codec_params() {
+        let job = plan_to_job(
+            &plan_with(vec![Op::Define {
+                key: "jpeg:dct-method".into(),
+                value: Some("float".into()),
+            }]),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        assert_eq!(track.params["jpeg:dct-method"], "float");
+    }
+
+    #[test]
+    fn define_bare_key_becomes_json_true() {
+        let job = plan_to_job(
+            &plan_with(vec![Op::Define {
+                key: "png:strip-comments".into(),
+                value: None,
+            }]),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        assert_eq!(track.params["png:strip-comments"], true);
+    }
+
+    #[test]
+    fn multiple_defines_all_preserved() {
+        // Ensures sequential `-define` flags don't shadow each other.
+        let job = plan_to_job(
+            &plan_with(vec![
+                Op::Define {
+                    key: "jpeg:dct-method".into(),
+                    value: Some("float".into()),
+                },
+                Op::Define {
+                    key: "jpeg:optimize-coding".into(),
+                    value: Some("true".into()),
+                },
+                Op::Define {
+                    key: "webp:lossless".into(),
+                    value: None,
+                },
+            ]),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        assert_eq!(track.params["jpeg:dct-method"], "float");
+        assert_eq!(track.params["jpeg:optimize-coding"], "true");
+        assert_eq!(track.params["webp:lossless"], true);
     }
 
     // ---- codec_for_output coverage ----
@@ -1164,7 +1314,7 @@ mod tests {
                 Op::Resize {
                     width: 64,
                     height: 64,
-                    bang: false,
+                    mode: ResizeMode::Default,
                 },
                 Op::Sharpen {
                     radius: 1,

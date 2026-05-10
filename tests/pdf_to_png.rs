@@ -742,3 +742,188 @@ fn rotate_90_then_270_round_trips_dims() {
     let (rw, rh) = png_dims(&fs::read(&rt).unwrap());
     assert_eq!((rw, rh), (pw, ph));
 }
+
+// -------- Round-next: -resize geometry modes, -thumbnail, -define -------- //
+
+/// `-resize WxH!` forces exact dims regardless of source aspect ratio.
+/// Source is 200×100 pt at 72 DPI = 200×100 px; force-resize to 50×50.
+#[test]
+fn resize_force_bang_lands_on_exact_dims() {
+    let dir = temp_dir("resize-force");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("out.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            "-resize".into(),
+            "50x50!".into(),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("resize force render");
+    let (w, h) = png_dims(&fs::read(&out).unwrap());
+    assert_eq!((w, h), (50, 50), "force mode must give exact 50x50");
+}
+
+/// `-resize WxH` (default mode) preserves aspect ratio, fitting inside
+/// the box. Source 200×100 → request 100×100 → aspect-fit gives 100×50
+/// (width is the limit).
+#[test]
+fn resize_default_fits_inside_preserving_aspect() {
+    let dir = temp_dir("resize-default");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("out.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            "-resize".into(),
+            "100x100".into(),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("resize default render");
+    let (w, h) = png_dims(&fs::read(&out).unwrap());
+    assert_eq!(
+        (w, h),
+        (100, 50),
+        "default mode must fit 200×100 into 100×100"
+    );
+}
+
+/// `-resize WxH^` fills the box: 200×100 → 100×100^ → 200×100 (smaller
+/// dim hits target via the larger scale = max(100/200, 100/100) = 1.0;
+/// effectively no change here). Use 50×50^ which scales by max(50/200,
+/// 50/100) = 0.5, giving 100×50.
+#[test]
+fn resize_fill_caret_picks_larger_scale() {
+    let dir = temp_dir("resize-fill");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("out.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            "-resize".into(),
+            "50x50^".into(),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("resize fill render");
+    let (w, h) = png_dims(&fs::read(&out).unwrap());
+    assert_eq!((w, h), (100, 50), "fill mode picks the larger scale");
+}
+
+/// `-resize WxH>` only shrinks if the source is larger; otherwise
+/// pass-through. Source 200×100; request 1000×1000> → no-op.
+#[test]
+fn resize_shrink_only_skips_when_already_smaller() {
+    let dir = temp_dir("resize-shrink");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("out.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            "-resize".into(),
+            "1000x1000>".into(),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("resize shrink render");
+    let (w, h) = png_dims(&fs::read(&out).unwrap());
+    assert_eq!(
+        (w, h),
+        (200, 100),
+        "shrink-only must pass through smaller input"
+    );
+}
+
+/// `-resize N%` scales both axes by N percent. Source 200×100 at 50% →
+/// 100×50.
+#[test]
+fn resize_percent_halves_both_axes() {
+    let dir = temp_dir("resize-percent");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("out.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            "-resize".into(),
+            "50%".into(),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("resize percent render");
+    let (w, h) = png_dims(&fs::read(&out).unwrap());
+    assert_eq!((w, h), (100, 50), "50% must halve both axes");
+}
+
+/// `-thumbnail WxH` resolves the same geometry as `-resize` and (for
+/// the side-channel) is otherwise indistinguishable from
+/// `-resize WxH`. Source 200×100; thumbnail 100×100 → 100×50.
+#[test]
+fn thumbnail_renders_with_geometry_resolution() {
+    let dir = temp_dir("thumbnail");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("out.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-density".into(),
+            "72".into(),
+            "-thumbnail".into(),
+            "100x100".into(),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("thumbnail render");
+    let (w, h) = png_dims(&fs::read(&out).unwrap());
+    assert_eq!((w, h), (100, 50), "thumbnail honours fit-inside aspect");
+}
+
+/// `-define KEY=VALUE` is accepted on the PDF side-channel. The
+/// side-channel doesn't consume the key (it's a sink-side hint), but
+/// the render must still succeed end-to-end.
+#[test]
+fn define_flag_accepted_on_pdf_side_channel() {
+    let dir = temp_dir("define");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("out.jpg");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0]", pdf_path.to_string_lossy()),
+            "-background".into(),
+            "white".into(),
+            "-alpha".into(),
+            "remove".into(),
+            "-define".into(),
+            "jpeg:dct-method=float".into(),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("define render");
+    let bytes = fs::read(&out).unwrap();
+    assert_eq!(&bytes[..2], &[0xff, 0xd8], "JPEG SOI expected");
+}

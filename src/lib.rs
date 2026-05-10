@@ -41,7 +41,7 @@ pub mod plan_to_job;
 pub mod probe;
 pub mod suggest;
 
-pub use op::{AlphaOp, ConvertPlan, Dither, Op, PrintfTemplate};
+pub use op::{AlphaOp, ConvertPlan, Dither, Op, PrintfTemplate, ResizeMode};
 
 use oxideav_core::{Error, RuntimeContext};
 

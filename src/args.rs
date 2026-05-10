@@ -8,7 +8,7 @@
 
 use crate::op::{
     AlphaOp, ConvertPlan, Dither, GltfFormatChoice, Mesh3DOptions, Op, PageSelector,
-    PrintfTemplate, StlFormatChoice,
+    PrintfTemplate, ResizeMode, StlFormatChoice,
 };
 use oxideav_core::Error;
 
@@ -60,17 +60,53 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
         match flag.as_str() {
             "-resize" => {
                 let v = val(i + 1)?;
-                let (bang, core) = match v.strip_suffix('!') {
-                    Some(c) => (true, c),
-                    None => (false, v),
-                };
-                let (w, h) = parse_wxh(core)
+                let (mode, core) = ResizeMode::split_suffix(v);
+                let (w, h) = parse_resize_geometry(core, mode)
                     .map_err(|e| Error::invalid(format!("convert: -resize: {e}")))?;
                 ops.push(Op::Resize {
                     width: w,
                     height: h,
-                    bang,
+                    mode,
                 });
+                i += 2;
+            }
+            // `-thumbnail` is IM's "make a small representative image"
+            // convenience flag. Same geometry grammar as `-resize`;
+            // semantics differ in that IM also strips metadata and
+            // (for JPEG inputs) honours EXIF orientation. We unroll it
+            // into [`Op::Thumbnail`] which the runners expand to
+            // `Resize { mode } + Strip` (auto-orient is documented as
+            // a follow-up — needs an EXIF reader on the source side).
+            "-thumbnail" => {
+                let v = val(i + 1)?;
+                let (mode, core) = ResizeMode::split_suffix(v);
+                let (w, h) = parse_resize_geometry(core, mode)
+                    .map_err(|e| Error::invalid(format!("convert: -thumbnail: {e}")))?;
+                ops.push(Op::Thumbnail {
+                    width: w,
+                    height: h,
+                    mode,
+                });
+                i += 2;
+            }
+            // `-define KEY[=VALUE]` — opaque codec-specific tunable.
+            // Forwarded literally to the sink encoder; the encoder
+            // ignores keys it doesn't recognise. IM's grammar uses `:`
+            // inside the key as a namespace separator (e.g.
+            // `jpeg:dct-method=float`); we don't parse that — the key
+            // is preserved verbatim.
+            "-define" => {
+                let v = val(i + 1)?;
+                let (key, value) = match v.split_once('=') {
+                    Some((k, val)) => (k.to_string(), Some(val.to_string())),
+                    None => (v.to_string(), None),
+                };
+                if key.is_empty() {
+                    return Err(Error::invalid(format!(
+                        "convert: -define: '{v}' has an empty KEY (expected KEY[=VALUE])"
+                    )));
+                }
+                ops.push(Op::Define { key, value });
                 i += 2;
             }
             "-blur" => {
@@ -673,6 +709,46 @@ fn translate_input_shorthand(input: &str) -> String {
     input.to_string()
 }
 
+/// Parse the geometry-without-suffix portion of a `-resize` /
+/// `-thumbnail` arg, branching on the scaling mode the suffix already
+/// selected.
+///
+/// Most modes parse exactly like `WxH` (two positive integers). A few
+/// modes have looser grammar:
+///
+/// - [`ResizeMode::Percent`] — `N`, `Nx`, `xN`, `NxN`. A bare `N`
+///   applies to both axes; missing axes default to the other one
+///   (`200x` → `200x200`; `x200` → `200x200`). Components must be
+///   integer percentages > 0.
+/// - [`ResizeMode::Area`] — same `WxH` shape; the runtime treats
+///   `W*H` as the target pixel area.
+/// - Everything else — strict `WxH`, both > 0.
+fn parse_resize_geometry(s: &str, mode: ResizeMode) -> Result<(u32, u32), String> {
+    if matches!(mode, ResizeMode::Percent) {
+        // `N` / `Nx` / `xN` / `NxN`. Single-number form replicates.
+        let s = s.trim();
+        let (w_str, h_str) = match s.split_once(['x', 'X']) {
+            None => (s, s), // bare N → both axes
+            Some((w, h)) => {
+                let w = if w.is_empty() { h } else { w };
+                let h = if h.is_empty() { w } else { h };
+                (w, h)
+            }
+        };
+        let w: u32 = w_str
+            .parse()
+            .map_err(|_| format!("'{w_str}' is not a non-negative integer percent"))?;
+        let h: u32 = h_str
+            .parse()
+            .map_err(|_| format!("'{h_str}' is not a non-negative integer percent"))?;
+        if w == 0 || h == 0 {
+            return Err("percent values must both be > 0".into());
+        }
+        return Ok((w, h));
+    }
+    parse_wxh(s)
+}
+
 /// Parse `WxH` — width × height. Accepts either lowercase `x` or
 /// uppercase `X`. Both parts must be non-negative integers.
 fn parse_wxh(s: &str) -> Result<(u32, u32), String> {
@@ -1058,7 +1134,7 @@ mod tests {
             vec![Op::Resize {
                 width: 800,
                 height: 600,
-                bang: false
+                mode: ResizeMode::Default,
             }]
         );
     }
@@ -1071,8 +1147,159 @@ mod tests {
             vec![Op::Resize {
                 width: 64,
                 height: 32,
-                bang: true
+                mode: ResizeMode::Force,
             }]
+        );
+    }
+
+    #[test]
+    fn resize_fill_caret_suffix() {
+        let p = parse(&to_vec(&["a.png", "-resize", "200x100^", "b.jpg"])).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::Resize {
+                width: 200,
+                height: 100,
+                mode: ResizeMode::Fill,
+            }]
+        );
+    }
+
+    #[test]
+    fn resize_shrink_only_suffix() {
+        let p = parse(&to_vec(&["a.png", "-resize", "100x100>", "b.jpg"])).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::Resize {
+                width: 100,
+                height: 100,
+                mode: ResizeMode::Shrink,
+            }]
+        );
+    }
+
+    #[test]
+    fn resize_grow_only_suffix() {
+        let p = parse(&to_vec(&["a.png", "-resize", "1024x1024<", "b.jpg"])).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::Resize {
+                width: 1024,
+                height: 1024,
+                mode: ResizeMode::Grow,
+            }]
+        );
+    }
+
+    #[test]
+    fn resize_percent_two_axis() {
+        let p = parse(&to_vec(&["a.png", "-resize", "50x200%", "b.jpg"])).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::Resize {
+                width: 50,
+                height: 200,
+                mode: ResizeMode::Percent,
+            }]
+        );
+    }
+
+    #[test]
+    fn resize_percent_single_value_replicates() {
+        // IM lets a bare `N%` mean "N percent on both axes"; we follow.
+        let p = parse(&to_vec(&["a.png", "-resize", "75%", "b.jpg"])).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::Resize {
+                width: 75,
+                height: 75,
+                mode: ResizeMode::Percent,
+            }]
+        );
+    }
+
+    #[test]
+    fn resize_area_at_suffix() {
+        let p = parse(&to_vec(&["a.png", "-resize", "640x480@", "b.jpg"])).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::Resize {
+                width: 640,
+                height: 480,
+                mode: ResizeMode::Area,
+            }]
+        );
+    }
+
+    #[test]
+    fn thumbnail_with_geometry_modifier() {
+        let p = parse(&to_vec(&["a.png", "-thumbnail", "128x128^", "b.jpg"])).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::Thumbnail {
+                width: 128,
+                height: 128,
+                mode: ResizeMode::Fill,
+            }]
+        );
+    }
+
+    #[test]
+    fn thumbnail_default_mode() {
+        let p = parse(&to_vec(&["a.png", "-thumbnail", "100x100", "b.jpg"])).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::Thumbnail {
+                width: 100,
+                height: 100,
+                mode: ResizeMode::Default,
+            }]
+        );
+    }
+
+    #[test]
+    fn define_with_value_round_trips_namespaced_key() {
+        let p = parse(&to_vec(&[
+            "a.png",
+            "-define",
+            "jpeg:dct-method=float",
+            "b.jpg",
+        ]))
+        .unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::Define {
+                key: "jpeg:dct-method".into(),
+                value: Some("float".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn define_bare_key_no_value() {
+        // `-define KEY` (no `=VALUE`) sets the flag-style key to JSON true.
+        let p = parse(&to_vec(&[
+            "a.png",
+            "-define",
+            "png:strip-comments",
+            "b.png",
+        ]))
+        .unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::Define {
+                key: "png:strip-comments".into(),
+                value: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn define_empty_key_rejected() {
+        let err = parse(&to_vec(&["a.png", "-define", "=value", "b.png"])).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("empty KEY"),
+            "unexpected error: {err:?}"
         );
     }
 
