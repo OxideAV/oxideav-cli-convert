@@ -409,9 +409,12 @@ fn encode_bmp(img: &RgbaImage) -> Result<Vec<u8>> {
             stride: img.stride,
             data: img.pixels.clone(),
         }],
+        palette: None,
         pts: None,
     };
-    bmp_encode(&bmp).map_err(|e| Error::invalid(format!("convert: BMP encode failed: {e:?}")))
+    bmp_encode(&bmp)
+        .map(|(bytes, _format)| bytes)
+        .map_err(|e| Error::invalid(format!("convert: BMP encode failed: {e:?}")))
 }
 
 fn encode_webp(img: &RgbaImage) -> Result<Vec<u8>> {
