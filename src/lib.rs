@@ -31,6 +31,8 @@
 //! ```
 
 pub mod args;
+#[cfg(feature = "mesh3d")]
+pub mod mesh3d_runner;
 pub mod op;
 pub mod pdf_runner;
 pub mod ping;
@@ -66,6 +68,34 @@ pub fn run(args: &[String], ctx: &RuntimeContext) -> Result<(), Error> {
     // specific to `convert`. See `pdf_runner` module docs.
     if pdf_runner::is_pdf_input(&plan.input) {
         return pdf_runner::run(&plan);
+    }
+
+    // Side-channel: 3D-asset inputs (STL/OBJ/glTF/GLB/USDZ/MTL) go
+    // through a Mesh3DRegistry-driven decode→encode bridge. 3D scenes
+    // don't fit any of the codec/container shapes the regular pipeline
+    // walks, and the dispatch contract is a separate registry from
+    // `RuntimeContext`'s codec/container/filter/source path. See
+    // `mesh3d_runner` module docs.
+    #[cfg(feature = "mesh3d")]
+    if mesh3d_runner::is_mesh3d_input(&plan.input) {
+        if !mesh3d_runner::is_mesh3d_output(&plan.output) {
+            return Err(Error::invalid(format!(
+                "convert: 3D input '{}' must pair with a 3D output extension (.stl/.obj/.gltf/.glb/.mtl); got '{}'. 3D→raster rendering is a separate follow-up.",
+                plan.input, plan.output
+            )));
+        }
+        if plan.output_template.is_some() {
+            return Err(Error::invalid(format!(
+                "convert: output '{}' has a `%d` template but 3D scenes are single-document; remove the template",
+                plan.output
+            )));
+        }
+        if !plan.ops.is_empty() {
+            eprintln!(
+                "convert: note: raster ops ignored on 3D-asset conversion (stl/obj/gltf/glb/mtl have no pixel grid)"
+            );
+        }
+        return mesh3d_runner::run(&plan.input, &plan.output);
     }
 
     let job = plan_to_job::plan_to_job(&plan, ctx)?;

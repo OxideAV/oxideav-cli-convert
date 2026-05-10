@@ -1,0 +1,224 @@
+//! End-to-end: build a tiny [`Scene3D`] (one triangle), encode it as
+//! STL on disk, run `convert` to translate STL → OBJ and STL → glTF,
+//! then assert the output files exist with sensible byte signatures.
+//!
+//! Cargo-feature-gated on `mesh3d` — the test crate is empty when
+//! the feature is off (matches the side-channel module's gating).
+
+#![cfg(feature = "mesh3d")]
+
+use std::fs;
+use std::path::PathBuf;
+
+use oxideav_cli_convert::run as convert_run;
+use oxideav_core::RuntimeContext;
+use oxideav_mesh3d::{Mesh, Mesh3DRegistry, Node, Primitive, Scene3D, Topology, Transform};
+
+fn ctx() -> RuntimeContext {
+    RuntimeContext::new()
+}
+
+fn temp_dir(name: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "oxideav-cli-convert-mesh3d-{name}-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&p).expect("temp dir");
+    p
+}
+
+/// Build a single-triangle [`Scene3D`] suitable for round-tripping
+/// through every 3D format we wire (STL/OBJ/glTF). Keeps the topology
+/// to plain `Triangles` + raw positions so the OBJ encoder (which
+/// requires triangulated input) doesn't reject it.
+fn make_one_triangle_scene() -> Scene3D {
+    let mut prim = Primitive::new(Topology::Triangles);
+    prim.positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+    let mesh = Mesh::new("triangle".to_string()).with_primitive(prim);
+
+    let mut scene = Scene3D::new();
+    scene.meshes.push(mesh);
+
+    let node = Node {
+        name: Some("triangle-node".to_string()),
+        mesh: Some(oxideav_mesh3d::MeshId(0)),
+        transform: Transform::identity(),
+        ..Node::default()
+    };
+    scene.nodes.push(node);
+    scene.roots.push(oxideav_mesh3d::NodeId(0));
+
+    scene
+}
+
+/// Encode the scene as binary STL and write it to `path`. Goes through
+/// the same registry the convert verb uses so the bytes that land on
+/// disk match what the CLI sees.
+fn write_stl_fixture(path: &std::path::Path, scene: &Scene3D) {
+    let mut reg = Mesh3DRegistry::new();
+    oxideav_meta::populate_mesh3d_registry(&mut reg);
+    let mut enc = reg
+        .encoder_for_extension("stl")
+        .expect("STL encoder registered");
+    let bytes = enc.encode(scene).expect("STL encode succeeds");
+    fs::write(path, bytes).expect("write STL fixture");
+}
+
+#[test]
+fn convert_stl_to_obj_writes_obj_with_v_lines() {
+    let dir = temp_dir("stl-to-obj");
+    let stl_path = dir.join("input.stl");
+    let obj_path = dir.join("output.obj");
+
+    let scene = make_one_triangle_scene();
+    write_stl_fixture(&stl_path, &scene);
+
+    let args = vec![
+        stl_path.to_string_lossy().into_owned(),
+        obj_path.to_string_lossy().into_owned(),
+    ];
+    convert_run(&args, &ctx()).expect("convert STL→OBJ succeeds");
+
+    assert!(obj_path.exists(), "OBJ output should exist");
+    let body = fs::read_to_string(&obj_path).expect("read OBJ output");
+    // Wavefront OBJ vertex lines start with `v `; expect at least one.
+    assert!(
+        body.lines().any(|l| l.starts_with("v ")),
+        "OBJ output should contain `v` (vertex) lines, got:\n{body}"
+    );
+    // And a face line — STL→OBJ via Scene3D round-trip should
+    // preserve the single triangle.
+    assert!(
+        body.lines().any(|l| l.starts_with("f ")),
+        "OBJ output should contain `f` (face) lines, got:\n{body}"
+    );
+}
+
+#[test]
+fn convert_stl_to_gltf_writes_json() {
+    let dir = temp_dir("stl-to-gltf");
+    let stl_path = dir.join("input.stl");
+    let gltf_path = dir.join("output.gltf");
+
+    let scene = make_one_triangle_scene();
+    write_stl_fixture(&stl_path, &scene);
+
+    let args = vec![
+        stl_path.to_string_lossy().into_owned(),
+        gltf_path.to_string_lossy().into_owned(),
+    ];
+    convert_run(&args, &ctx()).expect("convert STL→glTF succeeds");
+
+    assert!(gltf_path.exists(), "glTF output should exist");
+    let body = fs::read_to_string(&gltf_path).expect("read glTF output");
+    // glTF JSON envelope should mention the asset block.
+    assert!(
+        body.contains("\"asset\""),
+        "glTF output should be JSON with an \"asset\" key, got:\n{body}"
+    );
+}
+
+#[test]
+fn convert_obj_to_gltf_works_end_to_end() {
+    // Build an OBJ fixture via the registry (so we don't have to
+    // hand-author the text format), then convert OBJ → glTF.
+    let dir = temp_dir("obj-to-gltf");
+    let obj_path = dir.join("input.obj");
+    let gltf_path = dir.join("output.gltf");
+
+    let scene = make_one_triangle_scene();
+    {
+        let mut reg = Mesh3DRegistry::new();
+        oxideav_meta::populate_mesh3d_registry(&mut reg);
+        let mut enc = reg
+            .encoder_for_extension("obj")
+            .expect("OBJ encoder registered");
+        let bytes = enc.encode(&scene).expect("OBJ encode succeeds");
+        fs::write(&obj_path, bytes).expect("write OBJ fixture");
+    }
+
+    let args = vec![
+        obj_path.to_string_lossy().into_owned(),
+        gltf_path.to_string_lossy().into_owned(),
+    ];
+    convert_run(&args, &ctx()).expect("convert OBJ→glTF succeeds");
+
+    let body = fs::read_to_string(&gltf_path).expect("read glTF output");
+    assert!(body.contains("\"asset\""), "glTF should mention asset");
+}
+
+#[test]
+fn convert_stl_to_glb_writes_binary_container() {
+    let dir = temp_dir("stl-to-glb");
+    let stl_path = dir.join("input.stl");
+    let glb_path = dir.join("output.glb");
+
+    let scene = make_one_triangle_scene();
+    write_stl_fixture(&stl_path, &scene);
+
+    let args = vec![
+        stl_path.to_string_lossy().into_owned(),
+        glb_path.to_string_lossy().into_owned(),
+    ];
+    convert_run(&args, &ctx()).expect("convert STL→GLB succeeds");
+
+    let bytes = fs::read(&glb_path).expect("read GLB output");
+    // GLB binary container starts with the magic `glTF` (0x46546C67 LE).
+    assert!(
+        bytes.len() >= 4 && &bytes[..4] == b"glTF",
+        "GLB output should start with the `glTF` magic, got first 4 bytes: {:?}",
+        &bytes[..bytes.len().min(4)]
+    );
+}
+
+#[test]
+fn convert_3d_input_to_non_3d_output_errors() {
+    // A 3D-input + raster-output combo should be rejected with a
+    // clear "must pair with a 3D output extension" message — not
+    // silently fall through to the pipeline path (which would
+    // probably misdiagnose the failure).
+    let dir = temp_dir("stl-to-png-rejected");
+    let stl_path = dir.join("input.stl");
+    let png_path = dir.join("output.png");
+
+    let scene = make_one_triangle_scene();
+    write_stl_fixture(&stl_path, &scene);
+
+    let args = vec![
+        stl_path.to_string_lossy().into_owned(),
+        png_path.to_string_lossy().into_owned(),
+    ];
+    let err = convert_run(&args, &ctx()).expect_err("STL→PNG should fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("must pair with a 3D output extension"),
+        "expected pairing-mismatch error, got: {msg}"
+    );
+}
+
+#[test]
+fn convert_3d_input_with_printf_template_errors() {
+    // 3D scenes are single-document — a `%d` template makes no sense.
+    let dir = temp_dir("stl-with-template-rejected");
+    let stl_path = dir.join("input.stl");
+
+    let scene = make_one_triangle_scene();
+    write_stl_fixture(&stl_path, &scene);
+
+    let args = vec![
+        stl_path.to_string_lossy().into_owned(),
+        dir.join("out-%02d.obj").to_string_lossy().into_owned(),
+    ];
+    let err = convert_run(&args, &ctx()).expect_err("STL + %d should fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("`%d` template"),
+        "expected template-rejection error, got: {msg}"
+    );
+}

@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- 3D-asset side-channel — `convert cube.stl cube.obj`,
+  `convert model.obj model.gltf`, `convert scene.gltf scene.glb`,
+  `convert archive.usdz extracted.gltf`, etc. work end-to-end.
+  Inputs sniffed by extension (`.stl` / `.obj` / `.gltf` / `.glb` /
+  `.usdz` / `.mtl`); decode → re-encode runs through a
+  `oxideav_mesh3d::Mesh3DRegistry` populated by
+  `oxideav_meta::populate_mesh3d_registry`. USDZ is read-only today
+  (decoder registered, no encoder factory). Raster ops (`-resize`,
+  `-blur`, …) are silently ignored for 3D-asset conversions — they
+  have no pixel grid.
+- `mesh3d_runner` module with `is_mesh3d_input` / `is_mesh3d_output`
+  recognisers and a `run(input, output)` driver that picks decoder /
+  encoder by file extension and surfaces friendly error messages
+  (`"no 3D decoder registered for input extension '.xyz' (known:
+  .stl, .obj, .gltf, .glb, .usdz, .mtl)"`).
+- `mesh3d` cargo feature (default-on). Pulls `oxideav-mesh3d` plus
+  `oxideav-meta = { version = "0.0", default-features = false,
+  features = ["3d"] }` so the convert verb only drags the four
+  format codecs (stl/obj/gltf/usdz) into its dep tree, not every
+  audio/video/image sibling that meta's default `all` preset would
+  bring. Slim builds (`--no-default-features --features generator`)
+  drop the side-channel and 3D inputs fall through cleanly.
+- 3D→non-3D output and 3D + `%d`-template inputs are rejected
+  before decode with a clear, actionable error message.
+- End-to-end integration tests in `tests/mesh3d_convert.rs` covering
+  STL→OBJ, STL→glTF (JSON envelope check), STL→GLB (`glTF` magic
+  check), OBJ→glTF round-trip, plus the two error paths above.
+
 - Four more IM colour-grading flags wired to the matching
   `oxideav-image-filter` factory (registers as `vignette` / `colorize` /
   `equalize` / `auto-gamma` once the consumer pulls a published

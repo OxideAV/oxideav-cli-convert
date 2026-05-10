@@ -69,6 +69,7 @@ follow-up; today it errors with a clear message.
 | `http(s)://` | `oxideav-http` | `https://example.com/v.mp4` |
 | Generator shorthand | `oxideav-generator` | `xc:red`, `gradient:red-blue`, `pattern:checkerboard`, `plasma:`, `mandelbrot:`, `synth:5,sine,440`, `testsrc:`, `smptebars:`, `noise:perlin`, `label:Hello world` |
 | PDF (side-channel) | `oxideav-pdf` | `input.pdf`, `report.pdf[0]`, `report.pdf[2-5]` |
+| 3D asset (side-channel) | `oxideav-mesh3d` registry (`mesh3d` feature) | `cube.stl`, `model.obj`, `scene.gltf`, `scene.glb`, `archive.usdz`, `materials.mtl` |
 
 ### `[N]` / `[N-M]` page selectors
 
@@ -110,6 +111,23 @@ When the output filename contains a single `%[0-9]*d` token (e.g.
 substituting the index. Multiple `%d`s, `%s`, `%x`, etc. are
 rejected with a precise error.
 
+### Routing matrix (3D-asset input)
+
+The `mesh3d` cargo feature (default-on) wires `oxideav-mesh3d` plus
+the format codecs (stl/obj/gltf/usdz) through `oxideav-meta`'s
+`populate_mesh3d_registry` helper. With the feature off the side-channel
+disappears and 3D inputs fall through to the regular pipeline path.
+
+| Input | Output | Action |
+|---|---|---|
+| 3D format | matching 3D format (`.stl`/`.obj`/`.gltf`/`.glb`/`.mtl`) | decode → re-encode through `Mesh3DRegistry` |
+| 3D format | non-3D extension (`.png`, `.mp4`, …) | error — 3D→raster rendering is a documented follow-up |
+| 3D format | output with `%d` template | error — 3D scenes are single-document |
+
+USDZ is read-only today (decoder registered, no encoder). Raster ops
+(`-resize`, `-blur`, …) are silently ignored for 3D-asset conversions —
+they have no pixel grid.
+
 ### Routing matrix (PDF input)
 
 | Input | Output | Template? | Action |
@@ -150,6 +168,12 @@ oxideav convert input.pdf       page-%d.svg
 # PDF → smaller PDF (page extraction, vector preserved)
 oxideav convert input.pdf[0] just-the-cover.pdf
 oxideav convert input.pdf[10-20] excerpt.pdf
+
+# 3D-asset format conversion (mesh3d feature; default-on)
+oxideav convert cube.stl cube.obj
+oxideav convert model.obj model.gltf
+oxideav convert scene.gltf scene.glb
+oxideav convert archive.usdz extracted.gltf
 ```
 
 ## Round-3 follow-ups

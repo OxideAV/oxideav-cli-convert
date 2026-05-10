@@ -14,12 +14,20 @@ keywords = ["multimedia", "convert", "imagemagick", "cli", "pipeline"]
 categories = ["multimedia", "command-line-utilities"]
 
 [features]
-default = ["generator"]
+default = ["generator", "mesh3d"]
 # Hooks the oxideav-generator shorthand translator into the convert
 # arg parser (`xc:`, `pattern:`, `gradient:`, `synth:`, `testsrc:`, …).
 # Off → those shorthands fall through unchanged and the source registry
 # rejects them as unknown URIs.
 generator = ["dep:oxideav-generator"]
+# Wires the 3D-asset side-channel: STL / OBJ / glTF / GLB / USDZ
+# inputs decode into an `oxideav_mesh3d::Scene3D`, then encode through
+# the matching encoder factory pulled out of the
+# `Mesh3DRegistry` populated by `oxideav_meta::populate_mesh3d_registry`.
+# Off → 3D-format inputs fall through to the regular pipeline path,
+# which doesn't know what to do with them and errors out cleanly.
+# Slim builds (no 3D in the dep tree) compile fine without this.
+mesh3d = ["dep:oxideav-mesh3d", "dep:oxideav-meta"]
 
 [dependencies]
 oxideav-core = "0.1"
@@ -41,5 +49,15 @@ oxideav-mjpeg = "0.1"
 oxideav-webp = "0.1"
 # SVG writer for the per-page vector output path (PDF→SVG, no raster).
 oxideav-svg = "0.1"
+# 3D-asset side-channel — typed Scene3D model + the helper that fills
+# a registry with every enabled 3D-format codec sibling
+# (stl/obj/gltf/usdz). Both deps are optional + gated on the `mesh3d`
+# feature so a slim build without 3D in the dep tree still compiles.
+# `oxideav-meta`'s default features pull every codec/container/filter
+# in the workspace; we explicitly opt down to just `3d` so we don't
+# drag in audio/video/image siblings the convert verb already wires
+# directly.
+oxideav-mesh3d = { version = "0.0", optional = true }
+oxideav-meta = { version = "0.0", optional = true, default-features = false, features = ["3d"] }
 indexmap = "2"
 serde_json = "1"
