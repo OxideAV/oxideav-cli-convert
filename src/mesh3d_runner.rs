@@ -113,8 +113,9 @@ pub fn run(input_path: &str, output_path: &str, options: &Mesh3DOptions) -> Resu
     validate_options_against_output(&out_ext, options)?;
 
     let mut decoder = registry.decoder_for_extension(&in_ext).ok_or_else(|| {
+        let hint = crate::suggest::format_hint(&in_ext, MESH3D_INPUT_EXTS);
         Error::unsupported(format!(
-            "convert: no 3D decoder registered for input extension '.{in_ext}' (known: {})",
+            "convert: no 3D decoder registered for input extension '.{in_ext}'{hint} (known: {})",
             joined_known_inputs()
         ))
     })?;
@@ -171,8 +172,9 @@ fn pick_encoder(
         _ => {}
     }
     registry.encoder_for_extension(out_ext).ok_or_else(|| {
+        let hint = crate::suggest::format_hint(out_ext, MESH3D_OUTPUT_EXTS);
         Error::unsupported(format!(
-            "convert: no 3D encoder registered for output extension '.{out_ext}' (known: {})",
+            "convert: no 3D encoder registered for output extension '.{out_ext}'{hint} (known: {})",
             joined_known_outputs()
         ))
     })
@@ -284,6 +286,56 @@ mod tests {
         assert!(
             msg.contains("no 3D encoder registered for output extension '.xyz'"),
             "message was: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_input_extension_suggests_close_match() {
+        // `.gtlf` is one transposition away from `.gltf` — the
+        // did-you-mean clause should fire.
+        let err = run(
+            "/tmp/does-not-exist.gtlf",
+            "/tmp/out.stl",
+            &Mesh3DOptions::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("did you mean '.gltf'?"),
+            "expected did-you-mean hint, message was: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_output_extension_suggests_close_match() {
+        // `.glft` is one transposition from `.gltf`.
+        let err = run(
+            "/tmp/does-not-exist.stl",
+            "/tmp/out.glft",
+            &Mesh3DOptions::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("did you mean '.gltf'?"),
+            "expected did-you-mean hint, message was: {msg}"
+        );
+    }
+
+    #[test]
+    fn unrelated_unknown_extension_no_hint() {
+        // `.png` is too far from any 3D extension — no hint should be
+        // appended.
+        let err = run(
+            "/tmp/does-not-exist.png",
+            "/tmp/out.stl",
+            &Mesh3DOptions::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            !msg.contains("did you mean"),
+            "expected no hint, message was: {msg}"
         );
     }
 }

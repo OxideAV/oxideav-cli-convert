@@ -221,6 +221,14 @@ counting unique font names from the text-extraction layer would
 over-count synthetic encoding splits. Documented as a cross-crate
 follow-up.
 
+`--watch` paired with `--probe` re-runs the probe whenever the input
+file's mtime changes, polling once a second. Each fresh report goes
+to stdout in the same format the one-shot mode would have used; in
+`--json` form each report is its own line so the output is well-formed
+JSON-lines (`convert --probe --json --watch in.png | jq` works). The
+loop runs forever and exits only on Ctrl+C / SIGINT — useful for
+live-monitoring a render-in-progress.
+
 ```
 # Pretty-printed summary (default)
 oxideav convert --probe input.pdf
@@ -230,7 +238,25 @@ oxideav convert --probe sound.mp3
 # Single-line JSON (machine-readable)
 oxideav convert --probe --json input.pdf
 oxideav convert --probe --json movie.mp4 | jq .streams[0].codec_id
+
+# Live-monitor a render-in-progress (re-probes on mtime change)
+oxideav convert --probe --watch  rendering.png
+oxideav convert --probe --json --watch rendering.png | jq -c .file_size_bytes
 ```
+
+## "Did you mean?" suggestions
+
+Unrecognised extensions on 3D-asset inputs / outputs trigger a
+Levenshtein-distance hint:
+
+```
+$ oxideav convert model.gtlf out.obj
+convert: no 3D decoder registered for input extension '.gtlf' (did you mean '.gltf'?) (known: .stl, .obj, .gltf, .glb, .usdz, .mtl)
+```
+
+The hint fires when the bad extension is within `max(2, len/3)` edits
+of one of the supported set; unrelated typos (`.png` vs the 3D set)
+get the base error with no misleading suggestion.
 
 ## Round-3 follow-ups
 

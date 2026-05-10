@@ -38,6 +38,7 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
     let mut ping = false;
     let mut probe = false;
     let mut probe_json = false;
+    let mut probe_watch = false;
     let mut mesh3d_options = Mesh3DOptions::default();
 
     let mut i = 0;
@@ -152,6 +153,16 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
             // "unknown flag" one.
             "--json" => {
                 probe_json = true;
+                i += 1;
+            }
+            // `--watch` re-runs the probe whenever the input file's
+            // mtime changes. Like `--json`, it's only meaningful paired
+            // with `--probe` (there's no other long-running mode for it
+            // to attach to); the post-loop validation surfaces a clear
+            // "needs --probe" error rather than a generic "unknown
+            // flag" one.
+            "--watch" => {
+                probe_watch = true;
                 i += 1;
             }
             "-density" => {
@@ -433,6 +444,14 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
             "convert: --json requires --probe (today --json only formats the probe summary)",
         ));
     }
+    // `--watch` re-runs the probe on mtime change; only meaningful
+    // paired with `--probe`. Without `--probe` there's no long-running
+    // mode for it to attach to.
+    if probe_watch && !probe {
+        return Err(Error::invalid(
+            "convert: --watch requires --probe (today --watch only re-runs the probe on input mtime change)",
+        ));
+    }
 
     let (raw_input, input_pages) = split_input_selector(&positionals[0])?;
     let input = translate_input_shorthand(raw_input);
@@ -452,6 +471,7 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
         ping,
         probe,
         probe_json,
+        probe_watch,
         mesh3d_options,
     })
 }

@@ -231,7 +231,22 @@ fn json_string(s: &str) -> String {
 
 /// Print a probe summary for `plan.input` to stdout. Routing mirrors
 /// [`crate::run`] — PDF / 3D side-channels, then container fallback.
+///
+/// In `--watch` mode (paired with `--probe`), the probe is re-run
+/// whenever the input file's mtime changes, polling once per second.
+/// Each fresh report goes to stdout in the same format the one-shot
+/// mode would have used; in `--json` form each report is its own line
+/// so the output is well-formed JSON-lines. The loop runs forever and
+/// exits only on Ctrl+C / SIGINT.
 pub fn run(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<()> {
+    if plan.probe_watch {
+        return run_watch(plan, ctx);
+    }
+    print_one(plan, ctx)
+}
+
+/// One-shot probe: build the summary and print it.
+fn print_one(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<()> {
     let line = render(plan, ctx)?;
     if plan.probe_json {
         println!("{line}");
@@ -242,6 +257,57 @@ pub fn run(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<()> {
         print!("{line}");
     }
     Ok(())
+}
+
+/// Live-monitoring loop. Probes once at startup, then re-probes
+/// whenever the input file's mtime advances. Polling cadence is one
+/// second — fast enough for interactive feedback, slow enough that a
+/// long-running probe of a multi-MB PDF doesn't stack up.
+///
+/// The mtime is fetched via `std::fs::metadata` rather than an
+/// `inotify`-style watcher so the implementation stays portable
+/// (macOS, Linux, Windows) and dep-free. Errors during a re-probe
+/// (file truncated mid-write, transient I/O failure) are reported to
+/// stderr and the loop continues — losing one frame of output is
+/// strictly better than tearing down the whole watch session.
+fn run_watch(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<()> {
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    // Initial probe + initial mtime baseline. The first probe failing
+    // is not graceful-degradation territory — the user gave us an
+    // unreadable input. Surface it.
+    let mut last_mtime = mtime_of(&plan.input);
+    print_one(plan, ctx)?;
+
+    let poll_interval = Duration::from_secs(1);
+    loop {
+        sleep(poll_interval);
+        let cur_mtime = mtime_of(&plan.input);
+        // Only re-probe when the mtime *changed* — both `Some(t)` →
+        // `Some(t')` (file was rewritten) and `Some(t)` → `None` (file
+        // disappeared) qualify; `None` → `None` and `Some(t)` →
+        // `Some(t)` don't. The match is exhaustive so a future
+        // SystemTime variant doesn't sneak through.
+        if cur_mtime == last_mtime {
+            continue;
+        }
+        last_mtime = cur_mtime;
+        if let Err(e) = print_one(plan, ctx) {
+            // Soft-fail: print a short diagnostic to stderr but keep
+            // watching. The most common cause is a half-written file
+            // (mtime advanced but the writer hasn't flushed). On the
+            // next mtime advance we'll try again.
+            eprintln!("convert --probe --watch: re-probe failed: {e:?}");
+        }
+    }
+}
+
+/// Read the input file's mtime, mapping I/O errors to `None`. Used
+/// by the watch loop to detect "file changed" without panicking when
+/// the file is briefly unavailable (rename-rotate writers).
+fn mtime_of(path: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
 /// Build the probe summary for `plan.input` and return it formatted

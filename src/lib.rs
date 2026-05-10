@@ -39,6 +39,7 @@ pub mod ping;
 pub mod pixel_xform;
 pub mod plan_to_job;
 pub mod probe;
+pub mod suggest;
 
 pub use op::{AlphaOp, ConvertPlan, Dither, Op, PrintfTemplate};
 
@@ -89,8 +90,15 @@ pub fn run(args: &[String], ctx: &RuntimeContext) -> Result<(), Error> {
     #[cfg(feature = "mesh3d")]
     if mesh3d_runner::is_mesh3d_input(&plan.input) {
         if !mesh3d_runner::is_mesh3d_output(&plan.output) {
+            // Surface a did-you-mean suggestion when the output
+            // extension looks like a typo of one of the supported 3D
+            // outputs (e.g. `.gtlf` → `.gltf`). For genuinely unrelated
+            // extensions (`.png`, `.mp4`) the helper returns "" so the
+            // base message is unchanged.
+            let out_ext = plan.output.rsplit('.').next().unwrap_or("");
+            let hint = suggest::format_hint(out_ext, &["stl", "obj", "gltf", "glb", "mtl"]);
             return Err(Error::invalid(format!(
-                "convert: 3D input '{}' must pair with a 3D output extension (.stl/.obj/.gltf/.glb/.mtl); got '{}'. 3D→raster rendering is a separate follow-up.",
+                "convert: 3D input '{}' must pair with a 3D output extension (.stl/.obj/.gltf/.glb/.mtl); got '{}'{hint}. 3D→raster rendering is a separate follow-up.",
                 plan.input, plan.output
             )));
         }

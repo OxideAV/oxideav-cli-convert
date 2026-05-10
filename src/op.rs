@@ -396,6 +396,14 @@ pub struct ConvertPlan {
     /// passing `--json` without `--probe` is a parser-level error
     /// since there's nothing else for it to format.
     pub probe_json: bool,
+    /// `--watch` mode (paired with `--probe`) — re-run the probe
+    /// whenever the input file's mtime changes. Each re-probe emits a
+    /// fresh summary; in JSON mode each summary is on its own line so
+    /// `convert --probe --json --watch in.png | jq` is well-formed
+    /// JSON-lines. Polls the input mtime once per second; the loop
+    /// runs forever and exits only on Ctrl+C / signal. Useful for
+    /// live-monitoring a render-in-progress.
+    pub probe_watch: bool,
     /// Per-format encoder options for the 3D side-channel
     /// (`-stl-format`, `-gltf-format`, …). `Default` = "use the
     /// registry's default factory for each format" so callers who

@@ -42,6 +42,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bounding_box` and the empty `materials` / `animations` arrays are
   emitted (not omitted).
 
+- `--watch` flag (paired with `--probe`) — re-runs the probe whenever
+  the input file's mtime changes, polling once per second via
+  `std::fs::metadata`+`modified()`. Each fresh report is emitted in
+  the same format the one-shot mode would have used; in `--json` form
+  each report is its own line so the output is JSON-lines-compatible.
+  The loop runs forever and exits only on Ctrl+C / SIGINT. Soft-
+  failing re-probes (file truncated mid-write, transient I/O failure)
+  print a diagnostic to stderr and the loop continues — losing one
+  frame of output is strictly better than tearing down the watch
+  session. `--watch` without `--probe` is a parser-level error
+  ("--watch requires --probe").
+- `op::ConvertPlan::probe_watch` field carrying the parsed mode switch.
+- `probe::run` routes through `run_watch` when `probe_watch` is set;
+  the one-shot path is factored into `print_one`.
+
+- "Did you mean?" hint helper — `crate::suggest` provides
+  `closest_match` and `format_hint` over Levenshtein edit distance,
+  cutoff `max(2, len/3)`. Wired into `mesh3d_runner` (unknown input /
+  output extension) and `lib.rs` (3D-input → non-3D-output mismatch)
+  so e.g. `.gtlf` typo'd from `.gltf` produces
+  `(did you mean '.gltf'?)` rather than just listing the supported
+  set. Among ties the candidate with the closest length wins, so
+  4-letter typos prefer 4-letter candidates.
+- `+5 unit tests` in `crate::suggest` (Levenshtein basics, case
+  insensitivity, distance threshold, length-tiebreak); `+3
+  integration tests` in `mesh3d_runner` (input typo / output typo /
+  unrelated extension); `+3 tests` in `tests/probe.rs` (`--watch`
+  parses; `--watch` without `--probe` errors; `--watch --json`
+  parses).
+
 - `--probe` dry-run structural-inspection mode. Decodes the input far
   enough to extract metadata (page count, mesh count, sample rate, …),
   prints a compact summary to stdout, and skips any output write.

@@ -369,6 +369,7 @@ mod tests {
             ping: false,
             probe: false,
             probe_json: false,
+            probe_watch: false,
             mesh3d_options: Default::default(),
         }
     }
@@ -1044,6 +1045,7 @@ mod tests {
             ping: false,
             probe: false,
             probe_json: false,
+            probe_watch: false,
             mesh3d_options: Default::default(),
         };
         let job = plan_to_job(&plan, &empty_ctx()).unwrap();

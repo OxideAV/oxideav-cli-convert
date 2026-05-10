@@ -424,3 +424,71 @@ fn probe_without_input_errors_clearly() {
         "expected no-input error, got: {msg}"
     );
 }
+
+#[test]
+fn watch_without_probe_errors_clearly() {
+    // `--watch` is only meaningful paired with `--probe`. Without
+    // `--probe` we'd otherwise silently swallow the flag.
+    let dir = temp_dir("watch-alone");
+    let svg_path = dir.join("simple.svg");
+    write_minimal_svg(&svg_path);
+    let out_path = dir.join("out.svg");
+
+    let err = convert_run(
+        &[
+            "--watch".into(),
+            svg_path.to_string_lossy().into_owned(),
+            out_path.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect_err("--watch without --probe should fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("--watch requires --probe"),
+        "expected --watch-needs-probe error, got: {msg}"
+    );
+}
+
+#[test]
+fn watch_flag_parses_with_probe() {
+    use oxideav_cli_convert::args::parse as args_parse;
+
+    let dir = temp_dir("watch-parse");
+    let svg_path = dir.join("simple.svg");
+    write_minimal_svg(&svg_path);
+
+    // `--probe --watch` should parse cleanly. We only validate the
+    // parser surface here — the actual watch loop blocks forever on a
+    // poll loop so a full integration test would need to spawn-and-
+    // kill, which is overkill for the surface area added.
+    let plan = args_parse(&[
+        "--probe".into(),
+        "--watch".into(),
+        svg_path.to_string_lossy().into_owned(),
+    ])
+    .expect("parse");
+    assert!(plan.probe);
+    assert!(plan.probe_watch);
+    assert!(!plan.probe_json);
+}
+
+#[test]
+fn watch_with_json_parses_correctly() {
+    use oxideav_cli_convert::args::parse as args_parse;
+
+    let dir = temp_dir("watch-json-parse");
+    let svg_path = dir.join("simple.svg");
+    write_minimal_svg(&svg_path);
+
+    let plan = args_parse(&[
+        "--probe".into(),
+        "--watch".into(),
+        "--json".into(),
+        svg_path.to_string_lossy().into_owned(),
+    ])
+    .expect("parse");
+    assert!(plan.probe);
+    assert!(plan.probe_watch);
+    assert!(plan.probe_json);
+}
