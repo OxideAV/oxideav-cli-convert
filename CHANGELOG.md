@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `--probe` dry-run structural-inspection mode. Decodes the input far
+  enough to extract metadata (page count, mesh count, sample rate, …),
+  prints a compact summary to stdout, and skips any output write.
+  Mutually exclusive with an output positional — `--probe in.gltf`
+  is the supported shape; `--probe in.gltf out.obj` errors at the
+  parser. Fields surfaced per input class:
+  - **Raster image / video / audio**: container, codec, width × height,
+    bit_depth, color_space, alpha presence, frame_rate, sample_rate_hz,
+    channels, channel_layout, sample_format, duration_s, bit_rate
+    (best-effort from `StreamInfo` / `CodecParameters`; absent fields
+    omitted from the output).
+  - **PDF**: file_size_bytes, page_count, per-page width_pt × height_pt
+    × orientation_deg (capped at 32 entries; total is always reported
+    via `page_count`), embedded_image_count (walked from the
+    `VectorFrame` tree). embedded_font_count is reported as `unknown`
+    pending an upstream font-resource census.
+  - **SVG**: file_size_bytes, single-page width_pt × height_pt,
+    embedded_image_count.
+  - **3D (STL/OBJ/glTF/GLB/USDZ/MTL)** (mesh3d feature): mesh_count,
+    primitive_count, vertex_count, triangle_count (uses
+    `Primitive::triangle_count` for triangle topologies; non-triangle
+    topologies report 0), material_count, texture_count,
+    animation_count, skin_count, node_count, root_count, topologies
+    (per-topology histogram), bounding_box (computed from positions
+    when not embedded).
+- `--json` flag — pair with `--probe` for a single-line machine-
+  readable JSON object instead of the default pretty-printed
+  `key: value` block. Without `--probe` the parser rejects `--json`
+  with a clear "needs --probe" message rather than silently swallowing
+  the flag.
+- `op::ConvertPlan::probe` + `op::ConvertPlan::probe_json` fields
+  carrying the parsed mode switches.
+- New `crate::probe` module hosting the structural-inspection runner,
+  the input-shape decision tree (PDF / 3D / SVG / container fallback),
+  and a hand-rolled JSON serialiser kept in sync field-by-field with
+  the pretty-printer so a `diff` between two probes stays meaningful.
+- End-to-end coverage in `tests/probe.rs` (8 tests): PDF pretty + JSON,
+  SVG pretty, STL pretty + JSON, mutual-exclusion error, `--json`-
+  without-`--probe` error, no-input error.
 - Per-format encoder option flags for the 3D side-channel
   (`-stl-format ascii|binary` and `-gltf-format glb|embedded|external`)
   with case-insensitive synonyms (`bin`/`text`, `binary`/`json-embedded`/

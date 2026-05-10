@@ -38,6 +38,7 @@ pub mod pdf_runner;
 pub mod ping;
 pub mod pixel_xform;
 pub mod plan_to_job;
+pub mod probe;
 
 pub use op::{AlphaOp, ConvertPlan, Dither, Op, PrintfTemplate};
 
@@ -58,6 +59,15 @@ pub fn run(args: &[String], ctx: &RuntimeContext) -> Result<(), Error> {
     // for itself.
     if plan.ping {
         return ping::run(&plan, ctx);
+    }
+
+    // `--probe` is the structural-inspection mode: decode the input
+    // far enough to extract metadata (page count, mesh count, sample
+    // rate, …), print a summary to stdout, and skip any output write.
+    // The args parser already enforced the "no output positional"
+    // rule, so the probe module only deals with one shape (input-only).
+    if plan.probe {
+        return probe::run(&plan, ctx);
     }
 
     // Side-channel: PDF inputs go through a Scene-aware runner that

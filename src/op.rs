@@ -382,6 +382,20 @@ pub struct ConvertPlan {
     /// per "image" (page / video stream) to stdout, skip pixel decode
     /// and any output write. Output positional becomes optional.
     pub ping: bool,
+    /// `--probe` mode — decode the input far enough to extract
+    /// structural metadata (page count, mesh count, sample rate, …),
+    /// print a compact summary to stdout, and skip any output write.
+    /// Mutually exclusive with an output positional: `--probe in.gltf`
+    /// is the supported shape; `--probe in.gltf out.obj` errors at
+    /// the parser. The summary defaults to a pretty-printed
+    /// `key: value` block; pair with [`probe_json`](Self::probe_json)
+    /// for a single-line JSON object instead.
+    pub probe: bool,
+    /// `--json` mode — emit machine-readable JSON instead of the
+    /// pretty-printed summary. Today this only applies to `--probe`;
+    /// passing `--json` without `--probe` is a parser-level error
+    /// since there's nothing else for it to format.
+    pub probe_json: bool,
     /// Per-format encoder options for the 3D side-channel
     /// (`-stl-format`, `-gltf-format`, …). `Default` = "use the
     /// registry's default factory for each format" so callers who

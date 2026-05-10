@@ -194,6 +194,44 @@ oxideav convert model.obj -gltf-format glb   model.gltf  # binary container, .gl
 oxideav convert scene.gltf -gltf-format embedded scene.glb # JSON+data URI, .glb extension
 ```
 
+## `--probe` (structural inspection)
+
+`--probe INPUT` decodes the input far enough to extract structural
+metadata, prints a compact summary to stdout, and skips any output
+write. Pair with `--json` for a single-line machine-readable object
+instead of the default pretty-printed `key: value` block.
+
+The flag is mutually exclusive with an output positional:
+`oxideav convert --probe in.gltf` is the supported shape; passing
+both `--probe` and an output errors with a clear message rather than
+silently picking one.
+
+| Input class | Fields surfaced |
+|---|---|
+| Raster image | container, codec, width, height, bit_depth, color_space, alpha, frame_rate (animated) |
+| PDF | page_count, per-page width_pt × height_pt × orientation_deg, embedded_image_count |
+| SVG | width_pt, height_pt, embedded_image_count |
+| 3D (STL/OBJ/glTF/GLB/USDZ/MTL) | mesh_count, primitive_count, vertex_count, triangle_count, material_count, texture_count, animation_count, skin_count, node_count, root_count, topologies, bounding_box (computed from positions) |
+| Audio | container, codec, sample_rate_hz, channels, channel_layout, bit_depth, sample_format, duration_s, bit_rate |
+| Video | container, codec, per-stream width × height × bit_depth × color_space × alpha × frame_rate_fps × duration_s |
+
+Embedded font count for PDF / SVG is reported as `unknown` today —
+the producer crates don't surface a font-resource census, and
+counting unique font names from the text-extraction layer would
+over-count synthetic encoding splits. Documented as a cross-crate
+follow-up.
+
+```
+# Pretty-printed summary (default)
+oxideav convert --probe input.pdf
+oxideav convert --probe scene.gltf
+oxideav convert --probe sound.mp3
+
+# Single-line JSON (machine-readable)
+oxideav convert --probe --json input.pdf
+oxideav convert --probe --json movie.mp4 | jq .streams[0].codec_id
+```
+
 ## Round-3 follow-ups
 
 - Multi-input (`convert in1.pdf in2.pdf out.gif`) — IM allows it.

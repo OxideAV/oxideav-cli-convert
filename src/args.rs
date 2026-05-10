@@ -36,6 +36,8 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
     let mut positionals: Vec<String> = Vec::new();
     let mut pending_dither = Dither::None;
     let mut ping = false;
+    let mut probe = false;
+    let mut probe_json = false;
     let mut mesh3d_options = Mesh3DOptions::default();
 
     let mut i = 0;
@@ -131,6 +133,25 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
             }
             "-ping" => {
                 ping = true;
+                i += 1;
+            }
+            // `--probe` is GNU-style double-dash because it's a
+            // session-scope mode switch (no value, no per-input
+            // semantics) — same shape as `--help` / `--version` would
+            // have if the convert verb owned them. Single-dash `-probe`
+            // is reserved as a future IM-style probe-OP that might
+            // legitimately want an argument.
+            "--probe" => {
+                probe = true;
+                i += 1;
+            }
+            // `--json` selects a machine-readable output flavour for
+            // the probe summary. It's only meaningful paired with
+            // `--probe`; the validation runs after the loop so we can
+            // emit a clear "needs --probe" error rather than a generic
+            // "unknown flag" one.
+            "--json" => {
+                probe_json = true;
                 i += 1;
             }
             "-density" => {
@@ -382,7 +403,18 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
             "convert: no input file given (usage: convert [-op VALUE]... INPUT [-op VALUE]... OUTPUT)",
         ));
     }
-    if positionals.len() < 2 && !ping {
+    // `--probe` is mutually exclusive with an output positional —
+    // probing means "describe, don't write", and the user passing both
+    // is almost always a mistake (typo'd a flag, copy-pasted from a
+    // real conversion). Surface it as a clear actionable error rather
+    // than silently writing or silently dropping the output arg.
+    if probe && positionals.len() >= 2 {
+        return Err(Error::invalid(format!(
+            "convert: --probe cannot be combined with an output file ('{}'); use either --probe OR an output file, not both",
+            positionals[1]
+        )));
+    }
+    if positionals.len() < 2 && !ping && !probe {
         return Err(Error::invalid(
             "convert: no output file given (usage: convert [-op VALUE]... INPUT [-op VALUE]... OUTPUT)",
         ));
@@ -392,6 +424,14 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
             "convert: {} positional arguments given but multi-input is not yet supported (round-2 follow-up); pass exactly INPUT OUTPUT",
             positionals.len()
         )));
+    }
+    // `--json` is only meaningful as a formatting modifier on
+    // `--probe`. Without `--probe` there's no probe summary to
+    // serialise, so we'd otherwise silently swallow the flag.
+    if probe_json && !probe {
+        return Err(Error::invalid(
+            "convert: --json requires --probe (today --json only formats the probe summary)",
+        ));
     }
 
     let (raw_input, input_pages) = split_input_selector(&positionals[0])?;
@@ -410,6 +450,8 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
         output,
         output_template,
         ping,
+        probe,
+        probe_json,
         mesh3d_options,
     })
 }
