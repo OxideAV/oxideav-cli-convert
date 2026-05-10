@@ -95,7 +95,7 @@ pub fn run(args: &[String], ctx: &RuntimeContext) -> Result<(), Error> {
                 "convert: note: raster ops ignored on 3D-asset conversion (stl/obj/gltf/glb/mtl have no pixel grid)"
             );
         }
-        return mesh3d_runner::run(&plan.input, &plan.output);
+        return mesh3d_runner::run(&plan.input, &plan.output, &plan.mesh3d_options);
     }
 
     let job = plan_to_job::plan_to_job(&plan, ctx)?;

@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-format encoder option flags for the 3D side-channel
+  (`-stl-format ascii|binary` and `-gltf-format glb|embedded|external`)
+  with case-insensitive synonyms (`bin`/`text`, `binary`/`json-embedded`/
+  `json-external`). When set, the encoder is constructed directly via
+  the format crate (`oxideav_stl::encoder::StlEncoder::new(StlFormat::…)`,
+  `oxideav_gltf::GltfEncoder::with_output(OutputFlavour::…)`), bypassing
+  the parameter-less factory closures stored in `Mesh3DRegistry`. The
+  default code path is unchanged — flag-less convert invocations still
+  pick up the registry default for every format.
+- `op::Mesh3DOptions` field on `ConvertPlan` carrying the parsed
+  per-format choices; threaded through to `mesh3d_runner::run` which
+  validates the flag↔output-extension pairing up-front (e.g.
+  `-stl-format ascii` paired with a `.gltf` output emits a clear
+  "set but output extension is '.gltf', not '.stl'" error rather
+  than silently dropping).
+- `oxideav-stl` / `oxideav-obj` / `oxideav-gltf` as direct optional
+  deps (gated on `mesh3d`) so the convert verb can call the typed
+  encoder constructors. `oxideav-meta` already pulls them via the
+  `3d` feature so this adds no new transitive crates.
+- End-to-end coverage in `tests/format_flags.rs` (11 tests):
+  STL→STL ASCII / binary on-disk byte signatures, glTF JsonEmbedded
+  via `.glb` extension and Glb via `.gltf` extension (override-the-
+  extension paths), unknown-value parser rejection, mismatched-output
+  rejection, `external` follow-up surfacing.
+
+### Cross-crate follow-ups
+
+- `oxideav-obj` rN — publish 0.0.1 with `ObjEncoder::with_negative_indices`
+  + `obj::SerializeOptions::negative_indices` (already on master in this
+  workspace); needed to wire `-obj-negative-indices` through convert.
+  Per-decimal-precision option also needs to be added to
+  `mtl::serialize_mtl` / `obj::SerializeOptions` for `-mtl-precision N`.
+- `oxideav-gltf` rN — extend `OutputFlavour` with a `JsonExternal`
+  variant that emits a `.gltf` JSON document referencing a sidecar
+  `.bin` file (encoder needs to return both `Vec<u8>` blobs or a
+  caller-side helper that splits them). Once published, swap the
+  `external` arm in `mesh3d_runner::build_gltf_encoder` from
+  `Err(unsupported)` to the real flavour.
+
 - 3D-asset side-channel — `convert cube.stl cube.obj`,
   `convert model.obj model.gltf`, `convert scene.gltf scene.glb`,
   `convert archive.usdz extracted.gltf`, etc. work end-to-end.

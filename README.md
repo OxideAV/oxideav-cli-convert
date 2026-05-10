@@ -128,6 +128,19 @@ USDZ is read-only today (decoder registered, no encoder). Raster ops
 (`-resize`, `-blur`, …) are silently ignored for 3D-asset conversions —
 they have no pixel grid.
 
+#### Per-format encoder option flags
+
+These flags override the encoder choice the registry would make from the
+output extension alone. They're accepted on every input shape but only
+honoured when the 3D side-channel fires; the runner errors cleanly if a
+flag is paired with an extension it doesn't apply to (e.g.
+`-stl-format ascii out.obj`).
+
+| Flag | Values | Default | Notes |
+|---|---|---|---|
+| `-stl-format` | `binary` / `bin` / `ascii` / `text` | `binary` | Selects STL on-disk flavour |
+| `-gltf-format` | `glb` / `binary` / `embedded` / `json-embedded` / `external` / `json-external` | infer from `.glb` vs `.gltf` extension | `external` errors with a `gltf-rN` follow-up message until upstream `OutputFlavour::JsonExternal` lands |
+
 ### Routing matrix (PDF input)
 
 | Input | Output | Template? | Action |
@@ -174,6 +187,11 @@ oxideav convert cube.stl cube.obj
 oxideav convert model.obj model.gltf
 oxideav convert scene.gltf scene.glb
 oxideav convert archive.usdz extracted.gltf
+
+# 3D-asset per-format encoder options
+oxideav convert cube.stl  -stl-format ascii  cube-readable.stl
+oxideav convert model.obj -gltf-format glb   model.gltf  # binary container, .gltf extension
+oxideav convert scene.gltf -gltf-format embedded scene.glb # JSON+data URI, .glb extension
 ```
 
 ## Round-3 follow-ups

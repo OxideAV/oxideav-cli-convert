@@ -16,6 +16,15 @@
 //! can stay agnostic of the 3D dispatch contract (which uses a
 //! separate registry from `RuntimeContext`'s codec/container path).
 //!
+//! ## Per-format encoder options
+//!
+//! When the caller supplies a per-format option flag (`-stl-format`,
+//! `-gltf-format`, …), the encoder lookup bypasses the
+//! [`Mesh3DRegistry`]'s parameter-less factory and constructs a
+//! typed encoder directly via the format crate (`oxideav_stl`,
+//! `oxideav_gltf`). The decoder lookup always goes through the
+//! registry — input options aren't a thing yet.
+//!
 //! Cargo-feature-gated on `mesh3d`. With the feature off, this module
 //! disappears and the convert verb falls through to the regular
 //! pipeline path for 3D inputs (which then errors out cleanly because
@@ -24,7 +33,9 @@
 use std::fs;
 
 use oxideav_core::{Error, Result};
-use oxideav_mesh3d::Mesh3DRegistry;
+use oxideav_mesh3d::{Mesh3DEncoder, Mesh3DRegistry};
+
+use crate::op::{GltfFormatChoice, Mesh3DOptions, StlFormatChoice};
 
 /// File extensions the 3D side-channel claims as inputs. Mirrors the
 /// extension lists the four sibling format crates (stl/obj/gltf/usdz)
@@ -71,11 +82,13 @@ fn ext_of(path: &str) -> Option<&str> {
 /// Run the 3D-input convert flow. Side-effect-only: writes one file
 /// to disk.
 ///
-/// Output extension → encoder picked from the registry. Input extension
-/// → decoder picked from the registry. Decoders that don't accept the
-/// bytes (e.g. ASCII OBJ fed to the binary STL decoder via a renamed
-/// extension) propagate an `Error::Invalid` from the decoder up.
-pub fn run(input_path: &str, output_path: &str) -> Result<()> {
+/// Output extension → encoder picked from the registry, OR constructed
+/// directly via the format crate when [`Mesh3DOptions`] requests a
+/// non-default flavour. Input extension → decoder picked from the
+/// registry. Decoders that don't accept the bytes (e.g. ASCII OBJ fed
+/// to the binary STL decoder via a renamed extension) propagate an
+/// `Error::Invalid` from the decoder up.
+pub fn run(input_path: &str, output_path: &str, options: &Mesh3DOptions) -> Result<()> {
     let in_ext = ext_of(input_path)
         .ok_or_else(|| {
             Error::invalid(format!(
@@ -94,18 +107,18 @@ pub fn run(input_path: &str, output_path: &str) -> Result<()> {
     let mut registry = Mesh3DRegistry::new();
     oxideav_meta::populate_mesh3d_registry(&mut registry);
 
+    // Reject mismatched per-format flags up-front (e.g. `-stl-format ascii`
+    // paired with a `.glb` output) so the user sees the actual misuse, not
+    // a downstream "unknown encoder" message.
+    validate_options_against_output(&out_ext, options)?;
+
     let mut decoder = registry.decoder_for_extension(&in_ext).ok_or_else(|| {
         Error::unsupported(format!(
             "convert: no 3D decoder registered for input extension '.{in_ext}' (known: {})",
             joined_known_inputs()
         ))
     })?;
-    let mut encoder = registry.encoder_for_extension(&out_ext).ok_or_else(|| {
-        Error::unsupported(format!(
-            "convert: no 3D encoder registered for output extension '.{out_ext}' (known: {})",
-            joined_known_outputs()
-        ))
-    })?;
+    let mut encoder = pick_encoder(&registry, &out_ext, options)?;
 
     let bytes = fs::read(input_path)
         .map_err(|e| Error::invalid(format!("convert: failed to read {input_path}: {e}")))?;
@@ -114,6 +127,86 @@ pub fn run(input_path: &str, output_path: &str) -> Result<()> {
     fs::write(output_path, out_bytes)
         .map_err(|e| Error::invalid(format!("convert: failed to write {output_path}: {e}")))?;
     Ok(())
+}
+
+/// Reject per-format option flags that don't apply to the chosen
+/// output extension — e.g. `-stl-format ascii` with a `.obj` output.
+/// Per IM convention we surface this as a clear error rather than
+/// silently dropping the flag.
+fn validate_options_against_output(out_ext: &str, options: &Mesh3DOptions) -> Result<()> {
+    if options.stl_format.is_some() && out_ext != "stl" {
+        return Err(Error::invalid(format!(
+            "convert: -stl-format set but output extension is '.{out_ext}', not '.stl'"
+        )));
+    }
+    if options.gltf_format.is_some() && out_ext != "gltf" && out_ext != "glb" {
+        return Err(Error::invalid(format!(
+            "convert: -gltf-format set but output extension is '.{out_ext}', not '.gltf' or '.glb'"
+        )));
+    }
+    Ok(())
+}
+
+/// Pick the encoder for `out_ext`, honouring [`Mesh3DOptions`] when a
+/// per-format flag overrides the registry default.
+///
+/// The default path stays through the registry so adding a new 3D
+/// format requires zero churn here.
+fn pick_encoder(
+    registry: &Mesh3DRegistry,
+    out_ext: &str,
+    options: &Mesh3DOptions,
+) -> Result<Box<dyn Mesh3DEncoder>> {
+    match out_ext {
+        "stl" => {
+            if let Some(choice) = options.stl_format {
+                return Ok(build_stl_encoder(choice));
+            }
+        }
+        "gltf" | "glb" => {
+            if let Some(choice) = options.gltf_format {
+                return build_gltf_encoder(choice);
+            }
+        }
+        _ => {}
+    }
+    registry.encoder_for_extension(out_ext).ok_or_else(|| {
+        Error::unsupported(format!(
+            "convert: no 3D encoder registered for output extension '.{out_ext}' (known: {})",
+            joined_known_outputs()
+        ))
+    })
+}
+
+/// Construct an STL encoder for the given user choice. Bypasses the
+/// registry so we can pass the `StlFormat` constructor argument that
+/// the registry's parameter-less factory closure can't.
+fn build_stl_encoder(choice: StlFormatChoice) -> Box<dyn Mesh3DEncoder> {
+    use oxideav_stl::encoder::{StlEncoder, StlFormat};
+    let format = match choice {
+        StlFormatChoice::Binary => StlFormat::Binary,
+        StlFormatChoice::Ascii => StlFormat::Ascii,
+    };
+    Box::new(StlEncoder::new(format))
+}
+
+/// Construct a glTF encoder for the given user choice. `JsonExternal`
+/// is rejected with a clear gltf-rN follow-up message until the
+/// upstream `OutputFlavour::JsonExternal` variant lands in published
+/// `oxideav-gltf`.
+fn build_gltf_encoder(choice: GltfFormatChoice) -> Result<Box<dyn Mesh3DEncoder>> {
+    use oxideav_gltf::{GltfEncoder, OutputFlavour};
+    let flavour = match choice {
+        GltfFormatChoice::Glb => OutputFlavour::Glb,
+        GltfFormatChoice::JsonEmbedded => OutputFlavour::JsonEmbedded,
+        GltfFormatChoice::JsonExternal => {
+            return Err(Error::unsupported(
+                "convert: -gltf-format external (JSON + sidecar .bin) is not yet wired (gltf-rN follow-up: OutputFlavour::JsonExternal not in published oxideav-gltf)"
+                    .to_string(),
+            ));
+        }
+    };
+    Ok(Box::new(GltfEncoder::with_output(flavour)))
 }
 
 fn joined_known_inputs() -> String {
@@ -166,7 +259,12 @@ mod tests {
     fn unknown_input_extension_errors_with_known_set() {
         // Pick an extension that's neither 3D nor present on disk so
         // we can check the error message without wiring real fixtures.
-        let err = run("/tmp/does-not-exist.xyz", "/tmp/out.stl").unwrap_err();
+        let err = run(
+            "/tmp/does-not-exist.xyz",
+            "/tmp/out.stl",
+            &Mesh3DOptions::default(),
+        )
+        .unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("no 3D decoder registered for input extension '.xyz'"),
@@ -176,7 +274,12 @@ mod tests {
 
     #[test]
     fn unknown_output_extension_errors_with_known_set() {
-        let err = run("/tmp/does-not-exist.stl", "/tmp/out.xyz").unwrap_err();
+        let err = run(
+            "/tmp/does-not-exist.stl",
+            "/tmp/out.xyz",
+            &Mesh3DOptions::default(),
+        )
+        .unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("no 3D encoder registered for output extension '.xyz'"),

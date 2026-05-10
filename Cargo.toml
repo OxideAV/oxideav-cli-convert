@@ -24,10 +24,20 @@ generator = ["dep:oxideav-generator"]
 # inputs decode into an `oxideav_mesh3d::Scene3D`, then encode through
 # the matching encoder factory pulled out of the
 # `Mesh3DRegistry` populated by `oxideav_meta::populate_mesh3d_registry`.
+# `oxideav-stl` / `oxideav-obj` / `oxideav-gltf` are pulled directly so
+# the per-format encoder-option flags (`-stl-format`, `-gltf-format`,
+# …) can construct an encoder with options that the registry's
+# parameter-less factory closures can't pass through.
 # Off → 3D-format inputs fall through to the regular pipeline path,
 # which doesn't know what to do with them and errors out cleanly.
 # Slim builds (no 3D in the dep tree) compile fine without this.
-mesh3d = ["dep:oxideav-mesh3d", "dep:oxideav-meta"]
+mesh3d = [
+    "dep:oxideav-mesh3d",
+    "dep:oxideav-meta",
+    "dep:oxideav-stl",
+    "dep:oxideav-obj",
+    "dep:oxideav-gltf",
+]
 
 [dependencies]
 oxideav-core = "0.1"
@@ -59,5 +69,14 @@ oxideav-svg = "0.1"
 # directly.
 oxideav-mesh3d = { version = "0.0", optional = true }
 oxideav-meta = { version = "0.0", optional = true, default-features = false, features = ["3d"] }
+# Direct format-encoder deps so per-format option flags can construct
+# encoders bypassing the registry (which only stores parameter-less
+# factory closures). All three are pulled with their default `registry`
+# feature off the table — we don't need their `register()` helpers
+# inside cli-convert (oxideav-meta already does that wiring); we only
+# want the typed encoder constructors.
+oxideav-stl = { version = "0.0", optional = true }
+oxideav-obj = { version = "0.0", optional = true }
+oxideav-gltf = { version = "0.0", optional = true }
 indexmap = "2"
 serde_json = "1"

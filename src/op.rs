@@ -279,6 +279,84 @@ impl PageSelector {
     }
 }
 
+/// `-stl-format` value. Selects which STL-on-disk flavour the encoder
+/// emits. Default is [`Binary`](Self::Binary), matching the registry
+/// factory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StlFormatChoice {
+    /// 80-byte header + `uint32` triangle count + `N × 50`-byte triangle
+    /// records. Compact and binary-stable.
+    Binary,
+    /// `solid … endsolid` ASCII grammar. Larger and floating-point
+    /// formatted but human-readable.
+    Ascii,
+}
+
+impl StlFormatChoice {
+    /// Parse the value after `-stl-format`. Accepts ImageMagick-ish
+    /// tokens case-insensitively (`binary`/`bin` → Binary, `ascii`/`text`
+    /// → Ascii).
+    pub fn parse(s: &str) -> Result<StlFormatChoice, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "binary" | "bin" => Ok(StlFormatChoice::Binary),
+            "ascii" | "text" => Ok(StlFormatChoice::Ascii),
+            other => Err(format!(
+                "convert: -stl-format: unknown flavour '{other}' (expected 'binary' or 'ascii')"
+            )),
+        }
+    }
+}
+
+/// `-gltf-format` value. Selects the glTF on-disk container.
+///
+/// `JsonExternal` is documented but not yet implementable today
+/// (the underlying `OutputFlavour::JsonExternal` is missing in
+/// published `oxideav-gltf` 0.0.0); the args parser accepts the
+/// token now and the encoder will reject it cleanly until the
+/// upstream variant lands. See gltf-rN follow-up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GltfFormatChoice {
+    /// `.glb` self-contained binary container.
+    Glb,
+    /// `.gltf` JSON document with the binary buffer inlined as a
+    /// base64 `data:application/octet-stream;base64,…` URI.
+    JsonEmbedded,
+    /// `.gltf` JSON document referencing a sidecar `.bin` file.
+    /// Reserved — emits an "unsupported" error today (gltf-rN).
+    JsonExternal,
+}
+
+impl GltfFormatChoice {
+    /// Parse the value after `-gltf-format`. Accepts case-insensitive
+    /// `glb`, `embedded`, `external`. `binary` is an alias for `glb`
+    /// (mirrors how IM-style flags often accept short-form synonyms).
+    pub fn parse(s: &str) -> Result<GltfFormatChoice, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "glb" | "binary" => Ok(GltfFormatChoice::Glb),
+            "embedded" | "json" | "json-embedded" => Ok(GltfFormatChoice::JsonEmbedded),
+            "external" | "json-external" => Ok(GltfFormatChoice::JsonExternal),
+            other => Err(format!(
+                "convert: -gltf-format: unknown flavour '{other}' (expected 'glb', 'embedded', or 'external')"
+            )),
+        }
+    }
+}
+
+/// Per-format encoder option flags forwarded to the 3D side-channel.
+///
+/// All fields default to `None` meaning "use the format crate's
+/// registry default" — i.e. the existing convert behaviour is
+/// unchanged when no `-foo-format` flag is supplied.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Mesh3DOptions {
+    /// `-stl-format ascii|binary`. `None` → registry default (binary).
+    pub stl_format: Option<StlFormatChoice>,
+    /// `-gltf-format glb|embedded|external`. `None` → infer from
+    /// output extension (`.glb` → Glb, `.gltf` → JsonEmbedded), which
+    /// is exactly what the registry's by-extension lookup already does.
+    pub gltf_format: Option<GltfFormatChoice>,
+}
+
 /// The parsed result of one `oxideav convert` invocation.
 #[derive(Clone, Debug)]
 pub struct ConvertPlan {
@@ -304,4 +382,9 @@ pub struct ConvertPlan {
     /// per "image" (page / video stream) to stdout, skip pixel decode
     /// and any output write. Output positional becomes optional.
     pub ping: bool,
+    /// Per-format encoder options for the 3D side-channel
+    /// (`-stl-format`, `-gltf-format`, …). `Default` = "use the
+    /// registry's default factory for each format" so callers who
+    /// don't pass any of these flags see no behaviour change.
+    pub mesh3d_options: Mesh3DOptions,
 }

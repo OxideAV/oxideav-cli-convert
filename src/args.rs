@@ -6,7 +6,10 @@
 //! following value; a few (`-strip`) are valueless.  Any unrecognised
 //! flag errors out with a clear message — we never silently drop.
 
-use crate::op::{AlphaOp, ConvertPlan, Dither, Op, PageSelector, PrintfTemplate};
+use crate::op::{
+    AlphaOp, ConvertPlan, Dither, GltfFormatChoice, Mesh3DOptions, Op, PageSelector,
+    PrintfTemplate, StlFormatChoice,
+};
 use oxideav_core::Error;
 
 /// Parse the slice that comes after `oxideav convert`.
@@ -33,6 +36,7 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
     let mut positionals: Vec<String> = Vec::new();
     let mut pending_dither = Dither::None;
     let mut ping = false;
+    let mut mesh3d_options = Mesh3DOptions::default();
 
     let mut i = 0;
     while i < args.len() {
@@ -344,6 +348,27 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                 ops.push(Op::Colorspace(cs));
                 i += 2;
             }
+            // ---- Per-format encoder option flags for the 3D
+            //      side-channel. Stored on `ConvertPlan::mesh3d_options`,
+            //      not as `Op` entries, since they're plan-level
+            //      switches that only the mesh3d_runner consumes
+            //      (raster ops have no analogous notion). The flags
+            //      are accepted on every input shape (PDF / raster /
+            //      etc.) and silently ignored when the side-channel
+            //      doesn't fire — matches IM's tolerant-of-irrelevant-
+            //      flags posture.
+            "-stl-format" => {
+                let v = val(i + 1)?;
+                let choice = StlFormatChoice::parse(v).map_err(Error::invalid)?;
+                mesh3d_options.stl_format = Some(choice);
+                i += 2;
+            }
+            "-gltf-format" => {
+                let v = val(i + 1)?;
+                let choice = GltfFormatChoice::parse(v).map_err(Error::invalid)?;
+                mesh3d_options.gltf_format = Some(choice);
+                i += 2;
+            }
             other => {
                 // Reach here only on `-`-prefixed args (non-`-` was
                 // pushed to `positionals` above).
@@ -385,6 +410,7 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
         output,
         output_template,
         ping,
+        mesh3d_options,
     })
 }
 
@@ -1778,5 +1804,142 @@ mod tests {
             msg.contains("not a finite float sigma") || msg.contains("must be >= 0"),
             "unexpected message: {msg}"
         );
+    }
+
+    // ---- Per-format encoder option flags (`-stl-format`,
+    //      `-gltf-format`). End-to-end coverage lives in
+    //      `tests/format_flags.rs`; the unit tests here only check
+    //      that the parser populates `ConvertPlan::mesh3d_options`
+    //      correctly and rejects malformed values up-front. ----
+
+    #[test]
+    fn stl_format_default_is_none() {
+        let p = parse(&to_vec(&["in.stl", "out.stl"])).unwrap();
+        assert!(p.mesh3d_options.stl_format.is_none());
+        assert!(p.ops.is_empty(), "no -stl-format → no Op pushed");
+    }
+
+    #[test]
+    fn stl_format_ascii_parses() {
+        let p = parse(&to_vec(&["in.stl", "-stl-format", "ascii", "out.stl"])).unwrap();
+        assert_eq!(p.mesh3d_options.stl_format, Some(StlFormatChoice::Ascii));
+    }
+
+    #[test]
+    fn stl_format_binary_parses() {
+        let p = parse(&to_vec(&["in.stl", "-stl-format", "binary", "out.stl"])).unwrap();
+        assert_eq!(p.mesh3d_options.stl_format, Some(StlFormatChoice::Binary));
+    }
+
+    #[test]
+    fn stl_format_aliases_parse() {
+        // `bin` → Binary, `text` → Ascii.
+        let p = parse(&to_vec(&["in.stl", "-stl-format", "bin", "out.stl"])).unwrap();
+        assert_eq!(p.mesh3d_options.stl_format, Some(StlFormatChoice::Binary));
+        let p = parse(&to_vec(&["in.stl", "-stl-format", "text", "out.stl"])).unwrap();
+        assert_eq!(p.mesh3d_options.stl_format, Some(StlFormatChoice::Ascii));
+    }
+
+    #[test]
+    fn stl_format_case_insensitive() {
+        let p = parse(&to_vec(&["in.stl", "-stl-format", "ASCII", "out.stl"])).unwrap();
+        assert_eq!(p.mesh3d_options.stl_format, Some(StlFormatChoice::Ascii));
+    }
+
+    #[test]
+    fn stl_format_unknown_value_rejected() {
+        let err = parse(&to_vec(&["in.stl", "-stl-format", "xml", "out.stl"])).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("unknown flavour 'xml'") && msg.contains("expected 'binary'"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[test]
+    fn stl_format_missing_value_rejected() {
+        let err = parse(&to_vec(&["in.stl", "-stl-format"])).unwrap_err();
+        assert!(format!("{err:?}").contains("-stl-format: missing value"));
+    }
+
+    #[test]
+    fn gltf_format_default_is_none() {
+        let p = parse(&to_vec(&["in.stl", "out.gltf"])).unwrap();
+        assert!(p.mesh3d_options.gltf_format.is_none());
+    }
+
+    #[test]
+    fn gltf_format_glb_parses() {
+        let p = parse(&to_vec(&["in.stl", "-gltf-format", "glb", "out.glb"])).unwrap();
+        assert_eq!(p.mesh3d_options.gltf_format, Some(GltfFormatChoice::Glb));
+    }
+
+    #[test]
+    fn gltf_format_embedded_parses() {
+        let p = parse(&to_vec(&["in.stl", "-gltf-format", "embedded", "out.gltf"])).unwrap();
+        assert_eq!(
+            p.mesh3d_options.gltf_format,
+            Some(GltfFormatChoice::JsonEmbedded)
+        );
+    }
+
+    #[test]
+    fn gltf_format_external_parses_even_though_runtime_rejects() {
+        // The parser accepts the token; runtime emits the gltf-rN
+        // follow-up message. Decouples the user-facing error from the
+        // arg parser's "unknown flag" path.
+        let p = parse(&to_vec(&["in.stl", "-gltf-format", "external", "out.gltf"])).unwrap();
+        assert_eq!(
+            p.mesh3d_options.gltf_format,
+            Some(GltfFormatChoice::JsonExternal)
+        );
+    }
+
+    #[test]
+    fn gltf_format_aliases_parse() {
+        // `binary` → Glb (matches IM-style synonym tolerance).
+        let p = parse(&to_vec(&["in.stl", "-gltf-format", "binary", "out.glb"])).unwrap();
+        assert_eq!(p.mesh3d_options.gltf_format, Some(GltfFormatChoice::Glb));
+        // `json-embedded` → JsonEmbedded.
+        let p = parse(&to_vec(&[
+            "in.stl",
+            "-gltf-format",
+            "json-embedded",
+            "out.gltf",
+        ]))
+        .unwrap();
+        assert_eq!(
+            p.mesh3d_options.gltf_format,
+            Some(GltfFormatChoice::JsonEmbedded)
+        );
+    }
+
+    #[test]
+    fn gltf_format_unknown_value_rejected() {
+        let err = parse(&to_vec(&["in.stl", "-gltf-format", "obj", "out.gltf"])).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("unknown flavour 'obj'") && msg.contains("expected 'glb'"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[test]
+    fn mesh3d_flags_can_appear_before_input() {
+        // IM grammar lets ops appear on either side of the positional;
+        // confirm the per-format flags follow the same rule.
+        let p = parse(&to_vec(&[
+            "-stl-format",
+            "ascii",
+            "-gltf-format",
+            "glb",
+            "in.stl",
+            "out.stl",
+        ]))
+        .unwrap();
+        assert_eq!(p.mesh3d_options.stl_format, Some(StlFormatChoice::Ascii));
+        assert_eq!(p.mesh3d_options.gltf_format, Some(GltfFormatChoice::Glb));
+        assert_eq!(p.input, "in.stl");
+        assert_eq!(p.output, "out.stl");
     }
 }

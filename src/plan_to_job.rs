@@ -367,6 +367,7 @@ mod tests {
             output: "out.jpg".into(),
             output_template: None,
             ping: false,
+            mesh3d_options: Default::default(),
         }
     }
 
@@ -1039,6 +1040,7 @@ mod tests {
             output: "out.png".into(),
             output_template: None,
             ping: false,
+            mesh3d_options: Default::default(),
         };
         let job = plan_to_job(&plan, &empty_ctx()).unwrap();
         let track = &job.outputs.values().next().unwrap().all[0];
