@@ -22,7 +22,7 @@ use oxideav_core::vector::{
 };
 use oxideav_core::RuntimeContext;
 use oxideav_pdf::write_pdf_from_scene;
-use oxideav_scene::{Page, Scene};
+use oxideav_scene::{Metadata, Page, Scene};
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -124,6 +124,102 @@ fn probe_pdf_two_pages_json_form_succeeds() {
     .expect("--probe --json on PDF should succeed");
 }
 
+/// Write a 1-page PDF with a populated `/Info` dictionary so we can
+/// assert the probe surfaces title / author / producer / etc.
+fn write_pdf_with_metadata(path: &std::path::Path) {
+    let make_page = || {
+        let path_node = PathNode {
+            path: VPath {
+                commands: vec![
+                    PathCommand::MoveTo(Point::new(10.0, 10.0)),
+                    PathCommand::LineTo(Point::new(50.0, 10.0)),
+                    PathCommand::LineTo(Point::new(50.0, 50.0)),
+                    PathCommand::Close,
+                ],
+            },
+            fill: Some(Paint::Solid(Rgba::new(0, 200, 0, 255))),
+            stroke: None,
+            fill_rule: oxideav_core::vector::FillRule::NonZero,
+        };
+        let group = Group {
+            children: vec![Node::Path(path_node)],
+            ..Group::default()
+        };
+        let mut frame = VectorFrame::new(100.0, 100.0);
+        frame.root = group;
+        Page {
+            width: 100.0,
+            height: 100.0,
+            content: frame,
+            label: None,
+            orientation: 0,
+        }
+    };
+    let scene = Scene {
+        pages: Some(vec![make_page()]),
+        metadata: Metadata {
+            title: Some("Probe Test Doc".into()),
+            author: Some("oxideav".into()),
+            subject: Some("automated probe coverage".into()),
+            keywords: vec!["probe".into(), "test".into()],
+            creator: Some("oxideav-cli-convert tests".into()),
+            producer: Some("oxideav-pdf".into()),
+            created_at: Some("2026-05-10T12:00:00Z".into()),
+            ..Metadata::default()
+        },
+        ..Scene::default()
+    };
+    let bytes = write_pdf_from_scene(&scene).expect("pdf encode");
+    fs::write(path, bytes).expect("write PDF fixture");
+}
+
+#[test]
+fn probe_pdf_surfaces_info_dict_fields() {
+    use oxideav_cli_convert::args::parse as args_parse;
+    use oxideav_cli_convert::probe::render as probe_render;
+
+    let dir = temp_dir("pdf-info");
+    let pdf_path = dir.join("doc.pdf");
+    write_pdf_with_metadata(&pdf_path);
+
+    let plan = args_parse(&[
+        "--probe".into(),
+        "--json".into(),
+        pdf_path.to_string_lossy().into_owned(),
+    ])
+    .expect("parse");
+    let json = probe_render(&plan, &ctx()).expect("render");
+    // is_encrypted is always present for PDFs.
+    assert!(
+        json.contains("\"is_encrypted\":\"no\""),
+        "expected is_encrypted=no, got: {json}"
+    );
+    assert!(
+        json.contains("\"title\":\"Probe Test Doc\""),
+        "expected title, got: {json}"
+    );
+    assert!(
+        json.contains("\"author\":\"oxideav\""),
+        "expected author, got: {json}"
+    );
+    assert!(
+        json.contains("\"producer\":\"oxideav-pdf\""),
+        "expected producer, got: {json}"
+    );
+    assert!(
+        json.contains("\"creator\":\"oxideav-cli-convert tests\""),
+        "expected creator, got: {json}"
+    );
+    assert!(
+        json.contains("\"creation_date\":"),
+        "expected creation_date, got: {json}"
+    );
+    assert!(
+        json.contains("\"keywords\":[\"probe\",\"test\"]"),
+        "expected keywords array, got: {json}"
+    );
+}
+
 // ─────────────────────────── SVG probe ───────────────────────────
 
 fn write_minimal_svg(path: &std::path::Path) {
@@ -211,6 +307,56 @@ fn probe_stl_json_form_succeeds() {
         &ctx(),
     )
     .expect("--probe --json on STL should succeed");
+}
+
+#[cfg(feature = "mesh3d")]
+#[test]
+fn probe_stl_json_surfaces_per_mesh_detail() {
+    use oxideav_cli_convert::args::parse as args_parse;
+    use oxideav_cli_convert::probe::render as probe_render;
+
+    let dir = temp_dir("stl-per-mesh");
+    let stl_path = dir.join("triangle.stl");
+    write_one_triangle_stl_fixture(&stl_path);
+
+    let plan = args_parse(&[
+        "--probe".into(),
+        "--json".into(),
+        stl_path.to_string_lossy().into_owned(),
+    ])
+    .expect("parse");
+    let json = probe_render(&plan, &ctx()).expect("render");
+    // Per-mesh array surfaced.
+    assert!(
+        json.contains("\"meshes\":["),
+        "expected meshes array, got: {json}"
+    );
+    // STL doesn't carry a mesh name (the binary header is opaque /
+    // ASCII solid name doesn't propagate as a `Mesh::name`); the
+    // unnamed fallback is the right answer.
+    assert!(
+        json.contains("\"vertex_count\":3"),
+        "expected per-mesh vertex_count=3, got: {json}"
+    );
+    assert!(
+        json.contains("\"triangle_count\":1"),
+        "expected per-mesh triangle_count=1, got: {json}"
+    );
+    // Per-mesh bounding_box is computed from the triangle positions
+    // (0..1 unit cube corner).
+    assert!(
+        json.contains("\"bounding_box\":{\"min_x\":0,\"min_y\":0"),
+        "expected per-mesh bounding_box, got: {json}"
+    );
+    // Empty materials/animations are still emitted as empty arrays.
+    assert!(
+        json.contains("\"materials\":[]"),
+        "expected empty materials array, got: {json}"
+    );
+    assert!(
+        json.contains("\"animations\":[]"),
+        "expected empty animations array, got: {json}"
+    );
 }
 
 // ─────────────────────────── Mutual-exclusion / arg-parsing ─────────────

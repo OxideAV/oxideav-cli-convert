@@ -34,6 +34,7 @@ use std::fs;
 use oxideav_core::vector::{Group, Node, VectorFrame};
 use oxideav_core::{Error, MediaType, PixelFormat, Result, RuntimeContext, SourceOutput};
 use oxideav_pdf::read_pdf_to_scene;
+use oxideav_pdf::reader::DocumentReader;
 use oxideav_scene::Page;
 use oxideav_svg::parse_svg;
 
@@ -231,12 +232,7 @@ fn json_string(s: &str) -> String {
 /// Print a probe summary for `plan.input` to stdout. Routing mirrors
 /// [`crate::run`] — PDF / 3D side-channels, then container fallback.
 pub fn run(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<()> {
-    let summary = build_summary(plan, ctx)?;
-    let line = if plan.probe_json {
-        summary.to_json()
-    } else {
-        summary.to_pretty()
-    };
+    let line = render(plan, ctx)?;
     if plan.probe_json {
         println!("{line}");
     } else {
@@ -246,6 +242,21 @@ pub fn run(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<()> {
         print!("{line}");
     }
     Ok(())
+}
+
+/// Build the probe summary for `plan.input` and return it formatted
+/// as a single string — JSON when [`plan.probe_json`](ConvertPlan::probe_json)
+/// is on, pretty-printed `key: value` lines otherwise. Same data
+/// [`run`] would have printed; useful for callers (tests, embedders)
+/// that want to inspect the probe payload without going through stdout
+/// capture.
+pub fn render(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<String> {
+    let summary = build_summary(plan, ctx)?;
+    Ok(if plan.probe_json {
+        summary.to_json()
+    } else {
+        summary.to_pretty()
+    })
 }
 
 fn build_summary(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Summary> {
@@ -274,6 +285,17 @@ fn has_extension(path: &str, exts: &[&str]) -> bool {
 fn probe_pdf(plan: &ConvertPlan) -> Result<Summary> {
     let bytes = fs::read(&plan.input)
         .map_err(|e| Error::invalid(format!("convert: failed to read {}: {e}", plan.input)))?;
+    // Open via the low-level `DocumentReader` first so we can surface
+    // `is_encrypted` (the high-level `read_pdf_to_scene` succeeds on
+    // unencrypted PDFs and on encrypted-with-empty-password PDFs but
+    // doesn't expose which one we landed on). On encryption-failure
+    // (`open` errors) we still report the file as encrypted with the
+    // gap noted, rather than the whole probe failing.
+    let is_encrypted = match DocumentReader::open(&bytes) {
+        Ok(r) => r.is_encrypted(),
+        Err(_) => true, // open failed — almost certainly an /Encrypt
+                        // entry with a non-empty password we don't have
+    };
     let scene = read_pdf_to_scene(&bytes)
         .map_err(|e| Error::invalid(format!("convert: failed to parse PDF: {e:?}")))?;
     let pages = scene.pages.as_deref().unwrap_or(&[]);
@@ -282,7 +304,47 @@ fn probe_pdf(plan: &ConvertPlan) -> Result<Summary> {
     s.push(Field::Str("path", plan.input.clone()));
     s.push(Field::Str("kind", "pdf".into()));
     s.push(Field::Int("file_size_bytes", bytes.len() as i64));
+    s.push(Field::Str(
+        "is_encrypted",
+        if is_encrypted {
+            "yes".into()
+        } else {
+            "no".into()
+        },
+    ));
     s.push(Field::Int("page_count", pages.len() as i64));
+
+    // Document-info fields surfaced via the `/Info` dictionary, lifted
+    // into `Scene::metadata` by the PDF reader. Each is reported only
+    // when populated — the absence of `producer` is a real signal
+    // ("this PDF wasn't tagged"), not the same as the empty string.
+    let md = &scene.metadata;
+    if let Some(title) = &md.title {
+        s.push(Field::Str("title", title.clone()));
+    }
+    if let Some(author) = &md.author {
+        s.push(Field::Str("author", author.clone()));
+    }
+    if let Some(subject) = &md.subject {
+        s.push(Field::Str("subject", subject.clone()));
+    }
+    if !md.keywords.is_empty() {
+        s.push(Field::StrList("keywords", md.keywords.clone()));
+    }
+    if let Some(creator) = &md.creator {
+        s.push(Field::Str("creator", creator.clone()));
+    }
+    if let Some(producer) = &md.producer {
+        s.push(Field::Str("producer", producer.clone()));
+    }
+    if let Some(created_at) = &md.created_at {
+        // Ship the raw ISO-8601 string the PDF reader normalised to;
+        // it round-trips to PDF's `D:YYYYMMDD…` format on write.
+        s.push(Field::Str("creation_date", created_at.clone()));
+    }
+    if let Some(modified_at) = &md.modified_at {
+        s.push(Field::Str("modification_date", modified_at.clone()));
+    }
 
     // Per-page dimensions (PostScript points). Capped at 32 entries so
     // a 10 000-page PDF doesn't blow up the summary; the count is
@@ -447,6 +509,102 @@ fn probe_mesh3d(plan: &ConvertPlan) -> Result<Summary> {
     s.push(Field::Int("skin_count", scene.skins.len() as i64));
     s.push(Field::Int("node_count", scene.nodes.len() as i64));
     s.push(Field::Int("root_count", scene.roots.len() as i64));
+
+    // Per-mesh detail: name + primitive/vertex/triangle counts + bbox.
+    // Capped at 64 entries — the totals above are always reported via
+    // `mesh_count` / `primitive_count` / etc. so the field is
+    // answerable even on huge scenes.
+    let mesh_cap = 64usize;
+    let meshes_for_summary: Vec<Vec<Field>> = scene
+        .meshes
+        .iter()
+        .take(mesh_cap)
+        .enumerate()
+        .map(|(idx, m)| {
+            let mut prims = 0usize;
+            let mut verts = 0usize;
+            let mut tris = 0usize;
+            for prim in &m.primitives {
+                prims += 1;
+                verts += prim.positions.len();
+                tris += prim.triangle_count();
+            }
+            let mut row = vec![
+                Field::Int("index", idx as i64),
+                Field::Str("name", m.name.clone().unwrap_or_else(|| "(unnamed)".into())),
+                Field::Int("primitive_count", prims as i64),
+                Field::Int("vertex_count", verts as i64),
+                Field::Int("triangle_count", tris as i64),
+            ];
+            if let Some(b) = compute_mesh_bbox(m) {
+                row.push(Field::Group(
+                    "bounding_box",
+                    vec![
+                        Field::Float("min_x", b.0[0] as f64),
+                        Field::Float("min_y", b.0[1] as f64),
+                        Field::Float("min_z", b.0[2] as f64),
+                        Field::Float("max_x", b.1[0] as f64),
+                        Field::Float("max_y", b.1[1] as f64),
+                        Field::Float("max_z", b.1[2] as f64),
+                    ],
+                ));
+            }
+            row
+        })
+        .collect();
+    s.push(Field::GroupList("meshes", meshes_for_summary));
+    if scene.meshes.len() > mesh_cap {
+        s.push(Field::Int("meshes_truncated_at", mesh_cap as i64));
+    }
+
+    // Per-material detail: index + (best-effort) name. Materials don't
+    // carry a triangle/primitive count — references to materials live
+    // on `Primitive::material`, and a cross-walk would re-traverse the
+    // whole scene; the per-mesh totals above are the right place for
+    // that information today. Capped at 64.
+    let mat_cap = 64usize;
+    let materials_for_summary: Vec<Vec<Field>> = scene
+        .materials
+        .iter()
+        .take(mat_cap)
+        .enumerate()
+        .map(|(idx, m)| {
+            vec![
+                Field::Int("index", idx as i64),
+                Field::Str("name", m.name.clone().unwrap_or_else(|| "(unnamed)".into())),
+            ]
+        })
+        .collect();
+    s.push(Field::GroupList("materials", materials_for_summary));
+    if scene.materials.len() > mat_cap {
+        s.push(Field::Int("materials_truncated_at", mat_cap as i64));
+    }
+
+    // Per-animation detail: index + name + duration + channel count.
+    // Animation duration is the max keyframe across every channel — a
+    // single-channel translation that lasts 5.0s and a parallel rotation
+    // that lasts 8.0s yields a clip duration of 8.0s. Capped at 64.
+    let anim_cap = 64usize;
+    let animations_for_summary: Vec<Vec<Field>> = scene
+        .animations
+        .iter()
+        .take(anim_cap)
+        .enumerate()
+        .map(|(idx, a)| {
+            let dur = animation_duration(a);
+            vec![
+                Field::Int("index", idx as i64),
+                Field::Str("name", a.name.clone().unwrap_or_else(|| "(unnamed)".into())),
+                Field::Int("channel_count", a.channels.len() as i64),
+                Field::Float("duration_s", dur as f64),
+            ]
+        })
+        .collect();
+    s.push(Field::GroupList("animations", animations_for_summary));
+    if scene.animations.len() > anim_cap {
+        s.push(Field::Int("animations_truncated_at", anim_cap as i64));
+    }
+
     // The Scene3D model is single-document (no separate "scene"
     // collection like glTF's `scenes` array); surface the implicit
     // index-zero so the field is present and answerable.
@@ -502,6 +660,42 @@ fn topology_label(t: oxideav_mesh3d::Topology) -> &'static str {
         LineLoop => "LineLoop",
         Points => "Points",
     }
+}
+
+/// AABB of one mesh's primitives. `None` when the mesh has no
+/// position samples at all.
+#[cfg(feature = "mesh3d")]
+fn compute_mesh_bbox(mesh: &oxideav_mesh3d::Mesh) -> Option<([f32; 3], [f32; 3])> {
+    let mut bbox: Option<([f32; 3], [f32; 3])> = None;
+    for prim in &mesh.primitives {
+        for p in &prim.positions {
+            bbox = Some(match bbox {
+                None => (*p, *p),
+                Some((mn, mx)) => (
+                    [mn[0].min(p[0]), mn[1].min(p[1]), mn[2].min(p[2])],
+                    [mx[0].max(p[0]), mx[1].max(p[1]), mx[2].max(p[2])],
+                ),
+            });
+        }
+    }
+    bbox
+}
+
+/// Animation duration in seconds = max keyframe time across every
+/// channel's sampler. Returns `0.0` for an empty animation (no
+/// channels, or every channel empty) — matching what a glTF
+/// keyframes-empty animation would report.
+#[cfg(feature = "mesh3d")]
+fn animation_duration(anim: &oxideav_mesh3d::Animation) -> f32 {
+    let mut max = 0.0f32;
+    for ch in &anim.channels {
+        if let Some(&t) = ch.sampler.keyframes.last() {
+            if t > max {
+                max = t;
+            }
+        }
+    }
+    max
 }
 
 /// Compute the AABB of every position buffer across every mesh's
@@ -586,7 +780,63 @@ fn probe_container(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Summary> 
     // to special-case missing fields.
     let stream_groups: Vec<Vec<Field>> = streams.iter().map(stream_summary_fields).collect();
     s.push(Field::GroupList("streams", stream_groups));
+
+    // Container-level metadata via the Demuxer::metadata() trait
+    // method. Surfaced as a `metadata` group so callers can iterate
+    // `metadata.title` / `metadata.artist` / etc. without having to
+    // peer-into-streams. Demuxers that carry no metadata (the trait's
+    // default impl) just produce an empty group, which keeps the field
+    // present and answerable.
+    //
+    // The keys follow the loose convention defined on the Demuxer
+    // trait: `title`, `artist`, `album`, `comment`, `date`, etc. Keys
+    // we can't render as JSON object keys (control bytes etc.) are
+    // already escaped by `json_string`; values are passed through.
+    let meta = demuxer.metadata();
+    if !meta.is_empty() {
+        let meta_fields: Vec<Field> = meta
+            .iter()
+            .map(|(k, v)| Field::Str(intern_static_or_leak(k), v.clone()))
+            .collect();
+        s.push(Field::Group("metadata", meta_fields));
+    }
     Ok(s)
+}
+
+/// `Field::Str`'s key field is `&'static str` (so the in-source
+/// constants don't allocate). Container-metadata keys are runtime
+/// strings, so we leak them into a static slot via `Box::leak`. The
+/// whole-process metadata-key footprint is bounded — there are ~30
+/// well-known keys (`title` / `artist` / `album` / …) and a handful of
+/// per-format extensions — so the leak is bounded too. Same shape
+/// `Field::Group("metadata", …)` would have if we changed the key
+/// type, just without rippling into every other field constructor.
+fn intern_static_or_leak(s: &str) -> &'static str {
+    // Hot path: well-known keys are interned literally so they don't
+    // get leaked once per probe call.
+    match s {
+        "title" => "title",
+        "artist" => "artist",
+        "album" => "album",
+        "album_artist" => "album_artist",
+        "comment" => "comment",
+        "date" => "date",
+        "year" => "year",
+        "track" => "track",
+        "genre" => "genre",
+        "composer" => "composer",
+        "performer" => "performer",
+        "copyright" => "copyright",
+        "encoder" => "encoder",
+        "language" => "language",
+        "publisher" => "publisher",
+        "description" => "description",
+        "disc" => "disc",
+        "lyrics" => "lyrics",
+        // Cold path: leak — container-format-specific keys
+        // (`sample_name:0`, `n_patterns`, …) are bounded per process.
+        other => Box::leak(other.to_string().into_boxed_str()),
+    }
 }
 
 fn classify_kind(streams: &[oxideav_core::StreamInfo]) -> &'static str {

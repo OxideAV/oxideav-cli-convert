@@ -208,12 +208,12 @@ silently picking one.
 
 | Input class | Fields surfaced |
 |---|---|
-| Raster image | container, codec, width, height, bit_depth, color_space, alpha, frame_rate (animated) |
-| PDF | page_count, per-page width_pt × height_pt × orientation_deg, embedded_image_count |
+| Raster image | container, codec, width, height, bit_depth, color_space, alpha, frame_rate (animated), container metadata (title, artist, etc.) |
+| PDF | is_encrypted, page_count, per-page width_pt × height_pt × orientation_deg, embedded_image_count, document-info dictionary (title, author, subject, keywords, creator, producer, creation_date, modification_date) |
 | SVG | width_pt, height_pt, embedded_image_count |
-| 3D (STL/OBJ/glTF/GLB/USDZ/MTL) | mesh_count, primitive_count, vertex_count, triangle_count, material_count, texture_count, animation_count, skin_count, node_count, root_count, topologies, bounding_box (computed from positions) |
-| Audio | container, codec, sample_rate_hz, channels, channel_layout, bit_depth, sample_format, duration_s, bit_rate |
-| Video | container, codec, per-stream width × height × bit_depth × color_space × alpha × frame_rate_fps × duration_s |
+| 3D (STL/OBJ/glTF/GLB/USDZ/MTL) | mesh_count, primitive_count, vertex_count, triangle_count, material_count, texture_count, animation_count, skin_count, node_count, root_count, topologies, bounding_box (computed from positions), per-mesh detail (name + counts + bbox), per-material name, per-animation name + duration_s + channel_count |
+| Audio | container, codec, sample_rate_hz, channels, channel_layout, bit_depth, sample_format, duration_s, bit_rate, container metadata (title, artist, album, etc. via `Demuxer::metadata()`) |
+| Video | container, codec, per-stream width × height × bit_depth × color_space × alpha × frame_rate_fps × duration_s, container metadata |
 
 Embedded font count for PDF / SVG is reported as `unknown` today —
 the producer crates don't surface a font-resource census, and

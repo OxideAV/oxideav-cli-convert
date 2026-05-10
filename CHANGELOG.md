@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `--probe` extensions surfacing more upstream metadata that the
+  round-40 baseline left on the table:
+  - **PDF**: `is_encrypted` (always present), and the `/Info` dictionary
+    fields lifted onto `Scene::metadata` by `oxideav-pdf` —
+    `title`, `author`, `subject`, `keywords`, `creator`, `producer`,
+    `creation_date`, `modification_date`. Each is reported only when
+    populated (the absence of `producer` is a real signal — "this PDF
+    wasn't tagged" — distinct from the empty string). `is_encrypted`
+    is read via `DocumentReader::open()`+`is_encrypted()`; if `open()`
+    itself fails (encrypted PDF with non-empty password we don't have)
+    the field reports `yes` rather than failing the whole probe.
+  - **3D (mesh3d feature)**: per-mesh, per-material, per-animation
+    detail (capped at 64 entries each — totals always reported via
+    `mesh_count` / `material_count` / `animation_count`).
+    - `meshes[i]`: `index`, `name` (or `(unnamed)`), `primitive_count`,
+      `vertex_count`, `triangle_count`, `bounding_box` (per-mesh AABB
+      computed from `Primitive::positions`).
+    - `materials[i]`: `index`, `name`.
+    - `animations[i]`: `index`, `name`, `channel_count`, `duration_s`
+      (max keyframe time across every channel's sampler).
+  - **Container fallback**: container-level `metadata` group
+    (`title`, `artist`, `album`, etc. via `Demuxer::metadata()`).
+    Demuxers that carry no metadata produce an empty group so the
+    field stays predictable.
+- `probe::render(plan, ctx) -> Result<String>` — same data
+  `probe::run` would print, returned as a `String` for in-process
+  callers (tests, embedders) that don't want to fight stdout capture.
+- `tests/probe.rs` coverage for the new fields (+2 tests, total 10):
+  populated `/Info` dict round-trips through the JSON formatter; STL
+  per-mesh detail surfaces `vertex_count` / `triangle_count` /
+  `bounding_box` and the empty `materials` / `animations` arrays are
+  emitted (not omitted).
+
 - `--probe` dry-run structural-inspection mode. Decodes the input far
   enough to extract metadata (page count, mesh count, sample rate, …),
   prints a compact summary to stdout, and skips any output write.
