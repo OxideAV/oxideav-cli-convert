@@ -120,13 +120,23 @@ disappears and 3D inputs fall through to the regular pipeline path.
 
 | Input | Output | Action |
 |---|---|---|
-| 3D format | matching 3D format (`.stl`/`.obj`/`.gltf`/`.glb`/`.mtl`) | decode → re-encode through `Mesh3DRegistry` |
-| 3D format | non-3D extension (`.png`, `.mp4`, …) | error — 3D→raster rendering is a documented follow-up |
+| 3D format | matching 3D format (`.stl`/`.obj`/`.gltf`/`.glb`/`.mtl`/`.usdz`) | decode → re-encode through `Mesh3DRegistry` |
+| 3D format | raster (`.png`/`.jpg`/`.bmp`/`.webp`) | software-render the scene to RGBA, encode |
+| 3D format | other extension (`.svg`, `.mp4`, …) | error with did-you-mean hint |
 | 3D format | output with `%d` template | error — 3D scenes are single-document |
 
-USDZ is read-only today (decoder registered, no encoder). Raster ops
-(`-resize`, `-blur`, …) are silently ignored for 3D-asset conversions —
-they have no pixel grid.
+USDZ now round-trips both ways (encoder ships in `oxideav-usdz` 0.0.1).
+3D→raster rendering uses a tiny built-in software rasteriser:
+flat-shaded triangles by default (`-render flat`) with `-render
+wireframe` as an alternative; the camera auto-frames the scene's
+bounding box at 60° vertical FOV. Texture sampling, lighting models
+(Gouraud / Phong / PBR), and anti-aliasing are documented follow-ups.
+
+Raster ops (`-rotate`, `-flip`, `-crop`, `-negate`, …) ARE honoured
+on the 3D→raster path — they run after rasterisation, sharing the
+same pixel-transform chain as the PDF runner. `-resize WxH` seeds
+the canvas dimensions before rasterisation (default 1024×1024);
+`-background COLOR` paints the canvas (default opaque white).
 
 #### Per-format encoder option flags
 
@@ -140,6 +150,7 @@ flag is paired with an extension it doesn't apply to (e.g.
 |---|---|---|---|
 | `-stl-format` | `binary` / `bin` / `ascii` / `text` | `binary` | Selects STL on-disk flavour |
 | `-gltf-format` | `glb` / `binary` / `embedded` / `json-embedded` / `external` / `json-external` | infer from `.glb` vs `.gltf` extension | `external` errors with a `gltf-rN` follow-up message until upstream `OutputFlavour::JsonExternal` lands |
+| `-render` | `flat` / `shaded` / `wireframe` / `wire` | `flat` | Selects 3D→raster surface model. Only consulted on the 3D→raster routing path. |
 
 ### Routing matrix (PDF input)
 

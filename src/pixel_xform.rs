@@ -27,9 +27,9 @@
 //! (`flip` → `rotate 90` → `crop` walks a coherent buffer at every
 //! stage).
 //!
-//! The module is consumed by [`crate::pdf_runner`] today; once the
-//! non-PDF pipeline path grows the same hook the executor will call
-//! straight in here too.
+//! The module is consumed by [`crate::pdf_runner`] and
+//! [`crate::mesh3d_render`] today; once the non-PDF pipeline path
+//! grows the same hook the executor will call straight in here too.
 
 use oxideav_core::{Error, PixelFormat, VideoFrame, VideoPlane};
 use oxideav_image_filter::{
@@ -38,7 +38,7 @@ use oxideav_image_filter::{
 };
 
 use crate::op::Op;
-use crate::pdf_runner::RgbaImage;
+use crate::raster_io::RgbaImage;
 
 /// Bytes per packed pixel (3 = Rgb24, 4 = Rgba). Computed off
 /// `stride / width` since `RgbaImage` doesn't carry the format tag

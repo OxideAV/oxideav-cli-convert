@@ -43,10 +43,11 @@ use crate::op::{GltfFormatChoice, Mesh3DOptions, StlFormatChoice};
 /// recognition stays a single source of truth.
 const MESH3D_INPUT_EXTS: &[&str] = &["stl", "obj", "gltf", "glb", "usdz", "mtl"];
 
-/// File extensions the 3D side-channel can emit. Same set minus
-/// `usdz` (read-only today; the `oxideav-usdz` crate ships a decoder
-/// but no encoder factory).
-const MESH3D_OUTPUT_EXTS: &[&str] = &["stl", "obj", "gltf", "glb", "mtl"];
+/// File extensions the 3D side-channel can emit. Matches the input
+/// set: `oxideav-usdz` ships a [`UsdzEncoder`](oxideav_usdz::UsdzEncoder)
+/// alongside its decoder, so USDZ is now a round-trip target as
+/// well.
+const MESH3D_OUTPUT_EXTS: &[&str] = &["stl", "obj", "gltf", "glb", "mtl", "usdz"];
 
 /// Returns `true` when the input path's extension matches one of the
 /// 3D formats wired into the [`Mesh3DRegistry`]. Case-insensitive.
@@ -252,8 +253,8 @@ mod tests {
         assert!(is_mesh3d_output("out.gltf"));
         assert!(is_mesh3d_output("out.glb"));
         assert!(is_mesh3d_output("out.mtl"));
-        // USDZ is read-only today (decoder only, no encoder).
-        assert!(!is_mesh3d_output("out.usdz"));
+        assert!(is_mesh3d_output("out.usdz"));
+        assert!(is_mesh3d_output("out.USDZ"));
         assert!(!is_mesh3d_output("out.png"));
     }
 

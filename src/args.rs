@@ -7,8 +7,8 @@
 //! flag errors out with a clear message — we never silently drop.
 
 use crate::op::{
-    AlphaOp, ConvertPlan, Dither, GltfFormatChoice, Mesh3DOptions, Op, PageSelector,
-    PrintfTemplate, ResizeMode, StlFormatChoice,
+    AlphaOp, ConvertPlan, Dither, GltfFormatChoice, Mesh3DOptions, Mesh3DRenderMode, Op,
+    PageSelector, PrintfTemplate, ResizeMode, StlFormatChoice,
 };
 use oxideav_core::Error;
 
@@ -435,6 +435,17 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                 let v = val(i + 1)?;
                 let choice = GltfFormatChoice::parse(v).map_err(Error::invalid)?;
                 mesh3d_options.gltf_format = Some(choice);
+                i += 2;
+            }
+            // `-render flat|wireframe` selects the 3D→raster surface
+            // model. Stored on `Mesh3DOptions` (sister to `-stl-format`
+            // and `-gltf-format`) so it never leaks into the regular
+            // pipeline path. Silently ignored when the input/output
+            // pair doesn't trigger the 3D→raster side-channel.
+            "-render" => {
+                let v = val(i + 1)?;
+                let mode = Mesh3DRenderMode::parse(v).map_err(Error::invalid)?;
+                mesh3d_options.render_mode = Some(mode);
                 i += 2;
             }
             other => {

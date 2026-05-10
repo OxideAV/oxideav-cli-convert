@@ -178,12 +178,11 @@ fn convert_stl_to_glb_writes_binary_container() {
 }
 
 #[test]
-fn convert_3d_input_to_non_3d_output_errors() {
-    // A 3D-input + raster-output combo should be rejected with a
-    // clear "must pair with a 3D output extension" message — not
-    // silently fall through to the pipeline path (which would
-    // probably misdiagnose the failure).
-    let dir = temp_dir("stl-to-png-rejected");
+fn convert_3d_input_to_raster_renders_png() {
+    // STL → PNG now goes through the 3D→raster software renderer
+    // instead of being rejected. The output PNG should exist + start
+    // with the PNG magic bytes.
+    let dir = temp_dir("stl-to-png-renders");
     let stl_path = dir.join("input.stl");
     let png_path = dir.join("output.png");
 
@@ -194,11 +193,63 @@ fn convert_3d_input_to_non_3d_output_errors() {
         stl_path.to_string_lossy().into_owned(),
         png_path.to_string_lossy().into_owned(),
     ];
-    let err = convert_run(&args, &ctx()).expect_err("STL→PNG should fail");
+    convert_run(&args, &ctx()).expect("STL→PNG should render via mesh3d_render");
+
+    let bytes = fs::read(&png_path).expect("read PNG output");
+    assert!(
+        bytes.len() >= 8 && &bytes[..8] == b"\x89PNG\r\n\x1a\n",
+        "PNG output should start with the PNG magic, got: {:?}",
+        &bytes[..bytes.len().min(8)]
+    );
+}
+
+#[test]
+fn convert_3d_input_to_unrelated_output_errors() {
+    // Anything that's neither a 3D output nor a known raster output
+    // (e.g. `.mp4`) is still rejected with the pairing-mismatch error.
+    let dir = temp_dir("stl-to-mp4-rejected");
+    let stl_path = dir.join("input.stl");
+    let mp4_path = dir.join("output.mp4");
+
+    let scene = make_one_triangle_scene();
+    write_stl_fixture(&stl_path, &scene);
+
+    let args = vec![
+        stl_path.to_string_lossy().into_owned(),
+        mp4_path.to_string_lossy().into_owned(),
+    ];
+    let err = convert_run(&args, &ctx()).expect_err("STL→MP4 should fail");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("must pair with a 3D output extension"),
+        msg.contains("must pair with a 3D output") || msg.contains("must pair with"),
         "expected pairing-mismatch error, got: {msg}"
+    );
+}
+
+#[test]
+fn convert_stl_to_usdz_round_trips() {
+    // USDZ is now a round-trip target — encoder ships in oxideav-usdz
+    // and the runner's MESH3D_OUTPUT_EXTS includes "usdz".
+    let dir = temp_dir("stl-to-usdz");
+    let stl_path = dir.join("input.stl");
+    let usdz_path = dir.join("output.usdz");
+
+    let scene = make_one_triangle_scene();
+    write_stl_fixture(&stl_path, &scene);
+
+    let args = vec![
+        stl_path.to_string_lossy().into_owned(),
+        usdz_path.to_string_lossy().into_owned(),
+    ];
+    convert_run(&args, &ctx()).expect("convert STL→USDZ succeeds");
+
+    let bytes = fs::read(&usdz_path).expect("read USDZ output");
+    // USDZ is a STORED ZIP; first 4 bytes are the local-file-header
+    // signature `PK\x03\x04`.
+    assert!(
+        bytes.len() >= 4 && &bytes[..4] == b"PK\x03\x04",
+        "USDZ output should start with PK\\x03\\x04, got: {:?}",
+        &bytes[..bytes.len().min(4)]
     );
 }
 

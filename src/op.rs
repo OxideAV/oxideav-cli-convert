@@ -503,6 +503,40 @@ impl GltfFormatChoice {
     }
 }
 
+/// `-render MODE` value. Selects which surface model the 3D→raster
+/// renderer uses when the user pairs a 3D input (`.stl`/`.obj`/
+/// `.gltf`/`.glb`/`.usdz`) with a raster output (`.png`/`.jpg`/
+/// `.bmp`/`.webp`).
+///
+/// Default is [`Flat`](Self::Flat) — one constant colour per primitive
+/// derived from the material's `base_color` (or a fallback grey when
+/// no material is attached). Future modes (`gouraud`, `phong`, `pbr`)
+/// land here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mesh3DRenderMode {
+    /// Flat-shaded triangles, one colour per primitive (no per-pixel
+    /// lighting). Cheapest mode and the default.
+    #[default]
+    Flat,
+    /// Wireframe — only triangle edges are drawn, interior pixels stay
+    /// at the background. Same colour-per-primitive as [`Flat`](Self::Flat).
+    Wireframe,
+}
+
+impl Mesh3DRenderMode {
+    /// Parse the value after `-render`. Accepts `flat` / `wireframe`
+    /// case-insensitively. `wire` is a short alias for `wireframe`.
+    pub fn parse(s: &str) -> Result<Mesh3DRenderMode, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "flat" | "shaded" => Ok(Mesh3DRenderMode::Flat),
+            "wireframe" | "wire" => Ok(Mesh3DRenderMode::Wireframe),
+            other => Err(format!(
+                "convert: -render: unknown mode '{other}' (expected 'flat' or 'wireframe')"
+            )),
+        }
+    }
+}
+
 /// Per-format encoder option flags forwarded to the 3D side-channel.
 ///
 /// All fields default to `None` meaning "use the format crate's
@@ -516,6 +550,10 @@ pub struct Mesh3DOptions {
     /// output extension (`.glb` → Glb, `.gltf` → JsonEmbedded), which
     /// is exactly what the registry's by-extension lookup already does.
     pub gltf_format: Option<GltfFormatChoice>,
+    /// `-render flat|wireframe`. `None` → default ([`Mesh3DRenderMode::Flat`]).
+    /// Only consulted by the 3D→raster side-channel; ignored on
+    /// every other input/output combination.
+    pub render_mode: Option<Mesh3DRenderMode>,
 }
 
 /// The parsed result of one `oxideav convert` invocation.

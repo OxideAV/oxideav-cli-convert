@@ -32,6 +32,8 @@
 
 pub mod args;
 #[cfg(feature = "mesh3d")]
+pub mod mesh3d_render;
+#[cfg(feature = "mesh3d")]
 pub mod mesh3d_runner;
 pub mod op;
 pub mod pdf_runner;
@@ -39,6 +41,7 @@ pub mod ping;
 pub mod pixel_xform;
 pub mod plan_to_job;
 pub mod probe;
+pub mod raster_io;
 pub mod suggest;
 
 pub use op::{AlphaOp, ConvertPlan, Dither, Op, PrintfTemplate, ResizeMode};
@@ -82,38 +85,46 @@ pub fn run(args: &[String], ctx: &RuntimeContext) -> Result<(), Error> {
     }
 
     // Side-channel: 3D-asset inputs (STL/OBJ/glTF/GLB/USDZ/MTL) go
-    // through a Mesh3DRegistry-driven decode→encode bridge. 3D scenes
-    // don't fit any of the codec/container shapes the regular pipeline
-    // walks, and the dispatch contract is a separate registry from
-    // `RuntimeContext`'s codec/container/filter/source path. See
-    // `mesh3d_runner` module docs.
+    // through a Mesh3DRegistry-driven decode→encode bridge for
+    // same-class round-trips, OR through the 3D→raster software
+    // renderer when paired with a raster output (.png/.jpg/.bmp/
+    // .webp). 3D scenes don't fit any of the codec/container shapes
+    // the regular pipeline walks, and the dispatch contract is a
+    // separate registry from `RuntimeContext`'s codec/container/
+    // filter/source path. See `mesh3d_runner` and `mesh3d_render`
+    // module docs.
     #[cfg(feature = "mesh3d")]
     if mesh3d_runner::is_mesh3d_input(&plan.input) {
-        if !mesh3d_runner::is_mesh3d_output(&plan.output) {
-            // Surface a did-you-mean suggestion when the output
-            // extension looks like a typo of one of the supported 3D
-            // outputs (e.g. `.gtlf` → `.gltf`). For genuinely unrelated
-            // extensions (`.png`, `.mp4`) the helper returns "" so the
-            // base message is unchanged.
-            let out_ext = plan.output.rsplit('.').next().unwrap_or("");
-            let hint = suggest::format_hint(out_ext, &["stl", "obj", "gltf", "glb", "mtl"]);
-            return Err(Error::invalid(format!(
-                "convert: 3D input '{}' must pair with a 3D output extension (.stl/.obj/.gltf/.glb/.mtl); got '{}'{hint}. 3D→raster rendering is a separate follow-up.",
-                plan.input, plan.output
-            )));
-        }
         if plan.output_template.is_some() {
             return Err(Error::invalid(format!(
                 "convert: output '{}' has a `%d` template but 3D scenes are single-document; remove the template",
                 plan.output
             )));
         }
-        if !plan.ops.is_empty() {
-            eprintln!(
-                "convert: note: raster ops ignored on 3D-asset conversion (stl/obj/gltf/glb/mtl have no pixel grid)"
-            );
+        if mesh3d_runner::is_mesh3d_output(&plan.output) {
+            if !plan.ops.is_empty() {
+                eprintln!(
+                    "convert: note: raster ops ignored on 3D-asset conversion (stl/obj/gltf/glb/mtl/usdz have no pixel grid)"
+                );
+            }
+            return mesh3d_runner::run(&plan.input, &plan.output, &plan.mesh3d_options);
         }
-        return mesh3d_runner::run(&plan.input, &plan.output, &plan.mesh3d_options);
+        // Raster output? Route to the 3D→raster software renderer.
+        if matches!(
+            raster_io::classify_output(&plan.output),
+            Ok(raster_io::OutputClass::Raster(_))
+        ) {
+            return mesh3d_render::run(&plan.input, &plan.output, &plan.ops, &plan.mesh3d_options);
+        }
+        // Anything else (e.g. .pdf, .svg, .mp4, …): emit the
+        // pairing-mismatch error with a did-you-mean hint over the
+        // 3D-output set.
+        let out_ext = plan.output.rsplit('.').next().unwrap_or("");
+        let hint = suggest::format_hint(out_ext, &["stl", "obj", "gltf", "glb", "mtl", "usdz"]);
+        return Err(Error::invalid(format!(
+            "convert: 3D input '{}' must pair with a 3D output (.stl/.obj/.gltf/.glb/.mtl/.usdz) OR a raster output (.png/.jpg/.bmp/.webp); got '{}'{hint}",
+            plan.input, plan.output
+        )));
     }
 
     let job = plan_to_job::plan_to_job(&plan, ctx)?;

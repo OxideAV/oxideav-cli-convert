@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- USDZ wired as a 3D-output target. `oxideav convert in.obj out.usdz`
+  now produces a STORED-only PKZip carrying a `scene.usda` Default
+  Layer — the matching encoder ships in `oxideav-usdz` 0.0.1 (the
+  workspace populator already pointed `Mesh3DRegistry` at it; only
+  the runner's allow-list `MESH3D_OUTPUT_EXTS` was gating it out).
+- 3D → raster software renderer. `oxideav convert in.gltf out.png`
+  decodes the 3D asset through the same `Mesh3DRegistry` the
+  STL/OBJ/glTF/USDZ round-trip flow uses, then rasterises the
+  `Scene3D` through a tiny built-in software pipeline:
+  - **Camera** auto-frames the scene's axis-aligned bounding box at
+    a 60° vertical FOV with a 20% margin, looking down `-Z`.
+  - **Walk** every `Node`, composing the world matrix top-down; each
+    `Mesh::primitive` is projected, back-face-culled, and rasterised
+    with a half-space edge-function pipeline + per-pixel z-buffer.
+  - **Triangle / strip / fan / line / line-strip / line-loop / point
+    topologies** all dispatch through one tessellation step into the
+    same triangle-list inner loop.
+  - **Flat shading** — one constant colour per `Primitive`, pulled
+    from `material.base_color` (linear → sRGB) or fallback grey when
+    no material is bound.
+  - `-render flat` / `-render wireframe` selects shaded vs.
+    edge-only output. Wireframe draws Bresenham lines on each
+    triangle's three edges.
+  - `-resize WxH` seeds the canvas dimensions (otherwise 1024×1024);
+    `-background COLOR` paints the canvas before rasterisation;
+    `-alpha …` and the inline pixel-transform chain
+    (`-rotate` / `-flip` / `-flop` / `-crop` / `-negate`) all run
+    post-rasterisation, sharing the same plumbing as the PDF
+    side-channel.
+  - Output codec follows the extension: `.png` / `.jpg` / `.bmp` /
+    `.webp` (the same set the PDF runner emits); `-quality N`
+    forwards into the JPEG encoder.
+- New `mesh3d_render` module hosts the renderer; new `raster_io`
+  module centralises the `RgbaImage` handoff buffer + per-format
+  encoders so the PDF runner and the 3D-render runner share one
+  pixel-encode codepath.
+- `Op::Mesh3DRenderMode` enum + `-render flat|wireframe|wire` arg
+  (lives on `Mesh3DOptions::render_mode`, parallel to
+  `-stl-format` / `-gltf-format`; silently ignored when the
+  input/output pair doesn't trigger the 3D→raster path).
 - IM-style geometry-modifier suffixes on `-resize` (and on the new
   `-thumbnail`):
   - `WxH!` — force exact dimensions, ignore aspect ratio (was
