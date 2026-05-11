@@ -358,6 +358,101 @@ fn fbx_extension_is_recognised_as_mesh3d_input() {
 }
 
 #[test]
+fn convert_3d_input_to_raster_renders_with_normal_debug() {
+    // Round 45: -render normal-debug paints normals as RGB.
+    let dir = temp_dir("stl-normal-debug");
+    let stl_path = dir.join("input.stl");
+    let png_path = dir.join("output.png");
+
+    let scene = make_one_triangle_scene();
+    write_stl_fixture(&stl_path, &scene);
+
+    let args = vec![
+        stl_path.to_string_lossy().into_owned(),
+        "-render".into(),
+        "normal-debug".into(),
+        png_path.to_string_lossy().into_owned(),
+    ];
+    convert_run(&args, &ctx()).expect("STL→PNG -render normal-debug should succeed");
+    let bytes = fs::read(&png_path).expect("read PNG");
+    assert!(&bytes[..8] == b"\x89PNG\r\n\x1a\n");
+}
+
+#[test]
+fn convert_3d_input_to_raster_renders_with_depth_debug() {
+    // Round 45: -render depth-debug paints NDC z as grayscale.
+    let dir = temp_dir("stl-depth-debug");
+    let stl_path = dir.join("input.stl");
+    let png_path = dir.join("output.png");
+
+    let scene = make_one_triangle_scene();
+    write_stl_fixture(&stl_path, &scene);
+
+    let args = vec![
+        stl_path.to_string_lossy().into_owned(),
+        "-render".into(),
+        "depth-debug".into(),
+        png_path.to_string_lossy().into_owned(),
+    ];
+    convert_run(&args, &ctx()).expect("STL→PNG -render depth-debug should succeed");
+    let bytes = fs::read(&png_path).expect("read PNG");
+    assert!(&bytes[..8] == b"\x89PNG\r\n\x1a\n");
+}
+
+#[test]
+fn convert_3d_input_to_raster_with_aa_supersampling() {
+    // Round 45: -aa N must be honoured end-to-end and produce the
+    // same output dimensions as the no-aa render (only the smoothness
+    // changes — the framebuffer footprint is invisible to the user).
+    let dir = temp_dir("stl-aa");
+    let stl_path = dir.join("input.stl");
+    let png_path = dir.join("output.png");
+
+    let scene = make_one_triangle_scene();
+    write_stl_fixture(&stl_path, &scene);
+
+    let args = vec![
+        stl_path.to_string_lossy().into_owned(),
+        "-resize".into(),
+        "64x64".into(),
+        "-aa".into(),
+        "4".into(),
+        png_path.to_string_lossy().into_owned(),
+    ];
+    convert_run(&args, &ctx()).expect("STL→PNG -aa 4 should succeed");
+    let bytes = fs::read(&png_path).expect("read PNG");
+    assert!(&bytes[..8] == b"\x89PNG\r\n\x1a\n");
+    // PNG IHDR chunk starts at byte 8, length 4 bytes (== 13), then
+    // chunk type 4 bytes (b"IHDR"), then 4 bytes width, 4 bytes height.
+    let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    assert_eq!(width, 64, "AA must not change output width");
+    assert_eq!(height, 64, "AA must not change output height");
+}
+
+#[test]
+fn convert_3d_input_to_raster_aa_one_means_no_supersampling() {
+    // -aa 1 is documented as "off"; must succeed and produce a valid
+    // PNG, even though it's a no-op compared to omitting the flag.
+    let dir = temp_dir("stl-aa1");
+    let stl_path = dir.join("input.stl");
+    let png_path = dir.join("output.png");
+
+    let scene = make_one_triangle_scene();
+    write_stl_fixture(&stl_path, &scene);
+
+    let args = vec![
+        stl_path.to_string_lossy().into_owned(),
+        "-aa".into(),
+        "1".into(),
+        png_path.to_string_lossy().into_owned(),
+    ];
+    convert_run(&args, &ctx()).expect("STL→PNG -aa 1 should succeed");
+    let bytes = fs::read(&png_path).expect("read PNG");
+    assert!(&bytes[..8] == b"\x89PNG\r\n\x1a\n");
+}
+
+#[test]
 fn convert_3d_input_with_printf_template_errors() {
     // 3D scenes are single-document — a `%d` template makes no sense.
     let dir = temp_dir("stl-with-template-rejected");

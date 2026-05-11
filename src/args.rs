@@ -501,6 +501,28 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                 mesh3d_options.bg = Some(colour);
                 i += 2;
             }
+            // `-aa N` — supersampling factor for the 3D→raster
+            // renderer (rasterise at N × output, box-filter back to
+            // 1 × output). `1` means no supersampling. `>= 2` trades
+            // memory + CPU for smoother triangle edges. Stored on
+            // `Mesh3DOptions::aa`; silently ignored when the
+            // input/output pair doesn't trigger 3D rendering. We
+            // cap at 8 to keep memory bounded — at 8× a 1024²
+            // render needs ~80 MB just for the framebuffer + z-buffer
+            // and that already costs more than most users want.
+            "-aa" => {
+                let v = val(i + 1)?;
+                let factor: u32 = v.parse().map_err(|_| {
+                    Error::invalid(format!("convert: -aa: '{v}' is not a positive integer"))
+                })?;
+                if !(1..=8).contains(&factor) {
+                    return Err(Error::invalid(format!(
+                        "convert: -aa: factor {factor} out of range (must be in 1..=8)"
+                    )));
+                }
+                mesh3d_options.aa = Some(factor);
+                i += 2;
+            }
             other => {
                 // Reach here only on `-`-prefixed args (non-`-` was
                 // pushed to `positionals` above).
@@ -2442,5 +2464,110 @@ mod tests {
         assert_eq!(p.mesh3d_options.gltf_format, Some(GltfFormatChoice::Glb));
         assert_eq!(p.input, "in.stl");
         assert_eq!(p.output, "out.stl");
+    }
+
+    // ---- Round 45: -render normal-debug / depth-debug + -aa N --------
+
+    #[test]
+    fn render_normal_debug_parses() {
+        let p = parse(&to_vec(&["in.stl", "-render", "normal-debug", "out.png"])).unwrap();
+        assert_eq!(
+            p.mesh3d_options.render_mode,
+            Some(Mesh3DRenderMode::NormalDebug)
+        );
+    }
+
+    #[test]
+    fn render_depth_debug_parses() {
+        let p = parse(&to_vec(&["in.stl", "-render", "depth-debug", "out.png"])).unwrap();
+        assert_eq!(
+            p.mesh3d_options.render_mode,
+            Some(Mesh3DRenderMode::DepthDebug)
+        );
+    }
+
+    #[test]
+    fn render_normal_alias_parses() {
+        // `normal` (singular) and `normals` (plural) both map to
+        // NormalDebug; convenience for the common typo.
+        let p = parse(&to_vec(&["in.stl", "-render", "normal", "out.png"])).unwrap();
+        assert_eq!(
+            p.mesh3d_options.render_mode,
+            Some(Mesh3DRenderMode::NormalDebug)
+        );
+        let p = parse(&to_vec(&["in.stl", "-render", "normals", "out.png"])).unwrap();
+        assert_eq!(
+            p.mesh3d_options.render_mode,
+            Some(Mesh3DRenderMode::NormalDebug)
+        );
+    }
+
+    #[test]
+    fn render_depth_alias_parses() {
+        let p = parse(&to_vec(&["in.stl", "-render", "depth", "out.png"])).unwrap();
+        assert_eq!(
+            p.mesh3d_options.render_mode,
+            Some(Mesh3DRenderMode::DepthDebug)
+        );
+        let p = parse(&to_vec(&["in.stl", "-render", "z", "out.png"])).unwrap();
+        assert_eq!(
+            p.mesh3d_options.render_mode,
+            Some(Mesh3DRenderMode::DepthDebug)
+        );
+    }
+
+    #[test]
+    fn render_unknown_mode_lists_debug_modes() {
+        // Round 45 added two new modes; the error message should
+        // mention them so users don't have to grep the docs.
+        let err = parse(&to_vec(&["in.stl", "-render", "raytrace", "out.png"])).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("normal-debug") && msg.contains("depth-debug"),
+            "expected new debug-mode names in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn aa_default_is_unset() {
+        let p = parse(&to_vec(&["in.stl", "out.png"])).unwrap();
+        assert!(p.mesh3d_options.aa.is_none());
+    }
+
+    #[test]
+    fn aa_factor_parses() {
+        let p = parse(&to_vec(&["in.stl", "-aa", "4", "out.png"])).unwrap();
+        assert_eq!(p.mesh3d_options.aa, Some(4));
+    }
+
+    #[test]
+    fn aa_factor_one_is_allowed_meaning_no_supersampling() {
+        // 1× is the documented "off" value — allowed so callers can
+        // unconditionally set the flag from a config without special-
+        // casing the disabled state.
+        let p = parse(&to_vec(&["in.stl", "-aa", "1", "out.png"])).unwrap();
+        assert_eq!(p.mesh3d_options.aa, Some(1));
+    }
+
+    #[test]
+    fn aa_factor_zero_rejected() {
+        let err = parse(&to_vec(&["in.stl", "-aa", "0", "out.png"])).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("out of range") && msg.contains("1..=8"),
+            "expected range hint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn aa_factor_above_cap_rejected() {
+        let err = parse(&to_vec(&["in.stl", "-aa", "16", "out.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("1..=8"));
+    }
+
+    #[test]
+    fn aa_non_integer_rejected() {
+        let err = parse(&to_vec(&["in.stl", "-aa", "2.5", "out.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("not a positive integer"));
     }
 }

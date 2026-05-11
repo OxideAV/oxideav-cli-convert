@@ -34,17 +34,28 @@
 //!      triangle.
 //!    - **phong**: the per-vertex normal is interpolated across the
 //!      triangle and the lighting equation is evaluated per pixel.
+//!    - **normal-debug**: paint each pixel `(n + 1) / 2 * 255` per
+//!      channel — the classic "normal map" colour-key. Lighting and
+//!      material settings are ignored; useful for verifying the
+//!      geometry pipeline / normal-loading path.
+//!    - **depth-debug**: paint each pixel a grayscale value derived
+//!      from the interpolated NDC z (near = white, far = black).
+//!      Useful for spotting Z-fighting and picking sensible near/far
+//!      planes.
 //! 5. **Lighting** — `-light AZIMUTH,ELEVATION,INTENSITY` (defaults
 //!    to a 45°/45° 1.0-intensity directional light from the
 //!    upper-right-front quadrant) plus a small constant ambient term
 //!    so back-facing pixels stay visible.
+//! 6. **Anti-aliasing** — `-aa N` (1..=8) supersamples the scene at
+//!    `N × output` and box-filters back down to the requested size.
+//!    Off (`N = 1`) by default.
 //!
 //! ## Out of scope (documented follow-ups)
 //!
 //! * Texture sampling — the renderer reads `material.base_color`
 //!   only.
-//! * Anti-aliasing — every pixel is point-sampled.
 //! * PBR — metallic / roughness / specular / IBL all skipped.
+//! * Shadows — no raycast-against-light pass.
 //! * Camera nodes from the scene — we always synthesise a default
 //!   bbox-fitting camera or honour `-camera`, never the scene's own.
 
@@ -177,6 +188,12 @@ fn ext_of(path: &str) -> Option<&str> {
 
 /// Render a [`Scene3D`] to an [`RgbaImage`] at the given dimensions.
 ///
+/// When `Mesh3DOptions::aa` requests `N >= 2`, the scene is rasterised
+/// at `N × width` by `N × height` and then box-filtered back down to
+/// the final size — classic SSAA, no temporal jitter, no rotated grid.
+/// The pre-multiplied colour blend uses the source's alpha so the
+/// transparent-background case stays well-defined.
+///
 /// Public so the test suite can drive the renderer directly without
 /// going through the file-system. The CLI-facing entry point is
 /// [`run`].
@@ -187,10 +204,14 @@ pub fn render_scene(
     background: [u8; 4],
     options: &Mesh3DOptions,
 ) -> RgbaImage {
-    let mut fb = Framebuffer::new(width, height, background);
+    let aa = options.aa.unwrap_or(1).clamp(1, 8);
+    let render_w = width.saturating_mul(aa).max(1);
+    let render_h = height.saturating_mul(aa).max(1);
+
+    let mut fb = Framebuffer::new(render_w, render_h, background);
 
     let bbox = scene_bbox(scene);
-    let camera = Camera::build(width, height, bbox, options);
+    let camera = Camera::build(render_w, render_h, bbox, options);
     let light = build_light(options.light.unwrap_or_else(LightSpec::default_light));
     let mode = options.render_mode.unwrap_or_default();
 
@@ -199,7 +220,55 @@ pub fn render_scene(
         walk_node(scene, root, identity4(), &camera, &light, &mut fb, mode);
     }
 
-    fb.into_image()
+    let img = fb.into_image();
+    if aa <= 1 {
+        img
+    } else {
+        downsample_box(&img, width, height, aa)
+    }
+}
+
+/// Box-filter `src` (which is `aa × dst_w` by `aa × dst_h`) down to
+/// `dst_w × dst_h`. Each output pixel averages `aa²` source pixels in
+/// straight linear-byte space — no gamma round-trip, matching how IM
+/// `convert -filter box -resize` does it. Good enough for SSAA polish;
+/// stays well-defined when the source has transparent background
+/// pixels (their alpha contributes to the average).
+fn downsample_box(src: &RgbaImage, dst_w: u32, dst_h: u32, aa: u32) -> RgbaImage {
+    let aa = aa.max(1);
+    let aa_us = aa as usize;
+    let dst_w_us = dst_w as usize;
+    let dst_h_us = dst_h as usize;
+    let src_stride = src.stride;
+    let mut pixels = Vec::with_capacity(dst_w_us * dst_h_us * 4);
+    let div = (aa_us * aa_us) as u32;
+    for dy in 0..dst_h_us {
+        let sy0 = dy * aa_us;
+        for dx in 0..dst_w_us {
+            let sx0 = dx * aa_us;
+            let mut acc = [0u32; 4];
+            for j in 0..aa_us {
+                let row_base = (sy0 + j) * src_stride + sx0 * 4;
+                for i in 0..aa_us {
+                    let p = row_base + i * 4;
+                    acc[0] += src.pixels[p] as u32;
+                    acc[1] += src.pixels[p + 1] as u32;
+                    acc[2] += src.pixels[p + 2] as u32;
+                    acc[3] += src.pixels[p + 3] as u32;
+                }
+            }
+            pixels.push((acc[0] / div) as u8);
+            pixels.push((acc[1] / div) as u8);
+            pixels.push((acc[2] / div) as u8);
+            pixels.push((acc[3] / div) as u8);
+        }
+    }
+    RgbaImage {
+        width: dst_w,
+        height: dst_h,
+        stride: dst_w_us * 4,
+        pixels,
+    }
 }
 
 fn walk_node(
@@ -286,22 +355,26 @@ fn draw_primitive(
         .map(|p| project_vertex(*p, &mvp, fb.width as f32, fb.height as f32))
         .collect();
 
-    // For lighting we need world-space normals. The world matrix is
-    // assumed to be a rigid+uniform-scale transform (the only kind
-    // composed from `Transform::translation/rotation/scale`); its
-    // 3x3 upper-left therefore suffices for normal transformation
-    // (no inverse-transpose needed).
+    // For lighting AND normal-debug visualisation we need world-space
+    // normals. The world matrix is assumed to be a rigid+uniform-scale
+    // transform (the only kind composed from
+    // `Transform::translation/rotation/scale`); its 3x3 upper-left
+    // therefore suffices for normal transformation (no
+    // inverse-transpose needed). DepthDebug doesn't need normals, and
+    // Flat / Wireframe never look at them.
     let world_normals: Option<Vec<[f32; 3]>> = match mode {
-        Mesh3DRenderMode::Gouraud | Mesh3DRenderMode::Phong => Some(
-            prim.normals
-                .as_ref()
-                .map(|ns| {
-                    ns.iter()
-                        .map(|n| vec3_normalise(mat3_mul_vec3(world, *n)))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        ),
+        Mesh3DRenderMode::Gouraud | Mesh3DRenderMode::Phong | Mesh3DRenderMode::NormalDebug => {
+            Some(
+                prim.normals
+                    .as_ref()
+                    .map(|ns| {
+                        ns.iter()
+                            .map(|n| vec3_normalise(mat3_mul_vec3(world, *n)))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        }
         _ => None,
     };
 
@@ -484,6 +557,22 @@ fn draw_tri(
                 // Phong — interpolate normal, light per-pixel.
                 rasterise_triangle_phong(fb, va, vb, vc, na, nb, nc, colour_linear, light);
             }
+        }
+        Mesh3DRenderMode::NormalDebug => {
+            // Visualise the world-space interpolated normal as RGB.
+            // Pull (or synthesise) the per-vertex normals exactly the
+            // same way Gouraud / Phong do, then run the dedicated
+            // normal-debug rasteriser so the framebuffer carries the
+            // mapped colour rather than the lit one.
+            let (na, nb, nc) = vertex_normals_for_face(prim, world, world_normals, a, b, c);
+            rasterise_triangle_normal_debug(fb, va, vb, vc, na, nb, nc);
+        }
+        Mesh3DRenderMode::DepthDebug => {
+            // Visualise the interpolated NDC z as a grayscale value.
+            // Independent of any vertex normal — only the projected z
+            // coordinates of the three vertices matter, so the
+            // dedicated rasteriser doesn't need normal data at all.
+            rasterise_triangle_depth_debug(fb, va, vb, vc);
         }
     }
 }
@@ -668,6 +757,110 @@ fn rasterise_triangle_phong(
             fb.set_pixel(x, y, z, linear_rgba_to_srgb_u8(lit));
         }
     }
+}
+
+/// NormalDebug shading — interpolate the per-vertex normal across the
+/// triangle and write `(n + 1) / 2 * 255` per channel. Matches the
+/// classic "normal map" colour-key (positive +X is red-ish, +Y green,
+/// +Z blue) so the output reads visually the same as a baked normal
+/// map exported from a DCC tool.
+///
+/// Lighting / material settings are intentionally ignored — the goal
+/// is to verify the geometry pipeline alone.
+fn rasterise_triangle_normal_debug(
+    fb: &mut Framebuffer,
+    a: [f32; 3],
+    b: [f32; 3],
+    c: [f32; 3],
+    na: [f32; 3],
+    nb: [f32; 3],
+    nc: [f32; 3],
+) {
+    let area = edge(a, b, c);
+    if area.abs() < 1.0e-6 {
+        return;
+    }
+    let (min_x, min_y, max_x, max_y) = tri_bbox(fb, a, b, c);
+    let area_inv = 1.0 / area;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let p = [x as f32 + 0.5, y as f32 + 0.5, 0.0];
+            let w0 = edge(b, c, p) * area_inv;
+            let w1 = edge(c, a, p) * area_inv;
+            let w2 = edge(a, b, p) * area_inv;
+            let inside =
+                (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
+            if !inside {
+                continue;
+            }
+            let z = w0 * a[2] + w1 * b[2] + w2 * c[2];
+            let nx = w0 * na[0] + w1 * nb[0] + w2 * nc[0];
+            let ny = w0 * na[1] + w1 * nb[1] + w2 * nc[1];
+            let nz = w0 * na[2] + w1 * nb[2] + w2 * nc[2];
+            let n = vec3_normalise([nx, ny, nz]);
+            let pix = [
+                normal_to_byte(n[0]),
+                normal_to_byte(n[1]),
+                normal_to_byte(n[2]),
+                255,
+            ];
+            fb.set_pixel(x, y, z, pix);
+        }
+    }
+}
+
+/// Map a single normal component in `[-1, 1]` into a `u8` colour
+/// channel via `(n + 1) / 2 * 255`. NaNs and zero-length normals fall
+/// back to `128` (the encoded zero).
+fn normal_to_byte(n: f32) -> u8 {
+    if !n.is_finite() {
+        return 128;
+    }
+    let v = ((n.clamp(-1.0, 1.0) + 1.0) * 0.5 * 255.0).round();
+    v.clamp(0.0, 255.0) as u8
+}
+
+/// DepthDebug shading — paint each pixel a grayscale value derived from
+/// the interpolated NDC z. NDC z lives in `[-1, 1]` after perspective
+/// divide; we map it to `[0, 255]` with `near` (closer to the camera,
+/// smaller z) becoming white and `far` (deeper into the scene, larger
+/// z) becoming black. That matches what most 3D viewers ship as their
+/// "depth pass" preview.
+fn rasterise_triangle_depth_debug(fb: &mut Framebuffer, a: [f32; 3], b: [f32; 3], c: [f32; 3]) {
+    let area = edge(a, b, c);
+    if area.abs() < 1.0e-6 {
+        return;
+    }
+    let (min_x, min_y, max_x, max_y) = tri_bbox(fb, a, b, c);
+    let area_inv = 1.0 / area;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let p = [x as f32 + 0.5, y as f32 + 0.5, 0.0];
+            let w0 = edge(b, c, p) * area_inv;
+            let w1 = edge(c, a, p) * area_inv;
+            let w2 = edge(a, b, p) * area_inv;
+            let inside =
+                (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
+            if !inside {
+                continue;
+            }
+            let z = w0 * a[2] + w1 * b[2] + w2 * c[2];
+            let g = depth_to_byte(z);
+            fb.set_pixel(x, y, z, [g, g, g, 255]);
+        }
+    }
+}
+
+/// Map an NDC z value (`[-1, 1]`, near = -1) to a grayscale byte where
+/// near = 255 and far = 0. NaN / out-of-range values are clamped.
+fn depth_to_byte(z: f32) -> u8 {
+    if !z.is_finite() {
+        return 0;
+    }
+    let zc = z.clamp(-1.0, 1.0);
+    // near (-1) → 255, far (+1) → 0; linear in NDC z.
+    let v = ((1.0 - (zc * 0.5 + 0.5)) * 255.0).round();
+    v.clamp(0.0, 255.0) as u8
 }
 
 fn tri_bbox(fb: &Framebuffer, a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> (i32, i32, i32, i32) {
@@ -1254,5 +1447,202 @@ mod tests {
         let cam = Camera::build(64, 64, bbox, &opts);
         // Ortho proj's bottom row is [0, 0, 0, 1] (no perspective divide).
         assert_eq!(cam.proj[3], [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    // ---- Round 45: debug-mode rasterisers + SSAA ---------------------
+
+    #[test]
+    fn normal_to_byte_endpoints() {
+        assert_eq!(normal_to_byte(-1.0), 0);
+        assert_eq!(normal_to_byte(0.0), 128);
+        assert_eq!(normal_to_byte(1.0), 255);
+    }
+
+    #[test]
+    fn normal_to_byte_clamps_out_of_range() {
+        assert_eq!(normal_to_byte(-2.0), 0);
+        assert_eq!(normal_to_byte(2.0), 255);
+        // NaN falls back to the encoded zero.
+        assert_eq!(normal_to_byte(f32::NAN), 128);
+    }
+
+    #[test]
+    fn depth_to_byte_endpoints() {
+        // near (-1) → 255 (white), far (+1) → 0 (black).
+        assert_eq!(depth_to_byte(-1.0), 255);
+        assert_eq!(depth_to_byte(1.0), 0);
+        // mid-z is roughly mid-grey.
+        let mid = depth_to_byte(0.0);
+        assert!(
+            (120..=140).contains(&mid),
+            "mid-z grayscale should be ~128, got {mid}"
+        );
+    }
+
+    #[test]
+    fn normal_debug_mode_renders_pixels() {
+        let img = render_with_mode(Mesh3DRenderMode::NormalDebug);
+        let drawn = img
+            .pixels
+            .chunks_exact(4)
+            .any(|p| p != [255, 255, 255, 255]);
+        assert!(drawn, "normal-debug should rasterise the triangle");
+    }
+
+    #[test]
+    fn depth_debug_mode_renders_pixels() {
+        let img = render_with_mode(Mesh3DRenderMode::DepthDebug);
+        // The triangle covers part of the canvas with grayscale pixels;
+        // at least one pixel should differ from the white background.
+        let drawn = img
+            .pixels
+            .chunks_exact(4)
+            .any(|p| p != [255, 255, 255, 255]);
+        assert!(drawn, "depth-debug should rasterise the triangle");
+        // And every drawn pixel must be R == G == B (grayscale).
+        for px in img.pixels.chunks_exact(4) {
+            if px == [255, 255, 255, 255] {
+                continue;
+            }
+            assert_eq!(
+                px[0], px[1],
+                "depth-debug pixel must be grayscale, got {px:?}"
+            );
+            assert_eq!(
+                px[1], px[2],
+                "depth-debug pixel must be grayscale, got {px:?}"
+            );
+            assert_eq!(px[3], 255, "depth-debug pixel alpha must be opaque");
+        }
+    }
+
+    #[test]
+    fn aa_default_is_no_supersampling() {
+        // No `-aa` flag → renders straight at requested dims.
+        let scene = unit_triangle_scene();
+        let img = render_scene(
+            &scene,
+            32,
+            32,
+            [255, 255, 255, 255],
+            &Mesh3DOptions::default(),
+        );
+        assert_eq!(img.width, 32);
+        assert_eq!(img.height, 32);
+        assert_eq!(img.pixels.len(), 32 * 32 * 4);
+    }
+
+    #[test]
+    fn aa_factor_two_keeps_output_dims() {
+        // SSAA must NOT change the user-visible output size.
+        let scene = unit_triangle_scene();
+        let opts = Mesh3DOptions {
+            aa: Some(2),
+            ..Mesh3DOptions::default()
+        };
+        let img = render_scene(&scene, 32, 32, [255, 255, 255, 255], &opts);
+        assert_eq!(img.width, 32);
+        assert_eq!(img.height, 32);
+        assert_eq!(img.pixels.len(), 32 * 32 * 4);
+    }
+
+    #[test]
+    fn aa_softens_triangle_edges() {
+        // 1×: every covered pixel is solid colour, no anti-aliasing
+        // means no transitional grey sub-pixel.
+        // 4×: box-filtering averages 16 sub-pixels into one, so the
+        // edge pixels carry an intermediate value the 1× render can
+        // never produce. Counting "intermediate" pixels (those NOT
+        // pinned to background-or-foreground) is the simplest robust
+        // smoke test.
+        let scene = unit_triangle_scene();
+        let bg = [255, 255, 255, 255];
+        let opts_1 = Mesh3DOptions::default();
+        let opts_4 = Mesh3DOptions {
+            aa: Some(4),
+            ..Mesh3DOptions::default()
+        };
+        let img1 = render_scene(&scene, 64, 64, bg, &opts_1);
+        let img4 = render_scene(&scene, 64, 64, bg, &opts_4);
+        let intermediate = |img: &RgbaImage| -> usize {
+            img.pixels
+                .chunks_exact(4)
+                .filter(|p| {
+                    // anything that's neither pure-bg nor full-opaque-foreground
+                    // is an "intermediate" / blended pixel
+                    let is_bg = p == &[255, 255, 255, 255];
+                    let r = p[0];
+                    let same = p[0] == p[1] && p[1] == p[2];
+                    !is_bg && !(same && (r == 0 || r == 255))
+                })
+                .count()
+        };
+        let int1 = intermediate(&img1);
+        let int4 = intermediate(&img4);
+        assert!(
+            int4 > int1,
+            "expected SSAA to introduce more intermediate edge pixels; got 1×={int1}, 4×={int4}"
+        );
+    }
+
+    #[test]
+    fn aa_factor_one_matches_no_aa() {
+        // Explicit `-aa 1` must produce identical pixels to no-aa,
+        // since the downsample path bypasses when aa <= 1.
+        let scene = unit_triangle_scene();
+        let bg = [200, 100, 50, 255];
+        let img_off = render_scene(&scene, 16, 16, bg, &Mesh3DOptions::default());
+        let opts = Mesh3DOptions {
+            aa: Some(1),
+            ..Mesh3DOptions::default()
+        };
+        let img_one = render_scene(&scene, 16, 16, bg, &opts);
+        assert_eq!(img_off.pixels, img_one.pixels);
+    }
+
+    #[test]
+    fn downsample_box_averages_uniform_field() {
+        // A 4×4 source filled with [200, 100, 50, 255] downsampled at
+        // factor 2 must yield a 2×2 image of the same pixel.
+        let src = RgbaImage {
+            width: 4,
+            height: 4,
+            stride: 16,
+            pixels: vec![
+                200, 100, 50, 255, 200, 100, 50, 255, 200, 100, 50, 255, 200, 100, 50, 255, 200,
+                100, 50, 255, 200, 100, 50, 255, 200, 100, 50, 255, 200, 100, 50, 255, 200, 100,
+                50, 255, 200, 100, 50, 255, 200, 100, 50, 255, 200, 100, 50, 255, 200, 100, 50,
+                255, 200, 100, 50, 255, 200, 100, 50, 255, 200, 100, 50, 255,
+            ],
+        };
+        let dst = downsample_box(&src, 2, 2, 2);
+        assert_eq!(dst.width, 2);
+        assert_eq!(dst.height, 2);
+        for px in dst.pixels.chunks_exact(4) {
+            assert_eq!(px, &[200, 100, 50, 255]);
+        }
+    }
+
+    #[test]
+    fn downsample_box_averages_split_field() {
+        // 2×2 source: top-left black, top-right white, bottom-left
+        // white, bottom-right black. Box-downsample at factor 2 must
+        // give a single mid-grey pixel.
+        let src = RgbaImage {
+            width: 2,
+            height: 2,
+            stride: 8,
+            pixels: vec![
+                0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 255,
+            ],
+        };
+        let dst = downsample_box(&src, 1, 1, 2);
+        assert_eq!(dst.width, 1);
+        assert_eq!(dst.height, 1);
+        // (0 + 255 + 255 + 0) / 4 = 127 with integer division.
+        assert_eq!(dst.pixels[0], 127);
+        assert_eq!(dst.pixels[1], 127);
+        assert_eq!(dst.pixels[2], 127);
+        assert_eq!(dst.pixels[3], 255);
     }
 }

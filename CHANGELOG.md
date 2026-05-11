@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- 3D → raster renderer learns two diagnostic visualisation modes
+  plus N×N supersampling anti-aliasing.
+  - `-render normal-debug` (aliases `normal` / `normals`) paints each
+    pixel `(n + 1) / 2 * 255` per channel — the classic "normal map"
+    colour-key (positive +X is red-ish, +Y green, +Z blue). Lighting
+    and material are ignored; useful for verifying the geometry
+    pipeline / normal-loading path.
+  - `-render depth-debug` (aliases `depth` / `z`) paints each pixel
+    a grayscale value derived from the interpolated NDC z (near =
+    white, far = black). Lighting / material / camera-orbit ignored;
+    useful for spotting Z-fighting and picking sane near/far planes.
+  - `-aa N` for `N ∈ 1..=8` rasterises the scene at `N × output_w`
+    by `N × output_h` then box-filters back down. `N = 1` is the
+    round-44 baseline (off); `2` / `4` typical; `8` capped so a
+    1024² render stays under ~80 MB framebuffer + z-buffer. Stored
+    on `Mesh3DOptions::aa`; works with every `-render` mode (the
+    debug modes also benefit from cleaner triangle edges).
+- `op::Mesh3DRenderMode::NormalDebug` / `::DepthDebug` variants;
+  `op::Mesh3DOptions` gains an `aa: Option<u32>` field.
+- 11 new arg-parser tests (`-render normal-debug` / `depth-debug` +
+  short aliases; updated unknown-mode error mentions both new modes;
+  `-aa` factor parses, `1` allowed, `0` / `>=9` rejected, non-integer
+  rejected), 9 new renderer unit tests (`normal_to_byte` / `depth_to_byte`
+  endpoint mappings; normal-debug + depth-debug rasterisers paint
+  expected pixel patterns; AA default / 1× / 2× output dimensions and
+  edge softening; `downsample_box` averaging on uniform + split fields),
+  and 4 new end-to-end `mesh3d_convert` tests (`-render normal-debug`
+  PNG, `-render depth-debug` PNG, `-aa 4` keeps output dims at 64×64,
+  `-aa 1` no-op succeeds).
+
 - 3D → raster renderer learns Gouraud and Phong shading.
   - `-render gouraud` evaluates a Lambert+ambient term at every vertex
     (using `Primitive::normals` when present, else the face normal

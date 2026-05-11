@@ -126,11 +126,11 @@ disappears and 3D inputs fall through to the regular pipeline path.
 | 3D format | output with `%d` template | error — 3D scenes are single-document |
 
 USDZ now round-trips both ways (encoder ships in `oxideav-usdz` 0.0.1).
-3D→raster rendering uses a tiny built-in software rasteriser:
-flat-shaded triangles by default (`-render flat`) with `-render
-wireframe` as an alternative; the camera auto-frames the scene's
-bounding box at 60° vertical FOV. Texture sampling, lighting models
-(Gouraud / Phong / PBR), and anti-aliasing are documented follow-ups.
+3D→raster rendering uses a tiny built-in software rasteriser with
+flat / wireframe / Gouraud / Phong shading, two debug visualisations
+(`normal-debug`, `depth-debug`), an N×N supersampling anti-aliasing
+pass (`-aa N`), and full camera/light/projection/FOV/background
+controls. Texture sampling and PBR are documented follow-ups.
 
 Raster ops (`-rotate`, `-flip`, `-crop`, `-negate`, …) ARE honoured
 on the 3D→raster path — they run after rasterisation, sharing the
@@ -150,7 +150,13 @@ flag is paired with an extension it doesn't apply to (e.g.
 |---|---|---|---|
 | `-stl-format` | `binary` / `bin` / `ascii` / `text` | `binary` | Selects STL on-disk flavour |
 | `-gltf-format` | `glb` / `binary` / `embedded` / `json-embedded` / `external` / `json-external` | infer from `.glb` vs `.gltf` extension | `external` errors with a `gltf-rN` follow-up message until upstream `OutputFlavour::JsonExternal` lands |
-| `-render` | `flat` / `shaded` / `wireframe` / `wire` | `flat` | Selects 3D→raster surface model. Only consulted on the 3D→raster routing path. |
+| `-render` | `flat` / `shaded` / `wireframe` / `wire` / `gouraud` / `phong` / `normal-debug` (`normal` / `normals`) / `depth-debug` (`depth` / `z`) | `flat` | Selects 3D→raster surface model. `normal-debug` paints `(n+1)/2*255` per channel, `depth-debug` paints near=white, far=black grayscale; both ignore lighting / material settings. |
+| `-light` | `AZIMUTH,ELEVATION,INTENSITY` (each a number) | `45,45,1.0` | Directional-light override for Gouraud / Phong (Flat / Wireframe / debug ignore it). |
+| `-camera` | `ELEVATION,AZIMUTH,DISTANCE` (each a number; distance > 0) | bbox-fit auto-frame | Orbit camera override; `distance` is a multiplier of the auto-frame radius. |
+| `-projection` | `perspective` / `persp` / `p` / `orthographic` / `ortho` / `o` | `perspective` | Picks projection matrix; ortho frames the scene on the smaller axis with a 1.2× margin. |
+| `-fov` | degrees in `(0, 180)` | `60` | Vertical FOV for perspective; ignored for orthographic. |
+| `-bg` | CSS L3 named or `#hex` colour (3 / 4 / 6 / 8 hex digits) | transparent black | Render-canvas background fill. Distinct from `-background` so callers can keep IM canvas-fill and renderer-clear separate. |
+| `-aa` | integer `1..=8` | `1` (off) | Supersampling factor for the 3D→raster renderer. The scene is rasterised at `N × output` and box-filtered back down. `1` keeps the round-44 baseline; `2`/`4` are typical. Capped at `8` so a 1024² render at max-aa stays under ~80 MB framebuffer + z-buffer. |
 
 ### Routing matrix (PDF input)
 

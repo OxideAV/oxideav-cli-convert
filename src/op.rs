@@ -514,6 +514,10 @@ impl GltfFormatChoice {
 /// [`Phong`](Self::Phong) add per-vertex / per-pixel lighting using
 /// either the primitive's stored vertex normals or face normals
 /// computed from the triangle vertices when none are provided.
+/// [`NormalDebug`](Self::NormalDebug) and [`DepthDebug`](Self::DepthDebug)
+/// are diagnostic visualisations that bypass the lighting equation
+/// entirely — useful when normals look wrong, a Z-fighting glitch
+/// shows up, or the camera framing seems off.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mesh3DRenderMode {
     /// Flat-shaded triangles, one colour per primitive (no per-pixel
@@ -532,20 +536,37 @@ pub enum Mesh3DRenderMode {
     /// Smoother than Gouraud at the cost of one normalise + dot per
     /// fragment.
     Phong,
+    /// NormalDebug — paint each pixel with the world-space interpolated
+    /// normal mapped into RGB (`[r,g,b] = (n + 1) / 2 * 255`). Light /
+    /// camera / material settings are ignored. Useful for inspecting
+    /// whether per-vertex normals were loaded correctly or whether the
+    /// face-normal fallback is firing.
+    NormalDebug,
+    /// DepthDebug — paint each pixel a grayscale value derived from the
+    /// interpolated NDC z (near = white, far = black). Light / camera
+    /// orbit / material settings are ignored; useful for spotting
+    /// Z-fighting and for picking sane near/far planes.
+    DepthDebug,
 }
 
 impl Mesh3DRenderMode {
     /// Parse the value after `-render`. Accepts case-insensitive
-    /// `flat` / `wireframe` / `gouraud` / `phong`. `wire` is a short
-    /// alias for `wireframe`; `shaded` aliases `flat`.
+    /// `flat` / `wireframe` / `gouraud` / `phong` / `normal-debug` /
+    /// `depth-debug`. `wire` is a short alias for `wireframe`;
+    /// `shaded` aliases `flat`; `normal` / `normals` alias
+    /// `normal-debug`; `depth` / `z` alias `depth-debug`.
     pub fn parse(s: &str) -> Result<Mesh3DRenderMode, String> {
         match s.to_ascii_lowercase().as_str() {
             "flat" | "shaded" => Ok(Mesh3DRenderMode::Flat),
             "wireframe" | "wire" => Ok(Mesh3DRenderMode::Wireframe),
             "gouraud" => Ok(Mesh3DRenderMode::Gouraud),
             "phong" => Ok(Mesh3DRenderMode::Phong),
+            "normal-debug" | "normaldebug" | "normal" | "normals" => {
+                Ok(Mesh3DRenderMode::NormalDebug)
+            }
+            "depth-debug" | "depthdebug" | "depth" | "z" => Ok(Mesh3DRenderMode::DepthDebug),
             other => Err(format!(
-                "convert: -render: unknown mode '{other}' (expected 'flat', 'wireframe', 'gouraud', or 'phong')"
+                "convert: -render: unknown mode '{other}' (expected 'flat', 'wireframe', 'gouraud', 'phong', 'normal-debug', or 'depth-debug')"
             )),
         }
     }
@@ -723,6 +744,16 @@ pub struct Mesh3DOptions {
     /// (which is the canvas-fill colour for `-alpha remove` and the
     /// PDF runner) so callers can keep the two paint colours separate.
     pub bg: Option<[u8; 4]>,
+    /// `-aa N` — supersampling-anti-aliasing factor. The renderer
+    /// rasterises at `N × output_w` by `N × output_h` then box-filters
+    /// the framebuffer back down to the requested output. `None` or
+    /// `Some(1)` → no supersampling (every pixel is point-sampled,
+    /// matching the round-44 baseline). Values >= 2 trade memory and
+    /// CPU for cleaner triangle edges; 2× and 4× are typical. Hard
+    /// cap of 8 because at 8× a 1024² render is a 16M-pixel
+    /// framebuffer + an 8M f32 z-buffer (~80 MB) and that's already
+    /// further than most users want to push a software renderer.
+    pub aa: Option<u32>,
 }
 
 /// The parsed result of one `oxideav convert` invocation.
