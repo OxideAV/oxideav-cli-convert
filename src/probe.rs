@@ -531,7 +531,7 @@ fn probe_mesh3d(plan: &ConvertPlan) -> Result<Summary> {
     let bytes = fs::read(&plan.input)
         .map_err(|e| Error::invalid(format!("convert: failed to read {}: {e}", plan.input)))?;
     let mut registry = Mesh3DRegistry::new();
-    oxideav_meta::populate_mesh3d_registry(&mut registry);
+    crate::mesh3d_runner::populate_registry(&mut registry);
     let mut decoder = registry.decoder_for_extension(&in_ext).ok_or_else(|| {
         Error::unsupported(format!(
             "convert: no 3D decoder registered for input extension '.{in_ext}'"

@@ -38,10 +38,11 @@ use oxideav_mesh3d::{Mesh3DEncoder, Mesh3DRegistry};
 use crate::op::{GltfFormatChoice, Mesh3DOptions, StlFormatChoice};
 
 /// File extensions the 3D side-channel claims as inputs. Mirrors the
-/// extension lists the four sibling format crates (stl/obj/gltf/usdz)
+/// extension lists the sibling format crates (stl/obj/gltf/usdz/fbx)
 /// register with the `Mesh3DRegistry`. Centralised here so input
-/// recognition stays a single source of truth.
-const MESH3D_INPUT_EXTS: &[&str] = &["stl", "obj", "gltf", "glb", "usdz", "mtl"];
+/// recognition stays a single source of truth. `fbx` is decode-only
+/// today (no encoder); see [`MESH3D_OUTPUT_EXTS`] for outputs.
+const MESH3D_INPUT_EXTS: &[&str] = &["stl", "obj", "gltf", "glb", "usdz", "mtl", "fbx"];
 
 /// File extensions the 3D side-channel can emit. Matches the input
 /// set: `oxideav-usdz` ships a [`UsdzEncoder`](oxideav_usdz::UsdzEncoder)
@@ -106,7 +107,7 @@ pub fn run(input_path: &str, output_path: &str, options: &Mesh3DOptions) -> Resu
         .to_ascii_lowercase();
 
     let mut registry = Mesh3DRegistry::new();
-    oxideav_meta::populate_mesh3d_registry(&mut registry);
+    populate_registry(&mut registry);
 
     // Reject mismatched per-format flags up-front (e.g. `-stl-format ascii`
     // paired with a `.glb` output) so the user sees the actual misuse, not
@@ -210,6 +211,18 @@ fn build_gltf_encoder(choice: GltfFormatChoice) -> Result<Box<dyn Mesh3DEncoder>
         }
     };
     Ok(Box::new(GltfEncoder::with_output(flavour)))
+}
+
+/// Build a [`Mesh3DRegistry`] populated with every 3D format the CLI
+/// knows about. Wraps [`oxideav_meta::populate_mesh3d_registry`] (which
+/// pulls stl/obj/gltf/usdz off the workspace's `3d` preset) and tacks
+/// on FBX directly — meta 0.0.1 was published before oxideav-fbx 0.0.1,
+/// so FBX hasn't propagated through meta's generated populator yet.
+/// Once a meta release knows about FBX this layer becomes a one-liner
+/// again.
+pub(crate) fn populate_registry(registry: &mut Mesh3DRegistry) {
+    oxideav_meta::populate_mesh3d_registry(registry);
+    oxideav_fbx::register(registry);
 }
 
 fn joined_known_inputs() -> String {

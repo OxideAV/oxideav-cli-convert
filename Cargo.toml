@@ -37,6 +37,7 @@ mesh3d = [
     "dep:oxideav-stl",
     "dep:oxideav-obj",
     "dep:oxideav-gltf",
+    "dep:oxideav-fbx",
 ]
 
 [dependencies]
@@ -78,5 +79,11 @@ oxideav-meta = { version = "0.0", optional = true, default-features = false, fea
 oxideav-stl = { version = "0.0", optional = true }
 oxideav-obj = { version = "0.0", optional = true }
 oxideav-gltf = { version = "0.0", optional = true }
+# FBX (Filmbox) binary decoder — read-only today (no encoder in the
+# workspace yet). Wired directly because oxideav-meta 0.0.1's generated
+# `populate_mesh3d_registry` predates the FBX publish; once a newer
+# meta knows about FBX we can drop this direct dep and route through
+# meta exclusively.
+oxideav-fbx = { version = "0.0", optional = true }
 indexmap = "2"
 serde_json = "1"

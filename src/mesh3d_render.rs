@@ -1,55 +1,52 @@
 //! 3D scene → raster image.
 //!
 //! When `convert` sees a 3D-asset input (`.stl`/`.obj`/`.gltf`/`.glb`/
-//! `.usdz`) paired with a raster output (`.png`/`.jpg`/`.bmp`/`.webp`),
-//! the [`mesh3d_runner`](crate::mesh3d_runner) refuses (encoders only
-//! cover same-class round-trips). This module bridges the gap: decode
-//! the input through the same [`Mesh3DRegistry`] populated by
-//! [`oxideav_meta::populate_mesh3d_registry`], rasterise the
-//! [`Scene3D`] with a tiny built-in software renderer, then hand the
-//! resulting [`RgbaImage`] to the shared [`raster_io`] encoders.
+//! `.usdz`/`.fbx`) paired with a raster output (`.png`/`.jpg`/`.bmp`/
+//! `.webp`), the [`mesh3d_runner`](crate::mesh3d_runner) refuses
+//! (encoders only cover same-class round-trips). This module bridges
+//! the gap: decode the input through the same [`Mesh3DRegistry`]
+//! populated by [`oxideav_meta::populate_mesh3d_registry`] (plus our
+//! direct FBX wiring — meta 0.0.1 didn't know about FBX yet),
+//! rasterise the [`Scene3D`] with a built-in software renderer, then
+//! hand the resulting [`RgbaImage`] to the shared [`raster_io`]
+//! encoders.
 //!
-//! ## Renderer shape (MVP)
+//! ## Renderer shape
 //!
 //! Pure-Rust software rasteriser, zero external dependencies:
 //!
-//! 1. **Camera** — perspective projection (60° vertical FOV) framed
-//!    on the scene's axis-aligned bounding box; the camera sits at
-//!    `bbox_center + (0, 0, distance)` looking down `-Z`, where
-//!    `distance` is chosen so the bbox fits the viewport with a 20%
-//!    margin.
+//! 1. **Camera** — perspective OR orthographic projection
+//!    (`-projection`); auto-framed on the scene's axis-aligned bounding
+//!    box at a 60° vertical FOV (`-fov`) by default OR placed at a
+//!    user-supplied `(elevation, azimuth, distance)` orbit.
 //! 2. **World transform walk** — every node's mesh is rendered with
-//!    the composed world matrix (parent ⨯ local). Transforms compose
-//!    left-to-right (column-vector convention, matching glTF /
-//!    [`oxideav_mesh3d::Transform`]).
-//! 3. **Triangle rasterisation** — every triangle is projected to
-//!    screen space, back-face culled (CCW winding stays), and
-//!    rasterised through a half-space edge-function pipeline with a
-//!    per-pixel z-buffer. Quads / strips / fans are tessellated to a
-//!    triangle list before rasterisation.
-//! 4. **Shading** — flat shading: one constant colour per primitive,
-//!    pulled from `material.base_color` (linear → sRGB encoded for
-//!    the framebuffer) or a fallback grey when no material is bound.
-//!    Wireframe mode draws only the three edges of each triangle as
-//!    1-pixel-wide lines (Bresenham), with the same per-primitive
-//!    colour.
+//!    the composed world matrix (parent ⨯ local).
+//! 3. **Triangle rasterisation** — half-space edge-function pipeline
+//!    with a per-pixel z-buffer. Quads / strips / fans tessellate to
+//!    a triangle list before rasterisation.
+//! 4. **Shading** — selectable via `-render`:
+//!    - **flat**: one constant colour per primitive from
+//!      `material.base_color`.
+//!    - **wireframe**: only triangle edges (Bresenham).
+//!    - **gouraud**: light is evaluated at each vertex using the
+//!      per-vertex normal (or face normal when none is provided), then
+//!      the resulting RGB is bilinearly interpolated across the
+//!      triangle.
+//!    - **phong**: the per-vertex normal is interpolated across the
+//!      triangle and the lighting equation is evaluated per pixel.
+//! 5. **Lighting** — `-light AZIMUTH,ELEVATION,INTENSITY` (defaults
+//!    to a 45°/45° 1.0-intensity directional light from the
+//!    upper-right-front quadrant) plus a small constant ambient term
+//!    so back-facing pixels stay visible.
 //!
 //! ## Out of scope (documented follow-ups)
 //!
-//! * Lighting models — Gouraud / Phong / PBR all need normal & light
-//!   transport plumbing that this round skips.
 //! * Texture sampling — the renderer reads `material.base_color`
-//!   only; texture-mapped surfaces fall back to the constant factor.
-//! * Anti-aliasing — every pixel is point-sampled; multi-sampling +
-//!   resolve land later.
+//!   only.
+//! * Anti-aliasing — every pixel is point-sampled.
+//! * PBR — metallic / roughness / specular / IBL all skipped.
 //! * Camera nodes from the scene — we always synthesise a default
-//!   bbox-fitting camera, even when the scene supplies one.
-//! * Lights — ambient + single directional pre-baked into the flat
-//!   colour by averaging the material's base_color and the
-//!   world-up-aligned diffuse term. Today it's pure base_color.
-//!
-//! Each follow-up is independently scopable; the public surface
-//! ([`run`], [`render_scene`]) doesn't change when they land.
+//!   bbox-fitting camera or honour `-camera`, never the scene's own.
 
 use std::fs;
 
@@ -58,7 +55,7 @@ use oxideav_mesh3d::{
     Indices, Material, Mesh3DRegistry, Node, NodeId, Primitive, Scene3D, Topology,
 };
 
-use crate::op::{Mesh3DOptions, Mesh3DRenderMode, Op};
+use crate::op::{LightSpec, Mesh3DOptions, Mesh3DRenderMode, Op, ProjectionMode};
 use crate::pixel_xform::apply_pixel_transform_chain;
 use crate::raster_io::{
     apply_alpha_ops, classify_output, encode_raster_to_path, OutputClass, RgbaImage,
@@ -71,10 +68,17 @@ use crate::raster_io::{
 const DEFAULT_WIDTH: u32 = 1024;
 const DEFAULT_HEIGHT: u32 = 1024;
 
-/// Default background fill (opaque white) when no `-background` is
-/// supplied. Matches the PDF runner's default so a 3D→PNG and a
-/// PDF→PNG conversion produce visually-similar canvases.
-const DEFAULT_BACKGROUND: [u8; 4] = [255, 255, 255, 255];
+/// Default `-bg` background fill: transparent black so the canvas
+/// composites cleanly against any downstream `-alpha remove`.
+const DEFAULT_BG: [u8; 4] = [0, 0, 0, 0];
+
+/// Default vertical field of view in degrees for perspective projection.
+const DEFAULT_FOV_DEG: f32 = 60.0;
+
+/// Constant ambient term added to every shaded pixel so back-faces
+/// stay visible at the price of contrast. Matches the typical
+/// software-renderer baseline.
+const AMBIENT: f32 = 0.2;
 
 /// Run the 3D→raster convert flow. Side-effect-only: writes one file
 /// to disk.
@@ -111,7 +115,7 @@ pub fn run(input_path: &str, output_path: &str, ops: &[Op], options: &Mesh3DOpti
     };
 
     let mut registry = Mesh3DRegistry::new();
-    oxideav_meta::populate_mesh3d_registry(&mut registry);
+    crate::mesh3d_runner::populate_registry(&mut registry);
     let mut decoder = registry.decoder_for_extension(&in_ext).ok_or_else(|| {
         Error::unsupported(format!(
             "convert: no 3D decoder registered for input extension '.{in_ext}'"
@@ -123,10 +127,9 @@ pub fn run(input_path: &str, output_path: &str, ops: &[Op], options: &Mesh3DOpti
     let scene = decoder.decode(&bytes)?;
 
     let (width, height) = pick_dims(ops);
-    let bg = pick_background(ops);
-    let mode = options.render_mode.unwrap_or_default();
+    let bg = pick_render_bg(ops, options);
 
-    let mut img = render_scene(&scene, width, height, bg, mode);
+    let mut img = render_scene(&scene, width, height, bg, options);
 
     img = apply_pixel_transform_chain(img, ops)
         .map_err(|e| Error::invalid(format!("convert: 3D-render: {e}")))?;
@@ -150,13 +153,19 @@ fn pick_dims(ops: &[Op]) -> (u32, u32) {
     (DEFAULT_WIDTH, DEFAULT_HEIGHT)
 }
 
-fn pick_background(ops: &[Op]) -> [u8; 4] {
+/// Pick the render-canvas background. `-bg` (Mesh3DOptions::bg) wins
+/// over `-background` (Op::Background) so users can keep the IM
+/// canvas-fill semantics separate from the renderer's clear colour.
+fn pick_render_bg(ops: &[Op], options: &Mesh3DOptions) -> [u8; 4] {
+    if let Some(bg) = options.bg {
+        return bg;
+    }
     for op in ops.iter().rev() {
         if let Op::Background(c) = op {
             return *c;
         }
     }
-    DEFAULT_BACKGROUND
+    DEFAULT_BG
 }
 
 fn ext_of(path: &str) -> Option<&str> {
@@ -176,16 +185,18 @@ pub fn render_scene(
     width: u32,
     height: u32,
     background: [u8; 4],
-    mode: Mesh3DRenderMode,
+    options: &Mesh3DOptions,
 ) -> RgbaImage {
     let mut fb = Framebuffer::new(width, height, background);
 
     let bbox = scene_bbox(scene);
-    let camera = Camera::fit_to_bbox(width, height, bbox);
+    let camera = Camera::build(width, height, bbox, options);
+    let light = build_light(options.light.unwrap_or_else(LightSpec::default_light));
+    let mode = options.render_mode.unwrap_or_default();
 
     // Walk the node forest in pre-order, composing world matrices.
     for &root in &scene.roots {
-        walk_node(scene, root, identity4(), &camera, &mut fb, mode);
+        walk_node(scene, root, identity4(), &camera, &light, &mut fb, mode);
     }
 
     fb.into_image()
@@ -196,6 +207,7 @@ fn walk_node(
     id: NodeId,
     parent_world: [[f32; 4]; 4],
     camera: &Camera,
+    light: &DirLight,
     fb: &mut Framebuffer,
     mode: Mesh3DRenderMode,
 ) {
@@ -206,28 +218,33 @@ fn walk_node(
     if let Some(mesh_id) = node.mesh {
         if let Some(mesh) = scene.meshes.get(mesh_id.0 as usize) {
             for prim in &mesh.primitives {
-                let colour = primitive_colour(scene, prim);
-                draw_primitive(prim, &world, camera, colour, fb, mode);
+                let colour = primitive_colour_linear(scene, prim);
+                draw_primitive(prim, &world, camera, light, colour, fb, mode);
             }
         }
     }
     for &child in &node.children {
-        walk_node(scene, child, world, camera, fb, mode);
+        walk_node(scene, child, world, camera, light, fb, mode);
     }
 }
 
-fn primitive_colour(scene: &Scene3D, prim: &Primitive) -> [u8; 4] {
+/// Linear-space (0..=1 RGBA, premultiplied alpha NOT applied) colour for
+/// a primitive. We keep the colour in linear space for shading and only
+/// convert to sRGB right before writing to the framebuffer.
+fn primitive_colour_linear(scene: &Scene3D, prim: &Primitive) -> [f32; 4] {
     let mat = prim
         .material
         .and_then(|mid| scene.materials.get(mid.0 as usize));
-    let base = mat
-        .map(|m: &Material| m.base_color)
-        .unwrap_or([0.7, 0.7, 0.75, 1.0]);
+    mat.map(|m: &Material| m.base_color)
+        .unwrap_or([0.7, 0.7, 0.75, 1.0])
+}
+
+fn linear_rgba_to_srgb_u8(c: [f32; 4]) -> [u8; 4] {
     [
-        linear_to_srgb_u8(base[0]),
-        linear_to_srgb_u8(base[1]),
-        linear_to_srgb_u8(base[2]),
-        (base[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+        linear_to_srgb_u8(c[0]),
+        linear_to_srgb_u8(c[1]),
+        linear_to_srgb_u8(c[2]),
+        (c[3].clamp(0.0, 1.0) * 255.0).round() as u8,
     ]
 }
 
@@ -251,7 +268,8 @@ fn draw_primitive(
     prim: &Primitive,
     world: &[[f32; 4]; 4],
     camera: &Camera,
-    colour: [u8; 4],
+    light: &DirLight,
+    colour_linear: [f32; 4],
     fb: &mut Framebuffer,
     mode: Mesh3DRenderMode,
 ) {
@@ -268,6 +286,25 @@ fn draw_primitive(
         .map(|p| project_vertex(*p, &mvp, fb.width as f32, fb.height as f32))
         .collect();
 
+    // For lighting we need world-space normals. The world matrix is
+    // assumed to be a rigid+uniform-scale transform (the only kind
+    // composed from `Transform::translation/rotation/scale`); its
+    // 3x3 upper-left therefore suffices for normal transformation
+    // (no inverse-transpose needed).
+    let world_normals: Option<Vec<[f32; 3]>> = match mode {
+        Mesh3DRenderMode::Gouraud | Mesh3DRenderMode::Phong => Some(
+            prim.normals
+                .as_ref()
+                .map(|ns| {
+                    ns.iter()
+                        .map(|n| vec3_normalise(mat3_mul_vec3(world, *n)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        _ => None,
+    };
+
     // Walk the topology and draw each triangle / line.
     let indices: Vec<u32> = match &prim.indices {
         Some(Indices::U16(v)) => v.iter().map(|&x| x as u32).collect(),
@@ -281,11 +318,15 @@ fn draw_primitive(
             let mut i = 0;
             while i + 2 < n {
                 draw_tri(
+                    prim,
+                    world,
+                    world_normals.as_deref(),
                     &projected,
                     indices[i] as usize,
                     indices[i + 1] as usize,
                     indices[i + 2] as usize,
-                    colour,
+                    colour_linear,
+                    light,
                     fb,
                     mode,
                 );
@@ -301,7 +342,17 @@ fn draw_primitive(
                     (indices[i + 1], indices[i], indices[i + 2])
                 };
                 draw_tri(
-                    &projected, a as usize, b as usize, c as usize, colour, fb, mode,
+                    prim,
+                    world,
+                    world_normals.as_deref(),
+                    &projected,
+                    a as usize,
+                    b as usize,
+                    c as usize,
+                    colour_linear,
+                    light,
+                    fb,
+                    mode,
                 );
                 i += 1;
             }
@@ -310,11 +361,15 @@ fn draw_primitive(
             if n >= 3 {
                 for i in 1..(n - 1) {
                     draw_tri(
+                        prim,
+                        world,
+                        world_normals.as_deref(),
                         &projected,
                         indices[0] as usize,
                         indices[i] as usize,
                         indices[i + 1] as usize,
-                        colour,
+                        colour_linear,
+                        light,
                         fb,
                         mode,
                     );
@@ -322,36 +377,39 @@ fn draw_primitive(
             }
         }
         Topology::Lines => {
+            let colour_srgb = linear_rgba_to_srgb_u8(colour_linear);
             let mut i = 0;
             while i + 1 < n {
                 draw_line_pair(
                     &projected,
                     indices[i] as usize,
                     indices[i + 1] as usize,
-                    colour,
+                    colour_srgb,
                     fb,
                 );
                 i += 2;
             }
         }
         Topology::LineStrip => {
+            let colour_srgb = linear_rgba_to_srgb_u8(colour_linear);
             for i in 0..(n.saturating_sub(1)) {
                 draw_line_pair(
                     &projected,
                     indices[i] as usize,
                     indices[i + 1] as usize,
-                    colour,
+                    colour_srgb,
                     fb,
                 );
             }
         }
         Topology::LineLoop => {
+            let colour_srgb = linear_rgba_to_srgb_u8(colour_linear);
             for i in 0..(n.saturating_sub(1)) {
                 draw_line_pair(
                     &projected,
                     indices[i] as usize,
                     indices[i + 1] as usize,
-                    colour,
+                    colour_srgb,
                     fb,
                 );
             }
@@ -360,29 +418,35 @@ fn draw_primitive(
                     &projected,
                     indices[n - 1] as usize,
                     indices[0] as usize,
-                    colour,
+                    colour_srgb,
                     fb,
                 );
             }
         }
         Topology::Points => {
+            let colour_srgb = linear_rgba_to_srgb_u8(colour_linear);
             for &i in &indices {
                 if let Some(p) = projected.get(i as usize).and_then(|v| v.as_ref()) {
                     let x = p[0].round() as i32;
                     let y = p[1].round() as i32;
-                    fb.set_pixel(x, y, p[2], colour);
+                    fb.set_pixel(x, y, p[2], colour_srgb);
                 }
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_tri(
+    prim: &Primitive,
+    world: &[[f32; 4]; 4],
+    world_normals: Option<&[[f32; 3]]>,
     projected: &[Option<[f32; 3]>],
     a: usize,
     b: usize,
     c: usize,
-    colour: [u8; 4],
+    colour_linear: [f32; 4],
+    light: &DirLight,
     fb: &mut Framebuffer,
     mode: Mesh3DRenderMode,
 ) {
@@ -395,14 +459,63 @@ fn draw_tri(
     };
     match mode {
         Mesh3DRenderMode::Wireframe => {
-            draw_line(fb, va, vb, colour);
-            draw_line(fb, vb, vc, colour);
-            draw_line(fb, vc, va, colour);
+            let colour_srgb = linear_rgba_to_srgb_u8(colour_linear);
+            draw_line(fb, va, vb, colour_srgb);
+            draw_line(fb, vb, vc, colour_srgb);
+            draw_line(fb, vc, va, colour_srgb);
         }
         Mesh3DRenderMode::Flat => {
-            rasterise_triangle(fb, va, vb, vc, colour);
+            let colour_srgb = linear_rgba_to_srgb_u8(colour_linear);
+            rasterise_triangle_flat(fb, va, vb, vc, colour_srgb);
+        }
+        Mesh3DRenderMode::Gouraud | Mesh3DRenderMode::Phong => {
+            // Pick the three vertex normals for this triangle. Either
+            // pulled from the (transformed) per-vertex normal buffer, or
+            // synthesised from the face normal of the world-space
+            // positions.
+            let (na, nb, nc) = vertex_normals_for_face(prim, world, world_normals, a, b, c);
+            if matches!(mode, Mesh3DRenderMode::Gouraud) {
+                // Light per-vertex, interpolate colour.
+                let ca = shade_pixel(colour_linear, na, light);
+                let cb = shade_pixel(colour_linear, nb, light);
+                let cc = shade_pixel(colour_linear, nc, light);
+                rasterise_triangle_gouraud(fb, va, vb, vc, ca, cb, cc);
+            } else {
+                // Phong — interpolate normal, light per-pixel.
+                rasterise_triangle_phong(fb, va, vb, vc, na, nb, nc, colour_linear, light);
+            }
         }
     }
+}
+
+/// Pick the three world-space vertex normals for a face. When the
+/// primitive has its own per-vertex normals (and they're long enough),
+/// those are used. Otherwise we fall back to the face normal computed
+/// from the world-space positions of the three vertices — Gouraud
+/// degenerates to flat in that case, but per-pixel Phong still
+/// interpolates a clean direction across the triangle.
+fn vertex_normals_for_face(
+    prim: &Primitive,
+    world: &[[f32; 4]; 4],
+    world_normals: Option<&[[f32; 3]]>,
+    a: usize,
+    b: usize,
+    c: usize,
+) -> ([f32; 3], [f32; 3], [f32; 3]) {
+    if let Some(ns) = world_normals {
+        if a < ns.len() && b < ns.len() && c < ns.len() {
+            return (ns[a], ns[b], ns[c]);
+        }
+    }
+    // Fall back to face normal in world space.
+    let pa = prim.positions.get(a).copied().unwrap_or([0.0, 0.0, 0.0]);
+    let pb = prim.positions.get(b).copied().unwrap_or([0.0, 0.0, 0.0]);
+    let pc = prim.positions.get(c).copied().unwrap_or([0.0, 0.0, 0.0]);
+    let wa = mat4_mul_point(world, pa);
+    let wb = mat4_mul_point(world, pb);
+    let wc = mat4_mul_point(world, pc);
+    let n = vec3_normalise(vec3_cross(vec3_sub(wb, wa), vec3_sub(wc, wa)));
+    (n, n, n)
 }
 
 fn draw_line_pair(
@@ -443,9 +556,8 @@ fn project_vertex(pos: [f32; 3], mvp: &[[f32; 4]; 4], width: f32, height: f32) -
 }
 
 /// Half-space edge-function triangle rasteriser with z-buffer test.
-/// Pixels are point-sampled (no MSAA). Back-face culling: triangles
-/// with non-positive signed area in screen space are skipped.
-fn rasterise_triangle(
+/// Flat shading: every covered pixel gets the same `colour`.
+fn rasterise_triangle_flat(
     fb: &mut Framebuffer,
     a: [f32; 3],
     b: [f32; 3],
@@ -456,18 +568,7 @@ fn rasterise_triangle(
     if area.abs() < 1.0e-6 {
         return;
     }
-    // Back-face cull. Negative area = clockwise winding in screen
-    // space (after y-flip), so cull when area <= 0 to keep CCW
-    // front-faces. Many indexed meshes use either winding; for an MVP
-    // renderer we render double-sided to avoid losing whole models to
-    // the cull.
-    let _ = area;
-
-    let min_x = a[0].min(b[0]).min(c[0]).max(0.0).floor() as i32;
-    let min_y = a[1].min(b[1]).min(c[1]).max(0.0).floor() as i32;
-    let max_x = a[0].max(b[0]).max(c[0]).min(fb.width as f32 - 1.0).ceil() as i32;
-    let max_y = a[1].max(b[1]).max(c[1]).min(fb.height as f32 - 1.0).ceil() as i32;
-
+    let (min_x, min_y, max_x, max_y) = tri_bbox(fb, a, b, c);
     let area_inv = 1.0 / area;
     for y in min_y..=max_y {
         for x in min_x..=max_x {
@@ -475,7 +576,6 @@ fn rasterise_triangle(
             let w0 = edge(b, c, p) * area_inv;
             let w1 = edge(c, a, p) * area_inv;
             let w2 = edge(a, b, p) * area_inv;
-            // Inside-test honours both windings (rendering double-sided).
             let inside =
                 (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
             if !inside {
@@ -485,6 +585,112 @@ fn rasterise_triangle(
             fb.set_pixel(x, y, z, colour);
         }
     }
+}
+
+/// Gouraud shading — bilinearly interpolate the per-vertex colour
+/// (already lit) across the triangle.
+fn rasterise_triangle_gouraud(
+    fb: &mut Framebuffer,
+    a: [f32; 3],
+    b: [f32; 3],
+    c: [f32; 3],
+    ca: [f32; 4],
+    cb: [f32; 4],
+    cc: [f32; 4],
+) {
+    let area = edge(a, b, c);
+    if area.abs() < 1.0e-6 {
+        return;
+    }
+    let (min_x, min_y, max_x, max_y) = tri_bbox(fb, a, b, c);
+    let area_inv = 1.0 / area;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let p = [x as f32 + 0.5, y as f32 + 0.5, 0.0];
+            let w0 = edge(b, c, p) * area_inv;
+            let w1 = edge(c, a, p) * area_inv;
+            let w2 = edge(a, b, p) * area_inv;
+            let inside =
+                (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
+            if !inside {
+                continue;
+            }
+            let z = w0 * a[2] + w1 * b[2] + w2 * c[2];
+            // Linear interpolation in linear space (good enough for an
+            // MVP shader); convert to sRGB at the end.
+            let r = w0 * ca[0] + w1 * cb[0] + w2 * cc[0];
+            let g = w0 * ca[1] + w1 * cb[1] + w2 * cc[1];
+            let bl = w0 * ca[2] + w1 * cb[2] + w2 * cc[2];
+            let al = w0 * ca[3] + w1 * cb[3] + w2 * cc[3];
+            let pix = linear_rgba_to_srgb_u8([r, g, bl, al]);
+            fb.set_pixel(x, y, z, pix);
+        }
+    }
+}
+
+/// Phong shading — interpolate the per-vertex normal across the
+/// triangle, evaluate the lighting equation at every pixel.
+#[allow(clippy::too_many_arguments)]
+fn rasterise_triangle_phong(
+    fb: &mut Framebuffer,
+    a: [f32; 3],
+    b: [f32; 3],
+    c: [f32; 3],
+    na: [f32; 3],
+    nb: [f32; 3],
+    nc: [f32; 3],
+    colour_linear: [f32; 4],
+    light: &DirLight,
+) {
+    let area = edge(a, b, c);
+    if area.abs() < 1.0e-6 {
+        return;
+    }
+    let (min_x, min_y, max_x, max_y) = tri_bbox(fb, a, b, c);
+    let area_inv = 1.0 / area;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let p = [x as f32 + 0.5, y as f32 + 0.5, 0.0];
+            let w0 = edge(b, c, p) * area_inv;
+            let w1 = edge(c, a, p) * area_inv;
+            let w2 = edge(a, b, p) * area_inv;
+            let inside =
+                (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
+            if !inside {
+                continue;
+            }
+            let z = w0 * a[2] + w1 * b[2] + w2 * c[2];
+            let nx = w0 * na[0] + w1 * nb[0] + w2 * nc[0];
+            let ny = w0 * na[1] + w1 * nb[1] + w2 * nc[1];
+            let nz = w0 * na[2] + w1 * nb[2] + w2 * nc[2];
+            let normal = vec3_normalise([nx, ny, nz]);
+            let lit = shade_pixel(colour_linear, normal, light);
+            fb.set_pixel(x, y, z, linear_rgba_to_srgb_u8(lit));
+        }
+    }
+}
+
+fn tri_bbox(fb: &Framebuffer, a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> (i32, i32, i32, i32) {
+    let min_x = a[0].min(b[0]).min(c[0]).max(0.0).floor() as i32;
+    let min_y = a[1].min(b[1]).min(c[1]).max(0.0).floor() as i32;
+    let max_x = a[0].max(b[0]).max(c[0]).min(fb.width as f32 - 1.0).ceil() as i32;
+    let max_y = a[1].max(b[1]).max(c[1]).min(fb.height as f32 - 1.0).ceil() as i32;
+    (min_x, min_y, max_x, max_y)
+}
+
+/// Lambertian diffuse + ambient. `normal` is in world space, `light`
+/// carries a unit direction TOWARD the light. Result is in linear
+/// space, alpha pulled straight from the base colour.
+fn shade_pixel(base: [f32; 4], normal: [f32; 3], light: &DirLight) -> [f32; 4] {
+    let cos_theta = vec3_dot(normal, light.direction).max(0.0);
+    let diffuse = AMBIENT + (1.0 - AMBIENT) * cos_theta * light.intensity;
+    let factor = diffuse.clamp(0.0, 1.0);
+    [
+        base[0] * factor,
+        base[1] * factor,
+        base[2] * factor,
+        base[3],
+    ]
 }
 
 /// Bresenham line on a screen-space pair of projected vertices. Used
@@ -527,9 +733,31 @@ fn edge(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
 }
 
 // ---------------------------------------------------------------------
+// Light helper.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+struct DirLight {
+    /// Unit vector pointing TOWARD the light source from the surface.
+    direction: [f32; 3],
+    intensity: f32,
+}
+
+fn build_light(spec: LightSpec) -> DirLight {
+    let az = spec.azimuth_deg.to_radians();
+    let el = spec.elevation_deg.to_radians();
+    // Azimuth = rotation around Y, measured from +Z (toward +X).
+    // Elevation = pitch above the XZ plane.
+    let cos_el = el.cos();
+    let dir = [cos_el * az.sin(), el.sin(), cos_el * az.cos()];
+    DirLight {
+        direction: vec3_normalise(dir),
+        intensity: spec.intensity,
+    }
+}
+
+// ---------------------------------------------------------------------
 // 4x4 matrix helpers (column-vector convention, row-major storage).
-// We don't pull in nalgebra/glam — a few hand-written 4x4 ops are
-// plenty for a single-pass software rasteriser.
 // ---------------------------------------------------------------------
 
 fn identity4() -> [[f32; 4]; 4] {
@@ -561,6 +789,25 @@ fn mat4_mul_vec4(m: &[[f32; 4]; 4], v: [f32; 4]) -> [f32; 4] {
     ]
 }
 
+fn mat4_mul_point(m: &[[f32; 4]; 4], p: [f32; 3]) -> [f32; 3] {
+    let v = mat4_mul_vec4(m, [p[0], p[1], p[2], 1.0]);
+    if v[3].abs() > f32::EPSILON {
+        [v[0] / v[3], v[1] / v[3], v[2] / v[3]]
+    } else {
+        [v[0], v[1], v[2]]
+    }
+}
+
+/// Multiply the 3x3 upper-left of `m` by `v`. Used to transform
+/// directions (normals) without picking up the translation column.
+fn mat3_mul_vec3(m: &[[f32; 4]; 4], v: [f32; 3]) -> [f32; 3] {
+    [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    ]
+}
+
 // ---------------------------------------------------------------------
 // Camera framing.
 // ---------------------------------------------------------------------
@@ -572,7 +819,9 @@ struct Camera {
 }
 
 impl Camera {
-    fn fit_to_bbox(width: u32, height: u32, bbox: BBox) -> Self {
+    /// Build a camera honouring `Mesh3DOptions::camera` /
+    /// `Mesh3DOptions::projection` / `Mesh3DOptions::fov_deg` overrides.
+    fn build(width: u32, height: u32, bbox: BBox, options: &Mesh3DOptions) -> Self {
         let (cx, cy, cz) = (
             (bbox.min[0] + bbox.max[0]) * 0.5,
             (bbox.min[1] + bbox.max[1]) * 0.5,
@@ -581,20 +830,61 @@ impl Camera {
         let extent = ((bbox.max[0] - bbox.min[0]).max(bbox.max[1] - bbox.min[1]))
             .max(bbox.max[2] - bbox.min[2])
             .max(1.0e-3);
-        let fov_y = 60.0_f32.to_radians();
         let aspect = (width.max(1) as f32) / (height.max(1) as f32);
-        // Distance so the bbox extent fits the vertical FOV with a
-        // 1.2x margin (so the model doesn't kiss the framebuffer
-        // edge). Half the extent is the radius of the inscribed ball.
         let radius = extent * 0.5 * 1.2;
-        let dist = radius / (fov_y * 0.5).tan();
-        let eye = [cx, cy, cz + dist];
+
+        let projection = options.projection.unwrap_or_default();
+        let fov_y = options.fov_deg.unwrap_or(DEFAULT_FOV_DEG).to_radians();
+
+        // Camera placement.
+        let (eye, dist_units) = match options.camera {
+            Some(cam) => {
+                let el = cam.elevation_deg.to_radians();
+                let az = cam.azimuth_deg.to_radians();
+                // dist is a multiplier of the bounding-sphere radius.
+                // Auto-frame distance for perspective is radius / tan(fov/2);
+                // for ortho the eye distance only matters for the z range.
+                let auto_dist = match projection {
+                    ProjectionMode::Perspective => radius / (fov_y * 0.5).tan(),
+                    ProjectionMode::Orthographic => extent * 1.5,
+                };
+                let dist = auto_dist * cam.distance;
+                let cos_el = el.cos();
+                let dir = [cos_el * az.sin(), el.sin(), cos_el * az.cos()];
+                let eye = [cx + dir[0] * dist, cy + dir[1] * dist, cz + dir[2] * dist];
+                (eye, dist)
+            }
+            None => {
+                // Default: look down +Z toward -Z.
+                let dist = match projection {
+                    ProjectionMode::Perspective => radius / (fov_y * 0.5).tan(),
+                    ProjectionMode::Orthographic => extent * 1.5,
+                };
+                ([cx, cy, cz + dist], dist)
+            }
+        };
+
         let target = [cx, cy, cz];
         let up = [0.0, 1.0, 0.0];
         let view = look_at(eye, target, up);
-        let near = (dist - extent).max(extent * 0.01);
-        let far = dist + extent * 2.0;
-        let proj = perspective(fov_y, aspect, near, far);
+
+        let proj = match projection {
+            ProjectionMode::Perspective => {
+                let near = (dist_units - extent).max(extent * 0.01);
+                let far = dist_units + extent * 2.0;
+                perspective(fov_y, aspect, near, far)
+            }
+            ProjectionMode::Orthographic => {
+                // Frame the full extent on the smaller axis with a
+                // 1.2x margin (matching the perspective fit).
+                let half = radius;
+                let half_w = if aspect >= 1.0 { half * aspect } else { half };
+                let half_h = if aspect >= 1.0 { half } else { half / aspect };
+                let near = (dist_units - extent * 2.0).min(-extent);
+                let far = dist_units + extent * 2.0;
+                orthographic(-half_w, half_w, -half_h, half_h, near, far)
+            }
+        };
         Self { view, proj }
     }
 }
@@ -619,6 +909,28 @@ fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
         [0.0, f, 0.0, 0.0],
         [0.0, 0.0, (far + near) * nf, 2.0 * far * near * nf],
         [0.0, 0.0, -1.0, 0.0],
+    ]
+}
+
+/// Standard right-handed orthographic projection matrix (OpenGL
+/// convention; outputs `w = 1` so the perspective-divide in
+/// [`project_vertex`] is a no-op).
+fn orthographic(
+    left: f32,
+    right: f32,
+    bottom: f32,
+    top: f32,
+    near: f32,
+    far: f32,
+) -> [[f32; 4]; 4] {
+    let rl = right - left;
+    let tb = top - bottom;
+    let fne = far - near;
+    [
+        [2.0 / rl, 0.0, 0.0, -(right + left) / rl],
+        [0.0, 2.0 / tb, 0.0, -(top + bottom) / tb],
+        [0.0, 0.0, -2.0 / fne, -(far + near) / fne],
+        [0.0, 0.0, 0.0, 1.0],
     ]
 }
 
@@ -710,10 +1022,6 @@ fn accumulate_node_bbox(scene: &Scene3D, id: NodeId, parent_world: [[f32; 4]; 4]
             }
         }
     }
-    // Visit children with the composed world transform. Re-fetch
-    // children via the scene rather than holding a borrow into `node`
-    // so the recursive call doesn't conflict with the immutable scene
-    // borrow above.
     let children: Vec<NodeId> = scene
         .nodes
         .get(id.0 as usize)
@@ -778,6 +1086,7 @@ impl Framebuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::op::CameraSpec;
     use oxideav_mesh3d::{Mesh, MeshId, Node as MNode, Primitive as MPrimitive, Scene3D, Topology};
 
     fn unit_triangle_scene() -> Scene3D {
@@ -795,15 +1104,21 @@ mod tests {
         scene
     }
 
+    fn render_with_mode(mode: Mesh3DRenderMode) -> RgbaImage {
+        let scene = unit_triangle_scene();
+        let opts = Mesh3DOptions {
+            render_mode: Some(mode),
+            ..Mesh3DOptions::default()
+        };
+        render_scene(&scene, 64, 64, [255, 255, 255, 255], &opts)
+    }
+
     #[test]
     fn renders_triangle_changes_some_pixels() {
-        let scene = unit_triangle_scene();
-        let img = render_scene(&scene, 64, 64, [255, 255, 255, 255], Mesh3DRenderMode::Flat);
+        let img = render_with_mode(Mesh3DRenderMode::Flat);
         assert_eq!(img.width, 64);
         assert_eq!(img.height, 64);
         assert_eq!(img.pixels.len(), 64 * 64 * 4);
-        // Some pixels should differ from the background — the triangle
-        // is large enough to land inside the viewport.
         let drawn = img
             .pixels
             .chunks_exact(4)
@@ -814,16 +1129,40 @@ mod tests {
     #[test]
     fn wireframe_mode_paints_triangle_edges() {
         let scene = unit_triangle_scene();
-        let img = render_scene(&scene, 32, 32, [0, 0, 0, 255], Mesh3DRenderMode::Wireframe);
-        // At least one non-background pixel.
+        let opts = Mesh3DOptions {
+            render_mode: Some(Mesh3DRenderMode::Wireframe),
+            ..Mesh3DOptions::default()
+        };
+        let img = render_scene(&scene, 32, 32, [0, 0, 0, 255], &opts);
         let drawn = img.pixels.chunks_exact(4).any(|p| p != [0, 0, 0, 255]);
         assert!(drawn, "wireframe should paint at least one edge pixel");
     }
 
     #[test]
+    fn gouraud_mode_renders_pixels() {
+        let img = render_with_mode(Mesh3DRenderMode::Gouraud);
+        let drawn = img
+            .pixels
+            .chunks_exact(4)
+            .any(|p| p != [255, 255, 255, 255]);
+        assert!(drawn, "gouraud should rasterise the triangle");
+    }
+
+    #[test]
+    fn phong_mode_renders_pixels() {
+        let img = render_with_mode(Mesh3DRenderMode::Phong);
+        let drawn = img
+            .pixels
+            .chunks_exact(4)
+            .any(|p| p != [255, 255, 255, 255]);
+        assert!(drawn, "phong should rasterise the triangle");
+    }
+
+    #[test]
     fn empty_scene_yields_pure_background() {
         let scene = Scene3D::new();
-        let img = render_scene(&scene, 8, 8, [42, 7, 99, 255], Mesh3DRenderMode::Flat);
+        let opts = Mesh3DOptions::default();
+        let img = render_scene(&scene, 8, 8, [42, 7, 99, 255], &opts);
         for px in img.pixels.chunks_exact(4) {
             assert_eq!(px, &[42, 7, 99, 255]);
         }
@@ -850,5 +1189,70 @@ mod tests {
     fn linear_to_srgb_handles_endpoints() {
         assert_eq!(linear_to_srgb_u8(0.0), 0);
         assert_eq!(linear_to_srgb_u8(1.0), 255);
+    }
+
+    #[test]
+    fn render_bg_default_is_transparent() {
+        // No -bg flag, no -background op → defaults to transparent
+        // black.
+        let bg = pick_render_bg(&[], &Mesh3DOptions::default());
+        assert_eq!(bg, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn render_bg_honours_options_first() {
+        let opts = Mesh3DOptions {
+            bg: Some([10, 20, 30, 200]),
+            ..Mesh3DOptions::default()
+        };
+        let ops = vec![Op::Background([99, 99, 99, 255])];
+        // -bg wins over -background.
+        let bg = pick_render_bg(&ops, &opts);
+        assert_eq!(bg, [10, 20, 30, 200]);
+    }
+
+    #[test]
+    fn render_bg_falls_back_to_background_op() {
+        let opts = Mesh3DOptions::default();
+        let ops = vec![Op::Background([7, 8, 9, 255])];
+        let bg = pick_render_bg(&ops, &opts);
+        assert_eq!(bg, [7, 8, 9, 255]);
+    }
+
+    #[test]
+    fn camera_with_user_override_is_finite() {
+        let bbox = BBox {
+            min: [-1.0, -1.0, -1.0],
+            max: [1.0, 1.0, 1.0],
+        };
+        let opts = Mesh3DOptions {
+            camera: Some(CameraSpec {
+                elevation_deg: 30.0,
+                azimuth_deg: 45.0,
+                distance: 1.5,
+            }),
+            ..Mesh3DOptions::default()
+        };
+        let cam = Camera::build(64, 64, bbox, &opts);
+        for row in cam.view {
+            for v in row {
+                assert!(v.is_finite(), "camera view matrix component not finite");
+            }
+        }
+    }
+
+    #[test]
+    fn ortho_projection_matrix_has_zero_w_translation() {
+        let bbox = BBox {
+            min: [-1.0, -1.0, -1.0],
+            max: [1.0, 1.0, 1.0],
+        };
+        let opts = Mesh3DOptions {
+            projection: Some(ProjectionMode::Orthographic),
+            ..Mesh3DOptions::default()
+        };
+        let cam = Camera::build(64, 64, bbox, &opts);
+        // Ortho proj's bottom row is [0, 0, 0, 1] (no perspective divide).
+        assert_eq!(cam.proj[3], [0.0, 0.0, 0.0, 1.0]);
     }
 }

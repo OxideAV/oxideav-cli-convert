@@ -254,6 +254,110 @@ fn convert_stl_to_usdz_round_trips() {
 }
 
 #[test]
+fn convert_3d_input_to_raster_renders_with_gouraud_shading() {
+    // Round-next: -render gouraud must be honoured end-to-end.
+    let dir = temp_dir("stl-gouraud");
+    let stl_path = dir.join("input.stl");
+    let png_path = dir.join("output.png");
+
+    let scene = make_one_triangle_scene();
+    write_stl_fixture(&stl_path, &scene);
+
+    let args = vec![
+        stl_path.to_string_lossy().into_owned(),
+        "-render".into(),
+        "gouraud".into(),
+        png_path.to_string_lossy().into_owned(),
+    ];
+    convert_run(&args, &ctx()).expect("STL→PNG -render gouraud should succeed");
+    let bytes = fs::read(&png_path).expect("read PNG");
+    assert!(&bytes[..8] == b"\x89PNG\r\n\x1a\n");
+}
+
+#[test]
+fn convert_3d_input_to_raster_renders_with_phong_shading() {
+    // Round-next: -render phong must be honoured end-to-end.
+    let dir = temp_dir("stl-phong");
+    let stl_path = dir.join("input.stl");
+    let png_path = dir.join("output.png");
+
+    let scene = make_one_triangle_scene();
+    write_stl_fixture(&stl_path, &scene);
+
+    let args = vec![
+        stl_path.to_string_lossy().into_owned(),
+        "-render".into(),
+        "phong".into(),
+        png_path.to_string_lossy().into_owned(),
+    ];
+    convert_run(&args, &ctx()).expect("STL→PNG -render phong should succeed");
+    let bytes = fs::read(&png_path).expect("read PNG");
+    assert!(&bytes[..8] == b"\x89PNG\r\n\x1a\n");
+}
+
+#[test]
+fn convert_3d_input_to_raster_with_camera_and_projection() {
+    // Round-next: -camera + -projection + -fov + -bg + -light all
+    // pass through to the renderer cleanly.
+    let dir = temp_dir("stl-cam-ortho");
+    let stl_path = dir.join("input.stl");
+    let png_path = dir.join("output.png");
+
+    let scene = make_one_triangle_scene();
+    write_stl_fixture(&stl_path, &scene);
+
+    let args = vec![
+        stl_path.to_string_lossy().into_owned(),
+        "-projection".into(),
+        "orthographic".into(),
+        "-camera".into(),
+        "30,45,1.5".into(),
+        "-fov".into(),
+        "45".into(),
+        "-light".into(),
+        "60,30,1.0".into(),
+        "-bg".into(),
+        "#202020".into(),
+        "-render".into(),
+        "gouraud".into(),
+        png_path.to_string_lossy().into_owned(),
+    ];
+    convert_run(&args, &ctx()).expect("STL→PNG with all renderer flags should succeed");
+    let bytes = fs::read(&png_path).expect("read PNG");
+    assert!(&bytes[..8] == b"\x89PNG\r\n\x1a\n");
+}
+
+#[test]
+fn fbx_extension_is_recognised_as_mesh3d_input() {
+    // Once oxideav-fbx is wired in, the runner should claim `.fbx`
+    // as a 3D input. We can't easily author a real binary FBX in a
+    // smoke test (the format needs a 27-byte magic + a recursive node
+    // tree), so just assert the recognition + that random bytes
+    // produce a decoder error (NOT an "unknown extension" error).
+    use oxideav_cli_convert::mesh3d_runner::is_mesh3d_input;
+    assert!(is_mesh3d_input("foo.fbx"));
+    assert!(is_mesh3d_input("FOO.FBX"));
+
+    let dir = temp_dir("fbx-bad-bytes");
+    let fbx_path = dir.join("input.fbx");
+    let gltf_path = dir.join("output.gltf");
+    fs::write(&fbx_path, b"not really an fbx file").expect("write bogus FBX");
+
+    let args = vec![
+        fbx_path.to_string_lossy().into_owned(),
+        gltf_path.to_string_lossy().into_owned(),
+    ];
+    let err = convert_run(&args, &ctx()).expect_err("bogus FBX should fail at decode");
+    let msg = format!("{err:?}");
+    // The decoder owns the message; we just want to be sure the
+    // failure didn't come from "no decoder registered".
+    assert!(
+        !msg.contains("no 3D decoder registered for input extension '.fbx'"),
+        "FBX should be wired; decoder must produce its own error, got: {msg}"
+    );
+}
+
+#[test]
 fn convert_3d_input_with_printf_template_errors() {
     // 3D scenes are single-document — a `%d` template makes no sense.
     let dir = temp_dir("stl-with-template-rejected");

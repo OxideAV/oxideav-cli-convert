@@ -510,8 +510,10 @@ impl GltfFormatChoice {
 ///
 /// Default is [`Flat`](Self::Flat) — one constant colour per primitive
 /// derived from the material's `base_color` (or a fallback grey when
-/// no material is attached). Future modes (`gouraud`, `phong`, `pbr`)
-/// land here.
+/// no material is attached). [`Gouraud`](Self::Gouraud) and
+/// [`Phong`](Self::Phong) add per-vertex / per-pixel lighting using
+/// either the primitive's stored vertex normals or face normals
+/// computed from the triangle vertices when none are provided.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mesh3DRenderMode {
     /// Flat-shaded triangles, one colour per primitive (no per-pixel
@@ -521,19 +523,167 @@ pub enum Mesh3DRenderMode {
     /// Wireframe — only triangle edges are drawn, interior pixels stay
     /// at the background. Same colour-per-primitive as [`Flat`](Self::Flat).
     Wireframe,
+    /// Gouraud — light is evaluated at each vertex using the per-vertex
+    /// normal, then the resulting RGB is bilinearly interpolated across
+    /// the triangle. Requires (or computes) one normal per vertex.
+    Gouraud,
+    /// Phong — the per-vertex normal is interpolated across the
+    /// triangle and the lighting equation is evaluated per pixel.
+    /// Smoother than Gouraud at the cost of one normalise + dot per
+    /// fragment.
+    Phong,
 }
 
 impl Mesh3DRenderMode {
-    /// Parse the value after `-render`. Accepts `flat` / `wireframe`
-    /// case-insensitively. `wire` is a short alias for `wireframe`.
+    /// Parse the value after `-render`. Accepts case-insensitive
+    /// `flat` / `wireframe` / `gouraud` / `phong`. `wire` is a short
+    /// alias for `wireframe`; `shaded` aliases `flat`.
     pub fn parse(s: &str) -> Result<Mesh3DRenderMode, String> {
         match s.to_ascii_lowercase().as_str() {
             "flat" | "shaded" => Ok(Mesh3DRenderMode::Flat),
             "wireframe" | "wire" => Ok(Mesh3DRenderMode::Wireframe),
+            "gouraud" => Ok(Mesh3DRenderMode::Gouraud),
+            "phong" => Ok(Mesh3DRenderMode::Phong),
             other => Err(format!(
-                "convert: -render: unknown mode '{other}' (expected 'flat' or 'wireframe')"
+                "convert: -render: unknown mode '{other}' (expected 'flat', 'wireframe', 'gouraud', or 'phong')"
             )),
         }
+    }
+}
+
+/// `-projection MODE` value. Selects perspective vs. orthographic
+/// projection for the 3D→raster renderer. Default is
+/// [`Perspective`](Self::Perspective) — the IM convention for vector
+/// rasterisation matches what most 3D viewers ship.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProjectionMode {
+    /// Perspective projection — objects shrink with distance.
+    #[default]
+    Perspective,
+    /// Orthographic projection — parallel rays, no foreshortening.
+    /// Useful for technical drawings / part diagrams.
+    Orthographic,
+}
+
+impl ProjectionMode {
+    /// Parse the value after `-projection`. Case-insensitive synonyms:
+    /// `perspective` / `persp` / `p`, `orthographic` / `ortho` / `o`.
+    pub fn parse(s: &str) -> Result<ProjectionMode, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "perspective" | "persp" | "p" => Ok(ProjectionMode::Perspective),
+            "orthographic" | "ortho" | "o" => Ok(ProjectionMode::Orthographic),
+            other => Err(format!(
+                "convert: -projection: unknown mode '{other}' (expected 'perspective' or 'orthographic')"
+            )),
+        }
+    }
+}
+
+/// `-light AZIMUTH,ELEVATION,INTENSITY` — directional light override
+/// for the 3D→raster renderer.
+///
+/// `azimuth` and `elevation` are in degrees; `intensity` is a unit
+/// scalar in `[0.0, ~]` multiplied into the diffuse term. The
+/// renderer always also applies a small constant ambient term so
+/// back-faces stay visible.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LightSpec {
+    pub azimuth_deg: f32,
+    pub elevation_deg: f32,
+    pub intensity: f32,
+}
+
+impl LightSpec {
+    /// Default directional light: from the upper-right-front quadrant
+    /// at unit intensity. Matches the renderer baseline so explicit
+    /// `-light` is never required.
+    pub fn default_light() -> Self {
+        Self {
+            azimuth_deg: 45.0,
+            elevation_deg: 45.0,
+            intensity: 1.0,
+        }
+    }
+
+    /// Parse `AZIMUTH,ELEVATION,INTENSITY`. All three components are
+    /// required; intensity is clamped to `>= 0.0`.
+    pub fn parse(s: &str) -> Result<LightSpec, String> {
+        let parts: Vec<&str> = s.split([',', 'x']).collect();
+        if parts.len() != 3 {
+            return Err(format!(
+                "convert: -light: '{s}' must be 'AZIMUTH,ELEVATION,INTENSITY' (e.g. '45,30,1.0')"
+            ));
+        }
+        let az: f32 = parts[0]
+            .trim()
+            .parse()
+            .map_err(|_| format!("convert: -light: azimuth '{}' is not a number", parts[0]))?;
+        let el: f32 = parts[1]
+            .trim()
+            .parse()
+            .map_err(|_| format!("convert: -light: elevation '{}' is not a number", parts[1]))?;
+        let intensity: f32 = parts[2]
+            .trim()
+            .parse()
+            .map_err(|_| format!("convert: -light: intensity '{}' is not a number", parts[2]))?;
+        if !intensity.is_finite() || intensity < 0.0 {
+            return Err(format!(
+                "convert: -light: intensity {intensity} must be >= 0.0 and finite"
+            ));
+        }
+        Ok(LightSpec {
+            azimuth_deg: az,
+            elevation_deg: el,
+            intensity,
+        })
+    }
+}
+
+/// `-camera ELEVATION,AZIMUTH,DISTANCE` — camera override for the
+/// 3D→raster renderer.
+///
+/// `elevation` and `azimuth` are in degrees; `distance` is a positive
+/// multiplier of the scene bounding-sphere radius (`1.0` ≈ scene
+/// touches the framebuffer edge; the auto-framing default is `~1.2`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraSpec {
+    pub elevation_deg: f32,
+    pub azimuth_deg: f32,
+    pub distance: f32,
+}
+
+impl CameraSpec {
+    /// Parse `ELEVATION,AZIMUTH,DISTANCE`. All three components are
+    /// required; distance must be `> 0`.
+    pub fn parse(s: &str) -> Result<CameraSpec, String> {
+        let parts: Vec<&str> = s.split([',', 'x']).collect();
+        if parts.len() != 3 {
+            return Err(format!(
+                "convert: -camera: '{s}' must be 'ELEVATION,AZIMUTH,DISTANCE' (e.g. '20,30,1.5')"
+            ));
+        }
+        let el: f32 = parts[0]
+            .trim()
+            .parse()
+            .map_err(|_| format!("convert: -camera: elevation '{}' is not a number", parts[0]))?;
+        let az: f32 = parts[1]
+            .trim()
+            .parse()
+            .map_err(|_| format!("convert: -camera: azimuth '{}' is not a number", parts[1]))?;
+        let dist: f32 = parts[2]
+            .trim()
+            .parse()
+            .map_err(|_| format!("convert: -camera: distance '{}' is not a number", parts[2]))?;
+        if !dist.is_finite() || dist <= 0.0 {
+            return Err(format!(
+                "convert: -camera: distance {dist} must be > 0.0 and finite"
+            ));
+        }
+        Ok(CameraSpec {
+            elevation_deg: el,
+            azimuth_deg: az,
+            distance: dist,
+        })
     }
 }
 
@@ -542,7 +692,7 @@ impl Mesh3DRenderMode {
 /// All fields default to `None` meaning "use the format crate's
 /// registry default" — i.e. the existing convert behaviour is
 /// unchanged when no `-foo-format` flag is supplied.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Mesh3DOptions {
     /// `-stl-format ascii|binary`. `None` → registry default (binary).
     pub stl_format: Option<StlFormatChoice>,
@@ -550,10 +700,29 @@ pub struct Mesh3DOptions {
     /// output extension (`.glb` → Glb, `.gltf` → JsonEmbedded), which
     /// is exactly what the registry's by-extension lookup already does.
     pub gltf_format: Option<GltfFormatChoice>,
-    /// `-render flat|wireframe`. `None` → default ([`Mesh3DRenderMode::Flat`]).
-    /// Only consulted by the 3D→raster side-channel; ignored on
-    /// every other input/output combination.
+    /// `-render flat|wireframe|gouraud|phong`. `None` → default
+    /// ([`Mesh3DRenderMode::Flat`]). Only consulted by the 3D→raster
+    /// side-channel; ignored on every other input/output combination.
     pub render_mode: Option<Mesh3DRenderMode>,
+    /// `-light AZIMUTH,ELEVATION,INTENSITY`. `None` → renderer
+    /// default ([`LightSpec::default_light`]). Used by Gouraud / Phong
+    /// shading; Flat/Wireframe ignore the light entirely.
+    pub light: Option<LightSpec>,
+    /// `-camera ELEVATION,AZIMUTH,DISTANCE`. `None` → bbox-fit
+    /// auto-frame.
+    pub camera: Option<CameraSpec>,
+    /// `-projection orthographic|perspective`. `None` →
+    /// [`ProjectionMode::Perspective`].
+    pub projection: Option<ProjectionMode>,
+    /// `-fov DEGREES` — vertical field of view for perspective
+    /// projection. `None` → 60°. Ignored for orthographic projection.
+    /// Must be in `(0, 180)`.
+    pub fov_deg: Option<f32>,
+    /// `-bg COLOR` — background fill for the render canvas. `None` →
+    /// transparent black `[0, 0, 0, 0]`. Distinct from `-background`
+    /// (which is the canvas-fill colour for `-alpha remove` and the
+    /// PDF runner) so callers can keep the two paint colours separate.
+    pub bg: Option<[u8; 4]>,
 }
 
 /// The parsed result of one `oxideav convert` invocation.

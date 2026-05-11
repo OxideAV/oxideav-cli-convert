@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- 3D → raster renderer learns Gouraud and Phong shading.
+  - `-render gouraud` evaluates a Lambert+ambient term at every vertex
+    (using `Primitive::normals` when present, else the face normal
+    computed from the three triangle positions in world space) and
+    bilinearly interpolates the resulting RGB across the triangle.
+  - `-render phong` interpolates the per-vertex normal across the
+    triangle and evaluates the lighting equation at every pixel —
+    smoother surface contour at the cost of one normalise + dot per
+    fragment.
+  - `-render flat` and `-render wireframe` continue to behave as
+    they did in round 43; the default stays Flat.
+- Camera and lighting control on the 3D → raster path:
+  - `-light AZIMUTH,ELEVATION,INTENSITY` — directional light
+    override. Default is `45°,45°,1.0` from the upper-right-front
+    quadrant; only Gouraud / Phong consult the light (Flat and
+    Wireframe ignore it).
+  - `-camera ELEVATION,AZIMUTH,DISTANCE` — orbit camera override
+    (`distance` is a multiplier of the auto-framed default). Without
+    `-camera` the renderer keeps the bbox-fit auto-frame.
+  - `-projection perspective|orthographic` — projection mode. Default
+    is perspective; `ortho` / `o` aliases supported.
+  - `-fov DEGREES` — vertical FOV for perspective projection. Default
+    60°, valid range `(0, 180)`. Ignored for orthographic.
+  - `-bg COLOR` — render-canvas background fill (CSS L3 named or
+    `#hex`). Defaults to transparent black. Kept distinct from
+    `-background` (which keeps its IM canvas-fill semantics for
+    `-alpha remove` and the PDF runner).
+- FBX (Filmbox) wired as a 3D input. `oxideav convert in.fbx out.gltf`
+  now decodes through `oxideav-fbx` 0.0.1 and re-encodes through the
+  existing glTF / OBJ / GLB / USDZ encoders. FBX is decode-only —
+  no encoder ships yet, so `.fbx` doesn't appear in the
+  `MESH3D_OUTPUT_EXTS` allow-list.
+- `crate::mesh3d_runner::populate_registry(&mut Mesh3DRegistry)` —
+  workspace-aware registry builder that wraps
+  `oxideav_meta::populate_mesh3d_registry` and tacks on
+  `oxideav_fbx::register` (meta 0.0.1 predates the FBX publish so its
+  generated populator doesn't know about it). Once a meta release
+  knows about FBX, this layer collapses back to a one-liner.
+- `op::Mesh3DRenderMode::Gouraud` / `::Phong` variants;
+  `op::ProjectionMode`; `op::LightSpec`; `op::CameraSpec`.
+- `op::Mesh3DOptions` gains `light`, `camera`, `projection`,
+  `fov_deg`, `bg` fields (all `Option<…>`, defaulting to renderer
+  baseline behaviour when unset).
+- 18 new arg-parser tests (`-render gouraud|phong|wire`; `-light` /
+  `-camera` three-component grammar + invalid-input rejection;
+  `-projection orthographic` + aliases; `-fov` in-range + out-of-range
+  rejection; `-bg` named / hex / transparent), 4 new renderer unit
+  tests (gouraud / phong pixel-drawn, render-bg priority, camera +
+  ortho-projection matrix construction), and 4 new end-to-end
+  `mesh3d_convert` tests (`-render gouraud` PNG, `-render phong` PNG,
+  the full `-projection`/`-camera`/`-fov`/`-light`/`-bg` stack, FBX
+  extension recognition + decoder hand-off).
+
 - USDZ wired as a 3D-output target. `oxideav convert in.obj out.usdz`
   now produces a STORED-only PKZip carrying a `scene.usda` Default
   Layer — the matching encoder ships in `oxideav-usdz` 0.0.1 (the

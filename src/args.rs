@@ -7,8 +7,9 @@
 //! flag errors out with a clear message — we never silently drop.
 
 use crate::op::{
-    AlphaOp, ConvertPlan, Dither, GltfFormatChoice, Mesh3DOptions, Mesh3DRenderMode, Op,
-    PageSelector, PrintfTemplate, ResizeMode, StlFormatChoice,
+    AlphaOp, CameraSpec, ConvertPlan, Dither, GltfFormatChoice, LightSpec, Mesh3DOptions,
+    Mesh3DRenderMode, Op, PageSelector, PrintfTemplate, ProjectionMode, ResizeMode,
+    StlFormatChoice,
 };
 use oxideav_core::Error;
 
@@ -446,6 +447,58 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                 let v = val(i + 1)?;
                 let mode = Mesh3DRenderMode::parse(v).map_err(Error::invalid)?;
                 mesh3d_options.render_mode = Some(mode);
+                i += 2;
+            }
+            // `-light AZIMUTH,ELEVATION,INTENSITY` — directional light
+            // override for the 3D→raster renderer's Gouraud / Phong
+            // shading paths. Stored on `Mesh3DOptions::light`; silently
+            // ignored when the input/output pair doesn't trigger 3D
+            // rendering.
+            "-light" => {
+                let v = val(i + 1)?;
+                let spec = LightSpec::parse(v).map_err(Error::invalid)?;
+                mesh3d_options.light = Some(spec);
+                i += 2;
+            }
+            // `-camera ELEVATION,AZIMUTH,DISTANCE` — camera override for
+            // the 3D→raster renderer (replaces the auto-framed default).
+            "-camera" => {
+                let v = val(i + 1)?;
+                let spec = CameraSpec::parse(v).map_err(Error::invalid)?;
+                mesh3d_options.camera = Some(spec);
+                i += 2;
+            }
+            // `-projection perspective|orthographic` — projection mode
+            // for the 3D→raster renderer. Default is perspective.
+            "-projection" => {
+                let v = val(i + 1)?;
+                let mode = ProjectionMode::parse(v).map_err(Error::invalid)?;
+                mesh3d_options.projection = Some(mode);
+                i += 2;
+            }
+            // `-fov DEGREES` — vertical field of view for the 3D→raster
+            // renderer's perspective projection. Default is 60°. Ignored
+            // for orthographic projection.
+            "-fov" => {
+                let v = val(i + 1)?;
+                let fov: f32 = v
+                    .parse()
+                    .map_err(|_| Error::invalid(format!("convert: -fov: '{v}' is not a number")))?;
+                if !fov.is_finite() || fov <= 0.0 || fov >= 180.0 {
+                    return Err(Error::invalid(format!(
+                        "convert: -fov: {fov} must be in (0, 180) degrees"
+                    )));
+                }
+                mesh3d_options.fov_deg = Some(fov);
+                i += 2;
+            }
+            // `-bg COLOR` — background fill for the 3D render canvas.
+            // Default is transparent black. Distinct from `-background`
+            // which is the IM canvas-fill for alpha-remove + PDF.
+            "-bg" => {
+                let v = val(i + 1)?;
+                let colour = parse_color(v).map_err(Error::invalid)?;
+                mesh3d_options.bg = Some(colour);
                 i += 2;
             }
             other => {
@@ -2222,6 +2275,154 @@ mod tests {
             msg.contains("unknown flavour 'obj'") && msg.contains("expected 'glb'"),
             "unexpected message: {msg}"
         );
+    }
+
+    #[test]
+    fn render_gouraud_parses() {
+        let p = parse(&to_vec(&["in.stl", "-render", "gouraud", "out.png"])).unwrap();
+        assert_eq!(
+            p.mesh3d_options.render_mode,
+            Some(Mesh3DRenderMode::Gouraud)
+        );
+    }
+
+    #[test]
+    fn render_phong_parses() {
+        let p = parse(&to_vec(&["in.stl", "-render", "phong", "out.png"])).unwrap();
+        assert_eq!(p.mesh3d_options.render_mode, Some(Mesh3DRenderMode::Phong));
+    }
+
+    #[test]
+    fn render_wire_alias_parses() {
+        let p = parse(&to_vec(&["in.stl", "-render", "wire", "out.png"])).unwrap();
+        assert_eq!(
+            p.mesh3d_options.render_mode,
+            Some(Mesh3DRenderMode::Wireframe)
+        );
+    }
+
+    #[test]
+    fn render_unknown_mode_rejected_lists_all_options() {
+        let err = parse(&to_vec(&["in.stl", "-render", "raytrace", "out.png"])).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("unknown mode 'raytrace'")
+                && msg.contains("'gouraud'")
+                && msg.contains("'phong'"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[test]
+    fn light_parses_three_components() {
+        let p = parse(&to_vec(&["in.stl", "-light", "30,45,1.5", "out.png"])).unwrap();
+        let light = p.mesh3d_options.light.expect("-light should populate");
+        assert_eq!(light.azimuth_deg, 30.0);
+        assert_eq!(light.elevation_deg, 45.0);
+        assert_eq!(light.intensity, 1.5);
+    }
+
+    #[test]
+    fn light_rejects_negative_intensity() {
+        let err = parse(&to_vec(&["in.stl", "-light", "0,0,-1", "out.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("intensity"));
+    }
+
+    #[test]
+    fn light_rejects_two_component_input() {
+        let err = parse(&to_vec(&["in.stl", "-light", "30,45", "out.png"])).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("AZIMUTH,ELEVATION,INTENSITY"),
+            "expected grammar hint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn camera_parses_three_components() {
+        let p = parse(&to_vec(&["in.stl", "-camera", "20,30,2.0", "out.png"])).unwrap();
+        let cam = p.mesh3d_options.camera.expect("-camera should populate");
+        assert_eq!(cam.elevation_deg, 20.0);
+        assert_eq!(cam.azimuth_deg, 30.0);
+        assert_eq!(cam.distance, 2.0);
+    }
+
+    #[test]
+    fn camera_rejects_zero_distance() {
+        let err = parse(&to_vec(&["in.stl", "-camera", "0,0,0", "out.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("distance"));
+    }
+
+    #[test]
+    fn projection_orthographic_parses() {
+        let p = parse(&to_vec(&[
+            "in.stl",
+            "-projection",
+            "orthographic",
+            "out.png",
+        ]))
+        .unwrap();
+        assert_eq!(
+            p.mesh3d_options.projection,
+            Some(ProjectionMode::Orthographic)
+        );
+    }
+
+    #[test]
+    fn projection_perspective_default_is_unset() {
+        let p = parse(&to_vec(&["in.stl", "out.png"])).unwrap();
+        assert!(p.mesh3d_options.projection.is_none());
+    }
+
+    #[test]
+    fn projection_alias_parses() {
+        let p = parse(&to_vec(&["in.stl", "-projection", "ortho", "out.png"])).unwrap();
+        assert_eq!(
+            p.mesh3d_options.projection,
+            Some(ProjectionMode::Orthographic)
+        );
+    }
+
+    #[test]
+    fn projection_unknown_rejected() {
+        let err = parse(&to_vec(&["in.stl", "-projection", "isometric", "out.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("unknown mode 'isometric'"));
+    }
+
+    #[test]
+    fn fov_parses_within_range() {
+        let p = parse(&to_vec(&["in.stl", "-fov", "45", "out.png"])).unwrap();
+        assert_eq!(p.mesh3d_options.fov_deg, Some(45.0));
+    }
+
+    #[test]
+    fn fov_rejects_zero() {
+        let err = parse(&to_vec(&["in.stl", "-fov", "0", "out.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("(0, 180)"));
+    }
+
+    #[test]
+    fn fov_rejects_180_or_above() {
+        let err = parse(&to_vec(&["in.stl", "-fov", "180", "out.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("(0, 180)"));
+    }
+
+    #[test]
+    fn bg_named_colour_parses() {
+        let p = parse(&to_vec(&["in.stl", "-bg", "black", "out.png"])).unwrap();
+        assert_eq!(p.mesh3d_options.bg, Some([0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn bg_hex_colour_parses() {
+        let p = parse(&to_vec(&["in.stl", "-bg", "#abcdef", "out.png"])).unwrap();
+        assert_eq!(p.mesh3d_options.bg, Some([0xab, 0xcd, 0xef, 255]));
+    }
+
+    #[test]
+    fn bg_transparent_parses() {
+        let p = parse(&to_vec(&["in.stl", "-bg", "transparent", "out.png"])).unwrap();
+        assert_eq!(p.mesh3d_options.bg, Some([0, 0, 0, 0]));
     }
 
     #[test]
