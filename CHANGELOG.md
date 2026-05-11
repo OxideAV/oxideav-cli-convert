@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `.ico` (Windows icon) output target. `oxideav convert src.png out.ico`
+  writes a 1-entry ICO at the source dimensions; pair with
+  `-define icon:auto-resize=W1,W2,…` (IM convention) for a
+  multi-resolution icon — each comma-separated `W` becomes an `W × W`
+  sub-image bilinear-downscaled from the source through
+  `oxideav-image-filter`'s `Resize` factory. The writer follows the
+  `oxideav-ico` `WriteOptions::default()` policy (PNG for sub-images
+  with `min(w,h) >= 64`, BMP otherwise — what Windows 10+ tooling
+  produces). ICO format limits per-axis dimensions to `1..=256`;
+  out-of-range sizes (`0`, `257`, …) are rejected up front.
+- `crate::ico_runner` module hosts the new side-channel runner.
+  Decode covers PNG (`oxideav_png::decode_png_to_rgba`) and BMP
+  (`oxideav_bmp::decode_bmp`); other inputs surface a clean
+  "not yet supported on the ICO writer path — convert to PNG first"
+  error rather than silently bailing.
+- `ico` cargo feature (default-on, sibling to `mesh3d`). Pulls
+  `oxideav-ico` as an optional dep so slim builds (`--no-default-features
+  --features generator`) drop the side-channel and `.ico` falls through
+  to the regular pipeline path (which then errors out as an unknown
+  sink extension — exactly what it should).
+
 - 3D → raster renderer learns two diagnostic visualisation modes
   plus N×N supersampling anti-aliasing.
   - `-render normal-debug` (aliases `normal` / `normals`) paints each

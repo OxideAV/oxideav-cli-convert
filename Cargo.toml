@@ -14,7 +14,7 @@ keywords = ["multimedia", "convert", "imagemagick", "cli", "pipeline"]
 categories = ["multimedia", "command-line-utilities"]
 
 [features]
-default = ["generator", "mesh3d"]
+default = ["generator", "mesh3d", "ico"]
 # Hooks the oxideav-generator shorthand translator into the convert
 # arg parser (`xc:`, `pattern:`, `gradient:`, `synth:`, `testsrc:`, …).
 # Off → those shorthands fall through unchanged and the source registry
@@ -39,6 +39,11 @@ mesh3d = [
     "dep:oxideav-gltf",
     "dep:oxideav-fbx",
 ]
+# Wires `.ico` output: an ImageMagick-style multi-resolution Windows
+# icon writer driven by `-define icon:auto-resize=W,W,…`. Decoder side
+# stays on the regular PNG / BMP path. Off → `.ico` falls through to
+# the regular pipeline and errors out as an unknown sink extension.
+ico = ["dep:oxideav-ico"]
 
 [dependencies]
 oxideav-core = "0.1"
@@ -85,5 +90,8 @@ oxideav-gltf = { version = "0.0", optional = true }
 # meta knows about FBX we can drop this direct dep and route through
 # meta exclusively.
 oxideav-fbx = { version = "0.0", optional = true }
+# Pure-Rust ICO (Windows icon) writer. Optional + default-on; gated on
+# the `ico` feature so slim builds drop it cleanly.
+oxideav-ico = { version = "0.0", optional = true }
 indexmap = "2"
 serde_json = "1"

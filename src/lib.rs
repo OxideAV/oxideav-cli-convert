@@ -31,6 +31,8 @@
 //! ```
 
 pub mod args;
+#[cfg(feature = "ico")]
+pub mod ico_runner;
 #[cfg(feature = "mesh3d")]
 pub mod mesh3d_render;
 #[cfg(feature = "mesh3d")]
@@ -125,6 +127,17 @@ pub fn run(args: &[String], ctx: &RuntimeContext) -> Result<(), Error> {
             "convert: 3D input '{}' must pair with a 3D output (.stl/.obj/.gltf/.glb/.mtl/.usdz) OR a raster output (.png/.jpg/.bmp/.webp); got '{}'{hint}",
             plan.input, plan.output
         )));
+    }
+
+    // Side-channel: `.ico` output. The ICO container carries one OR
+    // more sub-images at different resolutions, driven on the IM CLI
+    // by `-define icon:auto-resize=W1,W2,…`. The regular pipeline
+    // path's "one Frame::Video per track" shape doesn't fit that
+    // multi-image fan-out, and the `-define` key parsing + per-size
+    // resize is convert-specific. See `ico_runner` module docs.
+    #[cfg(feature = "ico")]
+    if ico_runner::is_ico_output(&plan.output) {
+        return ico_runner::run(&plan);
     }
 
     let job = plan_to_job::plan_to_job(&plan, ctx)?;
