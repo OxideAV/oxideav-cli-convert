@@ -53,10 +53,18 @@ fn write_solid_red_png(path: &PathBuf, dims: u32) {
     fs::write(path, bytes).unwrap();
 }
 
-/// Parse an ICO file's directory and return `(icon_type, [(w, h, size,
-/// offset, is_png)…])` where `w = 0` decodes to `256` per the ICO
+/// One decoded ICO directory entry from `parse_ico_dir`.
+#[derive(Debug, Clone, Copy)]
+struct DirEntry {
+    w: u32,
+    h: u32,
+    is_png: bool,
+}
+
+/// Parse an ICO file's directory and return `(icon_type, [DirEntry…])`
+/// where `w == 0` in the on-disk byte decodes to `256` per the ICO
 /// directory convention.
-fn parse_ico_dir(bytes: &[u8]) -> (u16, Vec<(u32, u32, u32, u32, bool)>) {
+fn parse_ico_dir(bytes: &[u8]) -> (u16, Vec<DirEntry>) {
     assert!(
         bytes.len() >= 6,
         "ICO too small for header ({}B)",
@@ -92,7 +100,7 @@ fn parse_ico_dir(bytes: &[u8]) -> (u16, Vec<(u32, u32, u32, u32, bool)>) {
         ]);
         let payload = &bytes[offset as usize..offset as usize + size as usize];
         let is_png = payload.starts_with(b"\x89PNG\r\n\x1a\n");
-        out.push((w, h, size, offset, is_png));
+        out.push(DirEntry { w, h, is_png });
     }
     (ty, out)
 }
@@ -117,8 +125,8 @@ fn ico_single_entry_at_source_dims() {
     let (ty, dirs) = parse_ico_dir(&bytes);
     assert_eq!(ty, 1, "expected ICO (idType=1), got {ty}");
     assert_eq!(dirs.len(), 1, "expected 1 entry, got {}", dirs.len());
-    let (w, h, _size, _off, _is_png) = dirs[0];
-    assert_eq!((w, h), (256, 256), "entry dims");
+    let e = dirs[0];
+    assert_eq!((e.w, e.h), (256, 256), "entry dims");
 }
 
 #[test]
@@ -143,10 +151,10 @@ fn ico_multi_entry_auto_resize_four_sizes() {
     let (ty, dirs) = parse_ico_dir(&bytes);
     assert_eq!(ty, 1);
     assert_eq!(dirs.len(), 4, "expected 4 entries, got {}", dirs.len());
-    let got_dims: Vec<(u32, u32)> = dirs.iter().map(|d| (d.0, d.1)).collect();
+    let got_dims: Vec<(u32, u32)> = dirs.iter().map(|d| (d.w, d.h)).collect();
     assert_eq!(got_dims, vec![(16, 16), (32, 32), (48, 48), (64, 64)]);
     // 64 hits the WriteOptions PNG threshold, 16/32/48 stay BMP.
-    let is_png: Vec<bool> = dirs.iter().map(|d| d.4).collect();
+    let is_png: Vec<bool> = dirs.iter().map(|d| d.is_png).collect();
     assert_eq!(is_png, vec![false, false, false, true]);
 }
 
@@ -171,7 +179,7 @@ fn ico_multi_entry_auto_resize_six_sizes() {
     let bytes = fs::read(&out).expect("ico file");
     let (_ty, dirs) = parse_ico_dir(&bytes);
     assert_eq!(dirs.len(), 6);
-    let got_dims: Vec<(u32, u32)> = dirs.iter().map(|d| (d.0, d.1)).collect();
+    let got_dims: Vec<(u32, u32)> = dirs.iter().map(|d| (d.w, d.h)).collect();
     assert_eq!(
         got_dims,
         vec![
@@ -246,6 +254,6 @@ fn ico_dedup_and_sort() {
 
     let bytes = fs::read(&out).expect("ico file");
     let (_ty, dirs) = parse_ico_dir(&bytes);
-    let got_dims: Vec<(u32, u32)> = dirs.iter().map(|d| (d.0, d.1)).collect();
+    let got_dims: Vec<(u32, u32)> = dirs.iter().map(|d| (d.w, d.h)).collect();
     assert_eq!(got_dims, vec![(16, 16), (32, 32), (64, 64)]);
 }
