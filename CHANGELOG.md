@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Comma-separated and negative page-selector atoms on PDF inputs.
+  `convert input.pdf[-1] cover.png` now writes the last page of the
+  document; `convert input.pdf[0,2,4] page-%d.png` fans out the
+  user-listed pages in source order; `convert input.pdf[0-2,5,-1]
+  ...` mixes ranges, singles, and negative offsets in one selector;
+  `convert input.pdf[5--1] ...` runs page 5 through the last page.
+  Atomic specs (`PageAtom::Single(isize)` / `::Range(isize, isize)`)
+  carry the signed indices; `PageSelector::resolve(total_pages)`
+  maps `-k` to `total_pages - k` and propagates a precise "negative
+  index out of range" error otherwise.
+- `op::PageAtom` enum + a new `PageSelector::List(Vec<PageAtom>)`
+  variant. Single-atom selectors continue to land as
+  `PageSelector::Single` / `::Range` so existing pattern-match
+  callers don't have to walk a one-element list.
+- Source order is preserved on resolve (so `[2,0]` writes page 2
+  before page 0); duplicates are retained matching IM
+  (`[0,0,0]` writes the same page three times).
+- 13 new unit tests in `args::tests` (negative-index parse, negative
+  range endpoint(s), comma-list parse, single-atom-list collapse to
+  `Single`, empty-atom / bare-dash rejection, resolver coverage for
+  negatives / lists / duplicates / out-of-range propagation) plus 4
+  new end-to-end tests in `tests/pdf_to_png.rs` (`pdf[-1]` → PNG,
+  `pdf[0,1]` → PNG fan-out, `pdf[0,-1]` → PNG fan-out, `pdf[-5]`
+  out-of-range error).
+
 - `.ico` (Windows icon) output target. `oxideav convert src.png out.ico`
   writes a 1-entry ICO at the source dimensions; pair with
   `-define icon:auto-resize=W1,W2,…` (IM convention) for a

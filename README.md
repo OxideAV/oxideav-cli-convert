@@ -71,7 +71,7 @@ follow-up; today it errors with a clear message.
 | PDF (side-channel) | `oxideav-pdf` | `input.pdf`, `report.pdf[0]`, `report.pdf[2-5]` |
 | 3D asset (side-channel) | `oxideav-mesh3d` registry (`mesh3d` feature) | `cube.stl`, `model.obj`, `scene.gltf`, `scene.glb`, `archive.usdz`, `materials.mtl` |
 
-### `[N]` / `[N-M]` page selectors
+### `[N]` / `[N-M]` / `[A,B,…]` page selectors
 
 ImageMagick-style suffix on PDF inputs:
 
@@ -79,10 +79,23 @@ ImageMagick-style suffix on PDF inputs:
 |---|---|
 | `input.pdf[0]` | page 0 only |
 | `input.pdf[2-5]` | pages 2..=5 inclusive |
+| `input.pdf[-1]` | last page |
+| `input.pdf[-3]` | third-from-last page |
+| `input.pdf[5--1]` | page 5 through the last page |
+| `input.pdf[-3--1]` | last three pages |
+| `input.pdf[0,2,4]` | comma-separated list (atoms may themselves be ranges) |
+| `input.pdf[0-2,5,-1]` | mix of ranges, singles, and negative indices |
 | _(no suffix)_ | every page |
 
+Negative atoms `-k` resolve to `total_pages - k` (`-1` = last page).
+Comma lists preserve source order, so `[2,0]` writes page 2 first then
+page 0; duplicates are retained (IM convention — `[0,0,0]` writes the
+same page three times).
+
 Out-of-range indices error with a precise count: `page index 5 out
-of range (input has 3 page(s))`.
+of range (input has 3 page(s))` (or, for a negative atom that
+overshoots the document, `negative page index -5 out of range
+(input has 3 page(s); valid: -1..=-3)`).
 
 ## Outputs
 
@@ -278,13 +291,15 @@ get the base error with no misleading suggestion.
 ## Round-3 follow-ups
 
 - Multi-input (`convert in1.pdf in2.pdf out.gif`) — IM allows it.
-- Comma-separated and negative page selectors (`[0,2,4]`, `[-1]`).
 - GIF + TIFF raster outputs (need palette quantisation / multi-image
   TIFF encoder respectively; both are crate-side work).
 - `-density` applied to raster inputs (silently dropped today).
 - Registering PDF as a real `Demuxer` so `oxideav probe` /
   `transcode` / `run` see it. Today this side-channels through
   `convert` only.
+
+Completed previously: `[0,2,4]` comma-separated and `[-1]` negative
+page selectors (round 77).
 
 ## License
 

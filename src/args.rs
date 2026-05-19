@@ -8,7 +8,7 @@
 
 use crate::op::{
     AlphaOp, CameraSpec, ConvertPlan, Dither, GltfFormatChoice, LightSpec, Mesh3DOptions,
-    Mesh3DRenderMode, Op, PageSelector, PrintfTemplate, ProjectionMode, ResizeMode,
+    Mesh3DRenderMode, Op, PageAtom, PageSelector, PrintfTemplate, ProjectionMode, ResizeMode,
     StlFormatChoice,
 };
 use oxideav_core::Error;
@@ -598,12 +598,21 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
     })
 }
 
-/// Strip an ImageMagick-style `[N]` / `[N-M]` page selector suffix
-/// from the input path. `input.pdf[0]` → `("input.pdf", Some(Single(0)))`.
+/// Strip an ImageMagick-style `[N]` / `[N-M]` / `[A,B,…]` page-selector
+/// suffix from the input path. Examples:
+///
+/// * `input.pdf[0]` → `("input.pdf", Some(Single(0)))`
+/// * `input.pdf[2-5]` → `("input.pdf", Some(Range(2, 5)))`
+/// * `input.pdf[-1]` → `("input.pdf", Some(Single(-1)))` (resolves to last page)
+/// * `input.pdf[5--1]` → `("input.pdf", Some(Range(5, -1)))` (page 5 to last)
+/// * `input.pdf[0,2,4]` → `("input.pdf", Some(List([Single(0), Single(2), Single(4)])))`
+/// * `input.pdf[0-2,5,-1]` → `("input.pdf", Some(List([Range(0,2), Single(5), Single(-1)])))`
+///
 /// Inputs with no `[…]` suffix return `(input, None)`.
 ///
 /// Returns an `Err` for malformed selectors (`[abc]`, `[1-2-3]`, `[]`,
-/// unbalanced brackets, etc.) so the user gets a clear message.
+/// `[,]`, `[0,,1]`, unbalanced brackets, etc.) so the user gets a
+/// clear message.
 pub(crate) fn split_input_selector(s: &str) -> Result<(&str, Option<PageSelector>), Error> {
     if !s.ends_with(']') {
         return Ok((s, None));
@@ -622,35 +631,105 @@ pub(crate) fn split_input_selector(s: &str) -> Result<(&str, Option<PageSelector
             "convert: input '{s}' has an empty `[]` page selector"
         )));
     }
-    let sel = match body.split_once('-') {
+    let sel = parse_page_selector_body(s, body)?;
+    Ok((&s[..open], Some(sel)))
+}
+
+/// Parse the inside of a `[…]` page-selector. Splits on `,`, then each
+/// piece on a single `-` (taking care to keep a LEADING `-` as the
+/// sign of a negative endpoint, not a range separator). One atom →
+/// `Single`/`Range` variant; multiple atoms → `List`.
+fn parse_page_selector_body(input: &str, body: &str) -> Result<PageSelector, Error> {
+    // Comma-separated list of atoms. IM accepts `[0,2,4]` for "pages
+    // 0, 2, and 4"; we extend to ranges-within-lists (`[0-2,5,-1]`).
+    let pieces: Vec<&str> = body.split(',').collect();
+    let mut atoms: Vec<PageAtom> = Vec::with_capacity(pieces.len());
+    for piece in &pieces {
+        let trimmed = piece.trim();
+        if trimmed.is_empty() {
+            return Err(Error::invalid(format!(
+                "convert: input '{input}': page selector '{body}' has an empty atom (between commas)"
+            )));
+        }
+        atoms.push(parse_page_atom(input, trimmed)?);
+    }
+    Ok(if atoms.len() == 1 {
+        // Preserve the single-atom variants — most callers only care
+        // about the one-atom case and matching `Single(2)` is far
+        // friendlier than walking a one-element `List([Single(2)])`.
+        match atoms.into_iter().next().unwrap() {
+            PageAtom::Single(n) => PageSelector::Single(n),
+            PageAtom::Range(a, b) => PageSelector::Range(a, b),
+        }
+    } else {
+        PageSelector::List(atoms)
+    })
+}
+
+/// Parse one atom of a page selector. Accepts `N`, `-N`, `N-M`,
+/// `-N-M`, `N--M`, `-N--M`. Returns `Single(n)` for plain indices
+/// (possibly negative) and `Range(a, b)` for two-endpoint specs.
+///
+/// The trick: `-` is both the unary sign for negative indices AND the
+/// range separator. We split off a leading `-` first (so `-1` doesn't
+/// look like a range with an empty start), then look for the next `-`
+/// as the range delimiter, treating a leading `-` on the second
+/// endpoint the same way.
+fn parse_page_atom(input: &str, atom: &str) -> Result<PageAtom, Error> {
+    // Peel off a leading `-` as the sign of the first endpoint (if any).
+    let (first_sign, rest) = if let Some(rest) = atom.strip_prefix('-') {
+        ("-", rest)
+    } else {
+        ("", atom)
+    };
+    if rest.is_empty() {
+        return Err(Error::invalid(format!(
+            "convert: input '{input}': page selector atom '{atom}' is just a sign with no digits"
+        )));
+    }
+    // Now look for a `-` separator (range). Anything past the first
+    // digit-run that's `-` opens the second endpoint.
+    match rest.find('-') {
         None => {
-            let n: usize = body.parse().map_err(|_| {
+            // Single atom — `first_sign + rest` is a plain integer.
+            let n: isize = format!("{first_sign}{rest}").parse().map_err(|_| {
                 Error::invalid(format!(
-                    "convert: input '{s}': '{body}' is not a non-negative integer page index"
+                    "convert: input '{input}': page selector atom '{atom}' is not an integer page index"
                 ))
             })?;
-            PageSelector::Single(n)
+            Ok(PageAtom::Single(n))
         }
-        Some((a, b)) => {
-            if b.contains('-') {
+        Some(sep) => {
+            // Range. Left endpoint is `first_sign + rest[..sep]`.
+            let left = format!("{first_sign}{}", &rest[..sep]);
+            let right_raw = &rest[sep + 1..];
+            if left.is_empty() || left == "-" {
                 return Err(Error::invalid(format!(
-                    "convert: input '{s}': page selector '{body}' has more than one `-` (expected `[N]` or `[N-M]`)"
+                    "convert: input '{input}': page selector atom '{atom}' has no left endpoint"
                 )));
             }
-            let a: usize = a.parse().map_err(|_| {
+            if right_raw.is_empty() {
+                return Err(Error::invalid(format!(
+                    "convert: input '{input}': page selector atom '{atom}' has no right endpoint"
+                )));
+            }
+            // The right side may itself start with `-` to mark a
+            // negative endpoint (e.g. `5--1` = page 5 to last). After
+            // splitting on the FIRST `-`, anything beyond that
+            // shouldn't carry yet ANOTHER unparseable `-`.
+            let a: isize = left.parse().map_err(|_| {
                 Error::invalid(format!(
-                    "convert: input '{s}': '{a}' in range '{body}' is not a non-negative integer"
+                    "convert: input '{input}': page selector atom '{atom}': left endpoint '{left}' is not an integer"
                 ))
             })?;
-            let b: usize = b.parse().map_err(|_| {
+            let b: isize = right_raw.parse().map_err(|_| {
                 Error::invalid(format!(
-                    "convert: input '{s}': '{b}' in range '{body}' is not a non-negative integer"
+                    "convert: input '{input}': page selector atom '{atom}': right endpoint '{right_raw}' is not an integer (expected `N-M`, `-N-M`, or `N--M`)"
                 ))
             })?;
-            PageSelector::Range(a, b)
+            Ok(PageAtom::Range(a, b))
         }
-    };
-    Ok((&s[..open], Some(sel)))
+    }
 }
 
 /// Scan an output filename for a single `%[0-9]*d` token.
@@ -1992,6 +2071,128 @@ mod tests {
         assert_eq!(p.input, "in.pdf");
         assert_eq!(p.input_pages, Some(PageSelector::Range(2, 4)));
         assert!(p.output_template.is_some());
+    }
+
+    // ---- Round-after-next: comma-separated and negative page indices ----
+
+    #[test]
+    fn input_selector_negative_index_parses() {
+        let (path, sel) = split_input_selector("foo.pdf[-1]").unwrap();
+        assert_eq!(path, "foo.pdf");
+        assert_eq!(sel, Some(PageSelector::Single(-1)));
+    }
+
+    #[test]
+    fn input_selector_negative_range_endpoint_parses() {
+        // `5--1` = page 5 through the last page.
+        let (path, sel) = split_input_selector("foo.pdf[5--1]").unwrap();
+        assert_eq!(path, "foo.pdf");
+        assert_eq!(sel, Some(PageSelector::Range(5, -1)));
+    }
+
+    #[test]
+    fn input_selector_negative_range_both_endpoints() {
+        // `-3--1` = last three pages.
+        let (path, sel) = split_input_selector("foo.pdf[-3--1]").unwrap();
+        assert_eq!(path, "foo.pdf");
+        assert_eq!(sel, Some(PageSelector::Range(-3, -1)));
+    }
+
+    #[test]
+    fn input_selector_comma_list_of_singles() {
+        let (path, sel) = split_input_selector("foo.pdf[0,2,4]").unwrap();
+        assert_eq!(path, "foo.pdf");
+        assert_eq!(
+            sel,
+            Some(PageSelector::List(vec![
+                PageAtom::Single(0),
+                PageAtom::Single(2),
+                PageAtom::Single(4),
+            ]))
+        );
+    }
+
+    #[test]
+    fn input_selector_comma_list_with_ranges_and_negatives() {
+        // `0-2,5,-1` = "pages 0..=2, plus 5, plus the last page".
+        let (path, sel) = split_input_selector("foo.pdf[0-2,5,-1]").unwrap();
+        assert_eq!(path, "foo.pdf");
+        assert_eq!(
+            sel,
+            Some(PageSelector::List(vec![
+                PageAtom::Range(0, 2),
+                PageAtom::Single(5),
+                PageAtom::Single(-1),
+            ]))
+        );
+    }
+
+    #[test]
+    fn input_selector_single_atom_list_collapses_to_single_variant() {
+        // A list with exactly one atom collapses to the single-atom
+        // variant — most callers only ever inspect Single/Range.
+        let (_, sel) = split_input_selector("foo.pdf[3]").unwrap();
+        assert!(matches!(sel, Some(PageSelector::Single(3))));
+    }
+
+    #[test]
+    fn input_selector_empty_atom_in_list_rejected() {
+        assert!(split_input_selector("foo.pdf[0,,1]").is_err());
+        assert!(split_input_selector("foo.pdf[,0]").is_err());
+        assert!(split_input_selector("foo.pdf[0,]").is_err());
+    }
+
+    #[test]
+    fn input_selector_bare_dash_rejected() {
+        assert!(split_input_selector("foo.pdf[-]").is_err());
+    }
+
+    #[test]
+    fn page_selector_negative_single_resolves_to_last_page() {
+        let s = PageSelector::Single(-1);
+        assert_eq!(s.resolve(5).unwrap(), vec![4]);
+        let s = PageSelector::Single(-2);
+        assert_eq!(s.resolve(5).unwrap(), vec![3]);
+        // Negative index out of range.
+        assert!(PageSelector::Single(-6).resolve(5).is_err());
+    }
+
+    #[test]
+    fn page_selector_negative_range_endpoint_resolves() {
+        // `5--1` against 8 pages → 5..=7.
+        let s = PageSelector::Range(5, -1);
+        assert_eq!(s.resolve(8).unwrap(), vec![5, 6, 7]);
+        // `-3--1` against 8 pages → 5..=7 (last three).
+        let s = PageSelector::Range(-3, -1);
+        assert_eq!(s.resolve(8).unwrap(), vec![5, 6, 7]);
+    }
+
+    #[test]
+    fn page_selector_list_resolves_in_source_order() {
+        let s = PageSelector::List(vec![
+            PageAtom::Single(0),
+            PageAtom::Single(2),
+            PageAtom::Range(4, 5),
+            PageAtom::Single(-1),
+        ]);
+        assert_eq!(s.resolve(8).unwrap(), vec![0, 2, 4, 5, 7]);
+    }
+
+    #[test]
+    fn page_selector_list_preserves_duplicates() {
+        // IM convention: `[0,0,0]` writes the same page three times.
+        let s = PageSelector::List(vec![
+            PageAtom::Single(0),
+            PageAtom::Single(0),
+            PageAtom::Single(0),
+        ]);
+        assert_eq!(s.resolve(3).unwrap(), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn page_selector_list_propagates_out_of_range() {
+        let s = PageSelector::List(vec![PageAtom::Single(0), PageAtom::Single(99)]);
+        assert!(s.resolve(3).is_err());
     }
 
     // ---- Round-after-next: -vignette / -colorize / -equalize / -auto-gamma ----

@@ -384,6 +384,91 @@ fn pdf_range_selector_fans_out_to_two_pngs() {
     assert!(dir.join("p-1.png").exists());
 }
 
+// Round-77: comma-separated + negative-index page selectors.
+
+#[test]
+fn pdf_negative_selector_picks_last_page() {
+    // `[-1]` against a 2-page PDF should resolve to page 1.
+    let dir = temp_dir("neg-selector");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("last.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[-1]", pdf_path.to_string_lossy()),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("convert pdf[-1]→png");
+    assert!(out.exists(), "last.png missing");
+    assert_eq!(&fs::read(&out).unwrap()[..4], b"\x89PNG");
+}
+
+#[test]
+fn pdf_comma_list_selector_fans_out_per_atom() {
+    // `[0,1]` should produce two distinct output files via the `%d`
+    // template, one per selected page. Same shape as `[0-1]` but
+    // expressed as a comma list.
+    let dir = temp_dir("comma-selector");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let template = dir.join("p-%d.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0,1]", pdf_path.to_string_lossy()),
+            template.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("convert pdf[0,1]→png fan-out");
+    assert!(dir.join("p-0.png").exists());
+    assert!(dir.join("p-1.png").exists());
+}
+
+#[test]
+fn pdf_comma_list_selector_with_negative_endpoint() {
+    // `[0,-1]` against a 2-page PDF picks pages 0 and 1 — two output
+    // files via the template. Exercises the most useful "first + last"
+    // shorthand.
+    let dir = temp_dir("comma-neg-selector");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let template = dir.join("p-%d.png");
+    oxideav_cli_convert::run(
+        &[
+            format!("{}[0,-1]", pdf_path.to_string_lossy()),
+            template.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("convert pdf[0,-1]→png fan-out");
+    assert!(dir.join("p-0.png").exists());
+    assert!(dir.join("p-1.png").exists());
+}
+
+#[test]
+fn pdf_negative_selector_out_of_range_errors() {
+    // `[-5]` against a 2-page PDF should error cleanly — the negative
+    // offset overshoots the document.
+    let dir = temp_dir("neg-oor");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("out.png");
+    let err = oxideav_cli_convert::run(
+        &[
+            format!("{}[-5]", pdf_path.to_string_lossy()),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("out of range"),
+        "expected out-of-range error, got: {err:?}"
+    );
+}
+
 // -------- Round-3 inline geometry / negate ops -------- //
 //
 // Each of these runs the full PDF→PNG path with a new op and checks

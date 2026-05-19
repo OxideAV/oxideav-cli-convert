@@ -396,47 +396,119 @@ impl PrintfTemplate {
     }
 }
 
-/// ImageMagick-style `[N]` / `[N-M]` page-selection suffix on an
-/// input path. `input.pdf[0]` selects page 0; `input.pdf[2-5]`
-/// selects pages 2, 3, 4, 5 (inclusive on both ends, like IM).
+/// One atomic spec inside a [`PageSelector`].
 ///
-/// Today the selector only honours numeric pages — IM also supports
-/// negative indices (`[-1]` = last page) and comma-separated lists
-/// (`[0,2,4]`). Both are documented round-3 follow-ups.
+/// A single index (`5`, `-1`) or an inclusive range (`2-5`, `5--1`).
+/// Indices are signed so the IM convention `-1` = last page,
+/// `-2` = second-to-last, … can ride through unchanged. Resolution
+/// against an actual page count is `PageAtom::resolve`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PageAtom {
+    /// Single page index. Negative values count from the end:
+    /// `-1` = last page, `-2` = second-to-last, ….
+    Single(isize),
+    /// Inclusive range `start..=end`. Either endpoint may be negative
+    /// (`5..=-1` = "page 5 through the last page"). After resolution
+    /// against the actual page count, `start <= end` is required.
+    Range(isize, isize),
+}
+
+impl PageAtom {
+    /// Resolve this atom against a known `total_pages` count, appending
+    /// the resulting zero-based indices to `out` in IM-source order
+    /// (range left-to-right). Negative indices `-k` map to
+    /// `total_pages - k`.
+    fn resolve_into(&self, total_pages: usize, out: &mut Vec<usize>) -> Result<(), String> {
+        match self {
+            PageAtom::Single(n) => {
+                let idx = resolve_signed_index(*n, total_pages)?;
+                out.push(idx);
+                Ok(())
+            }
+            PageAtom::Range(a, b) => {
+                let aa = resolve_signed_index(*a, total_pages)?;
+                let bb = resolve_signed_index(*b, total_pages)?;
+                if aa > bb {
+                    return Err(format!(
+                        "page range [{a}-{b}] resolves to inverted [{aa}-{bb}] (start > end after negative-index resolution)"
+                    ));
+                }
+                out.extend(aa..=bb);
+                Ok(())
+            }
+        }
+    }
+}
+
+fn resolve_signed_index(n: isize, total_pages: usize) -> Result<usize, String> {
+    if n >= 0 {
+        let u = n as usize;
+        if u >= total_pages {
+            Err(format!(
+                "page index {n} out of range (input has {total_pages} page(s))"
+            ))
+        } else {
+            Ok(u)
+        }
+    } else {
+        // Negative — count from the end. `-1` = last page.
+        let off = (-n) as usize;
+        if off > total_pages || off == 0 {
+            Err(format!(
+                "negative page index {n} out of range (input has {total_pages} page(s); valid: -1..=-{total_pages})"
+            ))
+        } else {
+            Ok(total_pages - off)
+        }
+    }
+}
+
+/// ImageMagick-style `[N]` / `[N-M]` / `[A,B,…]` page-selection suffix
+/// on an input path. `input.pdf[0]` selects page 0; `input.pdf[2-5]`
+/// selects pages 2, 3, 4, 5 (inclusive on both ends, like IM);
+/// `input.pdf[-1]` selects the last page; `input.pdf[0,2,4]` selects a
+/// comma-separated list (atoms may themselves be ranges, so
+/// `[0-2,5,-1]` picks pages 0, 1, 2, 5, and the last page).
+///
+/// The single-atom variants ([`Single`](Self::Single) /
+/// [`Range`](Self::Range)) are preserved for ergonomics — most callers
+/// only care about the one-atom case — but every comma-separated
+/// invocation lands as a [`List`](Self::List).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PageSelector {
-    /// Single page index.
-    Single(usize),
-    /// Inclusive range `start..=end`.
-    Range(usize, usize),
+    /// Single page index. Negative values count from the end
+    /// (`-1` = last page).
+    Single(isize),
+    /// Inclusive range `start..=end`. Either endpoint may be negative.
+    Range(isize, isize),
+    /// Comma-separated list of atoms. Order is preserved on resolve;
+    /// duplicates are NOT collapsed (IM convention — `[0,0,0]` writes
+    /// the same page three times). Empty list rejected at parse time.
+    List(Vec<PageAtom>),
 }
 
 impl PageSelector {
     /// Resolve the selector to a list of zero-based page indices,
-    /// validated against `total_pages`.
+    /// validated against `total_pages`. Negative indices `-k` resolve
+    /// to `total_pages - k`. Order matches the IM source order:
+    /// `[0,2,4]` yields `[0, 2, 4]`; `[-1,0]` yields
+    /// `[total_pages-1, 0]`. Duplicates (e.g. `[0,0]`) are preserved.
     pub fn resolve(&self, total_pages: usize) -> Result<Vec<usize>, String> {
+        let mut out = Vec::new();
         match self {
             PageSelector::Single(n) => {
-                if *n >= total_pages {
-                    Err(format!(
-                        "page index {n} out of range (input has {total_pages} page(s))"
-                    ))
-                } else {
-                    Ok(vec![*n])
-                }
+                PageAtom::Single(*n).resolve_into(total_pages, &mut out)?;
             }
             PageSelector::Range(a, b) => {
-                if a > b {
-                    return Err(format!("page range [{a}-{b}] is inverted"));
+                PageAtom::Range(*a, *b).resolve_into(total_pages, &mut out)?;
+            }
+            PageSelector::List(atoms) => {
+                for atom in atoms {
+                    atom.resolve_into(total_pages, &mut out)?;
                 }
-                if *b >= total_pages {
-                    return Err(format!(
-                        "page range [{a}-{b}] out of range (input has {total_pages} page(s))"
-                    ));
-                }
-                Ok((*a..=*b).collect())
             }
         }
+        Ok(out)
     }
 }
 
