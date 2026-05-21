@@ -226,7 +226,7 @@ fn last_background(ops: &[Op]) -> Option<[u8; 4]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::op::{PageSelector, PrintfTemplate as Tmpl};
+    use crate::op::{Op, PageSelector, PrintfTemplate as Tmpl};
 
     #[test]
     fn detects_pdf_extension_case_insensitively() {
@@ -273,5 +273,92 @@ mod tests {
         assert!(s.resolve(3).is_err()); // 3 is out of range when total=3
         let inverted = PageSelector::Range(3, 1);
         assert!(inverted.resolve(5).is_err());
+    }
+
+    // -------- render_page_to_rgba dimension contract --------
+    //
+    // PDF page sizes are stored in PostScript points (1/72 inch). The
+    // rasteriser scales by `density / 72`, so:
+    //   - US Letter 612×792 pt at 72 DPI  → 612×792 px
+    //   - US Letter 612×792 pt at 300 DPI → 2550×3300 px
+    //   - A4 595×842 pt   at 150 DPI      → 1240×1754 px (rounded)
+    // These tests pin the math directly so a future refactor of the
+    // density / point-conversion expression can't silently drift.
+
+    fn empty_page(width_pt: f32, height_pt: f32) -> Page {
+        // An empty vector frame is enough to drive the rasteriser
+        // through the dimension-computation path. The Renderer paints
+        // the background-coloured canvas, returns it; nothing else to
+        // assert beyond width × height.
+        Page {
+            width: width_pt,
+            height: height_pt,
+            content: oxideav_core::vector::VectorFrame::new(width_pt, height_pt),
+            label: None,
+            orientation: 0,
+        }
+    }
+
+    #[test]
+    fn render_page_at_72_dpi_letter_emits_612x792() {
+        let page = empty_page(612.0, 792.0);
+        let img = render_page_to_rgba(&page, &[]).expect("default density");
+        assert_eq!(img.width, 612);
+        assert_eq!(img.height, 792);
+        assert_eq!(img.stride, 612 * 4);
+        assert_eq!(img.pixels.len(), 612 * 792 * 4);
+    }
+
+    #[test]
+    fn render_page_at_300_dpi_letter_emits_2550x3300() {
+        let page = empty_page(612.0, 792.0);
+        let ops = vec![Op::Density(300)];
+        let img = render_page_to_rgba(&page, &ops).expect("300 dpi");
+        assert_eq!(img.width, 2550);
+        assert_eq!(img.height, 3300);
+        assert_eq!(img.stride, 2550 * 4);
+    }
+
+    #[test]
+    fn render_page_at_150_dpi_a4_emits_expected_dims() {
+        // A4 = 595 × 842 pt; × 150/72 = 1239.58 × 1754.17 → round-half
+        // up gives 1240 × 1754.
+        let page = empty_page(595.0, 842.0);
+        let ops = vec![Op::Density(150)];
+        let img = render_page_to_rgba(&page, &ops).expect("a4 150 dpi");
+        assert_eq!(img.width, 1240);
+        assert_eq!(img.height, 1754);
+    }
+
+    #[test]
+    fn render_page_last_density_wins() {
+        // Two -density ops in sequence: only the last one should be
+        // honoured. Mirrors the IM behaviour of operations applied in
+        // source order with the last-wins convention for scalar tunables.
+        let page = empty_page(612.0, 792.0);
+        let ops = vec![Op::Density(72), Op::Density(300)];
+        let img = render_page_to_rgba(&page, &ops).expect("density chain");
+        assert_eq!((img.width, img.height), (2550, 3300));
+    }
+
+    #[test]
+    fn render_page_background_colour_paints_canvas() {
+        // Background `[64, 128, 192, 255]` should appear on every
+        // sample of the rendered empty page. Verifies the renderer
+        // received the background field set by `-background`.
+        let page = empty_page(8.0, 4.0); // tiny so the assert is cheap
+        let ops = vec![Op::Background([64, 128, 192, 255])];
+        let img = render_page_to_rgba(&page, &ops).expect("bg paint");
+        // 8×4 px at 72 DPI default — confirm bg colour on every pixel.
+        for y in 0..img.height as usize {
+            for x in 0..img.width as usize {
+                let off = y * img.stride + x * 4;
+                assert_eq!(
+                    img.pixels[off..off + 4],
+                    [64, 128, 192, 255],
+                    "px @ ({x},{y}) wrong"
+                );
+            }
+        }
     }
 }

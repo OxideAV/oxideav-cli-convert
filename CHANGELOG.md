@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Direct unit tests for the PDF-page → RGBA rasteriser
+  (`pdf_runner::render_page_to_rgba`) pinning the
+  point-to-pixel scaling at multiple DPIs: 72-DPI US Letter
+  (612 pt → 612 px), 300-DPI US Letter (612 pt → 2550 px,
+  792 pt → 3300 px), 150-DPI A4 (595 pt → 1240 px, 842 pt
+  → 1754 px), last-density-wins on a chained `-density`
+  sequence, and an opaque-colour `-background` paints every
+  pixel of an empty page. Round-trips the spec's claim that
+  PDF page sizes are in PostScript points (1/72 inch).
+- End-to-end pdf_to_png test `headline_command_letter_at_300_dpi_emits_2550x3300_rgb_pngs`
+  exercising the literal round-90 invocation
+  `-density 300 input.pdf -background white -alpha remove -alpha off page-%03d.png`
+  on a US-Letter-sized fixture. Asserts both output PNGs are
+  exactly 2550×3300 and that the PNG IHDR colour-type field
+  is `2` (Truecolor RGB), confirming `-alpha off` actually
+  drops the alpha channel from the encode rather than
+  emitting an RGBA buffer with `A=255` everywhere.
+
 - Comma-separated and negative page-selector atoms on PDF inputs.
   `convert input.pdf[-1] cover.png` now writes the last page of the
   document; `convert input.pdf[0,2,4] page-%d.png` fans out the

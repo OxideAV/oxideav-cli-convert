@@ -121,6 +121,101 @@ fn pdf_two_pages_fans_out_to_two_pngs_with_printf_template() {
     }
 }
 
+/// Verbatim headline-command shape from the round-90 plan, but with a
+/// US-Letter-sized fixture so the 300-DPI math has a known target:
+/// 612×792 pt × (300/72) = 2550×3300 px.
+///
+/// `-alpha remove` composites over the white background; `-alpha off`
+/// then drops the alpha channel for the encode. The PNG IHDR colour-type
+/// field at byte 25 must be `2` (Truecolor RGB), not `6` (Truecolor +
+/// Alpha) — that's the only side-effect of `-alpha off` visible from
+/// outside the encoder.
+#[test]
+fn headline_command_letter_at_300_dpi_emits_2550x3300_rgb_pngs() {
+    fn make_letter_pdf() -> Vec<u8> {
+        let path = VPath {
+            commands: vec![
+                PathCommand::MoveTo(Point::new(50.0, 50.0)),
+                PathCommand::LineTo(Point::new(562.0, 50.0)),
+                PathCommand::LineTo(Point::new(562.0, 742.0)),
+                PathCommand::LineTo(Point::new(50.0, 742.0)),
+                PathCommand::Close,
+            ],
+        };
+        let make_page = |c: Rgba| {
+            let pnode = PathNode {
+                path: path.clone(),
+                fill: Some(Paint::Solid(c)),
+                stroke: None,
+                fill_rule: oxideav_core::vector::FillRule::NonZero,
+            };
+            let mut frame = VectorFrame::new(612.0, 792.0);
+            frame.root = Group {
+                children: vec![Node::Path(pnode)],
+                ..Group::default()
+            };
+            Page {
+                width: 612.0,
+                height: 792.0,
+                content: frame,
+                label: None,
+                orientation: 0,
+            }
+        };
+        let scene = Scene {
+            pages: Some(vec![
+                make_page(Rgba::new(255, 0, 0, 255)),
+                make_page(Rgba::new(0, 0, 255, 255)),
+            ]),
+            ..Scene::default()
+        };
+        oxideav_pdf::write_pdf_from_scene(&scene).expect("pdf encode")
+    }
+
+    let dir = temp_dir("headline-300dpi-letter");
+    let pdf_path = dir.join("input.pdf");
+    fs::write(&pdf_path, make_letter_pdf()).unwrap();
+
+    // Literal arg order from the round-90 plan.
+    let template = dir.join("page-%03d.png");
+    oxideav_cli_convert::run(
+        &[
+            "-density".into(),
+            "300".into(),
+            pdf_path.to_string_lossy().into_owned(),
+            "-background".into(),
+            "white".into(),
+            "-alpha".into(),
+            "remove".into(),
+            "-alpha".into(),
+            "off".into(),
+            template.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .expect("headline command");
+
+    for i in 0..2usize {
+        let p = dir.join(format!("page-{i:03}.png"));
+        assert!(p.exists(), "{p:?} missing");
+        let bytes = fs::read(&p).unwrap();
+        assert_eq!(&bytes[..4], b"\x89PNG", "{p:?} not a PNG");
+
+        // PNG IHDR: bytes 16..20 = width, 20..24 = height (BE u32).
+        let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        assert_eq!((w, h), (2550, 3300), "{p:?} at 300 DPI must be 2550×3300");
+
+        // IHDR colour-type at byte 25: 2 = RGB, 6 = RGB+Alpha.
+        // `-alpha off` should give us 2.
+        let colour_type = bytes[25];
+        assert_eq!(
+            colour_type, 2,
+            "{p:?} colour-type {colour_type} — expected 2 (RGB) after `-alpha off`"
+        );
+    }
+}
+
 #[test]
 fn pdf_multi_page_no_template_errors_with_helpful_message() {
     let dir = temp_dir("multi-page-no-template");
