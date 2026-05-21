@@ -237,44 +237,15 @@ fn encode_bmp(img: &RgbaImage) -> Result<Vec<u8>> {
         .map_err(|e| Error::invalid(format!("convert: BMP encode failed: {e:?}")))
 }
 
-fn encode_webp(img: &RgbaImage) -> Result<Vec<u8>> {
-    use oxideav_webp::encode_vp8l_argb;
-    use oxideav_webp::riff::{build_vp8l_with_alpha, build_webp_file, ImageKind, WebpMetadata};
-    // VP8L (lossless) takes ARGB-packed `&[u32]` (one u32 per pixel,
-    // alpha in the high byte). Pack accordingly.
-    let n_px = (img.width as usize) * (img.height as usize);
-    let mut argb = Vec::with_capacity(n_px);
-    let has_alpha = !img.is_rgb();
-    if has_alpha {
-        for px in img.pixels.chunks_exact(4) {
-            let v = ((px[3] as u32) << 24)
-                | ((px[0] as u32) << 16)
-                | ((px[1] as u32) << 8)
-                | (px[2] as u32);
-            argb.push(v);
-        }
-    } else {
-        for px in img.pixels.chunks_exact(3) {
-            let v =
-                (0xff_u32 << 24) | ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | (px[2] as u32);
-            argb.push(v);
-        }
-    }
-    let bitstream = encode_vp8l_argb(img.width, img.height, &argb, has_alpha)
-        .map_err(|e| Error::invalid(format!("convert: WebP VP8L encode failed: {e:?}")))?;
-    let bytes = if has_alpha {
-        build_vp8l_with_alpha(&bitstream, img.width, img.height, &WebpMetadata::default())
-    } else {
-        build_webp_file(
-            ImageKind::Vp8lLossless,
-            &bitstream,
-            img.width,
-            img.height,
-            None,
-            &WebpMetadata::default(),
-        )
-    };
-    Ok(bytes)
+fn encode_webp(_img: &RgbaImage) -> Result<Vec<u8>> {
+    // VP8L encoder + RIFF assembly was removed by the 2026-05-20
+    // clean-room orphan rebuild of `oxideav-webp`. The crate now
+    // exposes only container walk + typed VP8X / ALPH / ANIM / ANMF
+    // headers (RFC 9649 §2.x) — no encoder, no RIFF builders. WebP
+    // encode is gated off until a clean-room VP8L encoder lands.
+    Err(Error::invalid(
+        "convert: WebP encode pending oxideav-webp clean-room VP8L encoder",
+    ))
 }
 
 fn encode_jpeg(img: &RgbaImage, ops: &[Op]) -> Result<Vec<u8>> {

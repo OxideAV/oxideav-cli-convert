@@ -347,23 +347,30 @@ fn pdf_to_bmp_single_page() {
 }
 
 #[test]
-fn pdf_to_webp_single_page() {
+fn pdf_to_webp_reports_unavailable_until_vp8l_encoder_lands() {
+    // WebP encode is gated off until the post-2026-05-20 clean-room
+    // orphan rebuild of `oxideav-webp` lands a VP8L encoder; the
+    // `encode_webp` path currently surfaces an error. Verify that
+    // convert refuses the request cleanly rather than producing
+    // garbage output. Re-enable the round-trip assertion once the
+    // VP8L encoder is available again.
     let dir = temp_dir("webp");
     let pdf_path = dir.join("in.pdf");
     fs::write(&pdf_path, make_two_page_pdf()).unwrap();
     let out = dir.join("page0.webp");
-    oxideav_cli_convert::run(
+    let err = oxideav_cli_convert::run(
         &[
             format!("{}[0]", pdf_path.to_string_lossy()),
             out.to_string_lossy().into_owned(),
         ],
         &ctx(),
     )
-    .expect("convert pdf[0]→webp");
-    let bytes = fs::read(&out).unwrap();
-    // RIFF container with WEBP fourcc at offset 8.
-    assert_eq!(&bytes[..4], b"RIFF");
-    assert_eq!(&bytes[8..12], b"WEBP");
+    .expect_err("WebP encode should fail until the VP8L encoder lands");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("WebP encode pending"),
+        "unexpected error: {msg}"
+    );
 }
 
 #[test]
