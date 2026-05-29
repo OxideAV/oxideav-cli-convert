@@ -361,6 +361,29 @@ pub enum Op {
     /// `-auto-gamma` (no value) — auto-gamma: pick a per-channel gamma
     /// so the geometric mean lands at `0.5`.
     AutoGamma,
+    /// `-extent WxH[+X+Y]` — re-window the input onto a fixed `WxH`
+    /// canvas. The source is placed at signed offset `(x, y)` (default
+    /// `(0, 0)`, IM's top-left convention); pixels outside the source
+    /// rectangle are painted with `bg` (RGBA). Offsets may be negative
+    /// (`-extent 100x100-10-10`) to translate the source toward the
+    /// upper-left so its right / bottom edge can land inside the
+    /// window. Unlike `Crop` (only shrinks) and `Resize` (only scales),
+    /// `Extent` can both add canvas and discard content depending on
+    /// the requested geometry.
+    ///
+    /// `bg` is captured at args-parse time from the most recent
+    /// `-background` op seen in source order (defaulting to IM's
+    /// opaque white `[255, 255, 255, 255]` when none was set). Pinning
+    /// the colour onto the op preserves source-order semantics — a
+    /// later `-background` does NOT retroactively repaint an earlier
+    /// `-extent`'s padding.
+    Extent {
+        width: u32,
+        height: u32,
+        x: i32,
+        y: i32,
+        bg: [u8; 4],
+    },
 }
 
 /// A printf-style multi-output template. Detected by the args parser

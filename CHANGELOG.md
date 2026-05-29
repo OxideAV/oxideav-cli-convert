@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `-extent WxH[±X±Y]` — IM's canvas re-window op. Places the source at
+  signed offset `(x, y)` (default `(0, 0)`) on a fresh `WxH` canvas,
+  painting pixels outside the source rectangle with the active
+  `-background` colour (defaulting to opaque white when none was set).
+  Negative offsets translate the source toward the upper-left so its
+  right / bottom edge can fit inside the window; sources fully outside
+  the canvas yield an all-background image (no error, matching IM).
+  Source-order semantics are preserved: each `-extent` captures the
+  `-background` that preceded it, so a later `-background` does NOT
+  retroactively repaint earlier extents. Wired through three paths:
+  the args parser (`parse_extent` with full `±X±Y` grammar), the
+  generic pipeline path (`video.extent` factory in
+  `oxideav-image-filter`), and the inline PDF / mesh3d side-channel
+  (new `pixel_xform::extent` working on `RgbaImage` with both RGB-24
+  and RGBA stride layouts).
+
 - Direct unit tests for the PDF-page → RGBA rasteriser
   (`pdf_runner::render_page_to_rgba`) pinning the
   point-to-pixel scaling at multiple DPIs: 72-DPI US Letter

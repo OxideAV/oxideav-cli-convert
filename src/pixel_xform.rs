@@ -75,6 +75,15 @@ pub fn apply_pixel_transform_chain(mut img: RgbaImage, ops: &[Op]) -> Result<Rgb
             Op::Crop { x, y, w, h } => {
                 img = crop(img, *x, *y, *w, *h)?;
             }
+            Op::Extent {
+                width,
+                height,
+                x,
+                y,
+                bg,
+            } => {
+                img = extent(img, *width, *height, *x, *y, *bg)?;
+            }
             Op::Negate => {
                 negate(&mut img);
             }
@@ -395,6 +404,105 @@ fn rotate_270_cw(img: RgbaImage) -> RgbaImage {
     }
 }
 
+/// Re-window `img` onto a `(out_w, out_h)` canvas with the source
+/// placed at signed offset `(off_x, off_y)`. Pixels outside the source
+/// rectangle are filled with `bg` (RGBA; the alpha byte is dropped on
+/// Rgb24 outputs).
+///
+/// Negative offsets translate the source toward the upper-left so its
+/// right / bottom edge can land inside the window — this is the IM
+/// convention for `-extent WxH-X-Y`. A `(0, 0)` offset places the
+/// source at the canvas top-left; an offset larger than the canvas
+/// produces an all-background output (no source pixels visible) rather
+/// than an error, also matching IM.
+pub fn extent(
+    img: RgbaImage,
+    out_w: u32,
+    out_h: u32,
+    off_x: i32,
+    off_y: i32,
+    bg: [u8; 4],
+) -> Result<RgbaImage, String> {
+    if out_w == 0 || out_h == 0 {
+        return Err(format!(
+            "extent canvas {out_w}x{out_h} has zero width/height"
+        ));
+    }
+    let bpp = bpp(&img);
+    let new_stride = (out_w as usize) * bpp;
+    let canvas_len = (out_h as usize)
+        .checked_mul(new_stride)
+        .ok_or_else(|| format!("extent canvas {out_w}x{out_h} byte size overflows usize"))?;
+
+    // Build the per-pixel fill once, then memcpy across each output
+    // row. RGB outputs drop the alpha byte; RGBA keep it.
+    let fill: [u8; 4] = bg;
+    let mut out = vec![0u8; canvas_len];
+    // Pre-fill one row's worth of background and replicate.
+    let mut row0 = vec![0u8; new_stride];
+    for chunk in row0.chunks_exact_mut(bpp) {
+        chunk[0] = fill[0];
+        chunk[1] = fill[1];
+        chunk[2] = fill[2];
+        if bpp == 4 {
+            chunk[3] = fill[3];
+        }
+    }
+    for row in 0..(out_h as usize) {
+        let dst_off = row * new_stride;
+        out[dst_off..dst_off + new_stride].copy_from_slice(&row0);
+    }
+
+    // Stamp the source rectangle on top, intersected with the canvas.
+    // Working in signed i64 keeps `out_w + |off|` in range without
+    // overflow even for u32::MAX-ish dims.
+    let src_w = img.width as i64;
+    let src_h = img.height as i64;
+    let canvas_w = out_w as i64;
+    let canvas_h = out_h as i64;
+    let ox = off_x as i64;
+    let oy = off_y as i64;
+
+    // Visible source rectangle in source-image coordinates.
+    let sx_start = (-ox).max(0);
+    let sy_start = (-oy).max(0);
+    let sx_end = (canvas_w - ox).min(src_w);
+    let sy_end = (canvas_h - oy).min(src_h);
+    if sx_start >= sx_end || sy_start >= sy_end {
+        // Source rectangle is entirely outside the canvas — return the
+        // all-background image. This is the IM behaviour for offsets
+        // that translate the source out of view.
+        return Ok(RgbaImage {
+            width: out_w,
+            height: out_h,
+            pixels: out,
+            stride: new_stride,
+        });
+    }
+
+    let copy_w = (sx_end - sx_start) as usize;
+    let copy_h = (sy_end - sy_start) as usize;
+    let dst_x = (sx_start + ox) as usize;
+    let dst_y = (sy_start + oy) as usize;
+    let src_x = sx_start as usize;
+    let src_y = sy_start as usize;
+
+    let row_bytes = copy_w * bpp;
+    for row in 0..copy_h {
+        let src_row_off = (src_y + row) * img.stride + src_x * bpp;
+        let dst_row_off = (dst_y + row) * new_stride + dst_x * bpp;
+        out[dst_row_off..dst_row_off + row_bytes]
+            .copy_from_slice(&img.pixels[src_row_off..src_row_off + row_bytes]);
+    }
+
+    Ok(RgbaImage {
+        width: out_w,
+        height: out_h,
+        pixels: out,
+        stride: new_stride,
+    })
+}
+
 /// Extract a `WxH` bbox at offset `(x, y)`. Errors when the bbox runs
 /// past the input dimensions — the caller surfaces the IM-style
 /// "bbox WxH+X+Y exceeds input W'xH'" message verbatim.
@@ -638,6 +746,117 @@ mod tests {
     fn crop_zero_size_errors() {
         let err = crop(img_2x2_rgba(), 0, 0, 0, 1).unwrap_err();
         assert!(err.contains("zero width/height"));
+    }
+
+    // ---- extent ----
+
+    // Zero-offset, equal-sized canvas is a byte-for-byte copy: every
+    // input pixel maps 1:1, no background pixels visible.
+    #[test]
+    fn extent_zero_offset_same_size_is_identity() {
+        let img = img_2x2_rgba();
+        let original = img.pixels.clone();
+        let out = extent(img, 2, 2, 0, 0, [0xff, 0xff, 0xff, 0xff]).unwrap();
+        assert_eq!(out.width, 2);
+        assert_eq!(out.height, 2);
+        assert_eq!(out.pixels, original);
+    }
+
+    // Growing the canvas paints the new pixels with the background
+    // colour and leaves the source rectangle at (0, 0) untouched.
+    #[test]
+    fn extent_grows_canvas_pads_background() {
+        let img = img_2x2_rgba();
+        let bg = [0xaa, 0xbb, 0xcc, 0xdd];
+        let out = extent(img, 4, 3, 0, 0, bg).unwrap();
+        assert_eq!(out.width, 4);
+        assert_eq!(out.height, 3);
+        // Source pixels intact at top-left.
+        assert_eq!(pixel(&out, 0, 0), [0x10, 0x11, 0x12, 0xff]);
+        assert_eq!(pixel(&out, 1, 0), [0x20, 0x21, 0x22, 0xff]);
+        // Background fills the extension.
+        assert_eq!(pixel(&out, 2, 0), bg);
+        assert_eq!(pixel(&out, 3, 0), bg);
+        assert_eq!(pixel(&out, 0, 2), bg);
+        assert_eq!(pixel(&out, 3, 2), bg);
+    }
+
+    // Positive offset shifts the source toward the lower-right; the
+    // top / left rows become background.
+    #[test]
+    fn extent_positive_offset_shifts_source() {
+        let img = img_2x2_rgba();
+        let bg = [0x55, 0x55, 0x55, 0xff];
+        let out = extent(img, 4, 4, 1, 1, bg).unwrap();
+        assert_eq!(pixel(&out, 0, 0), bg);
+        assert_eq!(pixel(&out, 1, 0), bg);
+        // Source pixels offset by (1, 1).
+        assert_eq!(pixel(&out, 1, 1), [0x10, 0x11, 0x12, 0xff]);
+        assert_eq!(pixel(&out, 2, 1), [0x20, 0x21, 0x22, 0xff]);
+        assert_eq!(pixel(&out, 1, 2), [0x30, 0x31, 0x32, 0xff]);
+        assert_eq!(pixel(&out, 2, 2), [0x40, 0x41, 0x42, 0xff]);
+        // Bottom-right is still background.
+        assert_eq!(pixel(&out, 3, 3), bg);
+    }
+
+    // Negative offset translates the source toward the upper-left so
+    // its right / bottom edge can land inside a smaller canvas —
+    // pixels that fall off the canvas are discarded.
+    #[test]
+    fn extent_negative_offset_clips_source() {
+        let img = img_2x2_rgba();
+        let bg = [0x55, 0x55, 0x55, 0xff];
+        // 1x1 canvas with offset (-1, -1) shows ONLY the source's
+        // bottom-right pixel.
+        let out = extent(img, 1, 1, -1, -1, bg).unwrap();
+        assert_eq!(out.width, 1);
+        assert_eq!(out.height, 1);
+        assert_eq!(pixel(&out, 0, 0), [0x40, 0x41, 0x42, 0xff]);
+    }
+
+    // Source fully outside canvas → all-background output (not an
+    // error). Mirrors IM's behaviour.
+    #[test]
+    fn extent_offset_off_canvas_yields_all_background() {
+        let img = img_2x2_rgba();
+        let bg = [0xab, 0xcd, 0xef, 0xff];
+        let out = extent(img, 2, 2, 10, 10, bg).unwrap();
+        for y in 0..2 {
+            for x in 0..2 {
+                assert_eq!(pixel(&out, x, y), bg);
+            }
+        }
+    }
+
+    // Shrinking the canvas keeps only the intersected window — the
+    // top-left WxH bytes survive when offset is (0, 0).
+    #[test]
+    fn extent_shrinks_canvas_keeps_intersection() {
+        let img = img_2x2_rgba();
+        let out = extent(img, 1, 1, 0, 0, [0; 4]).unwrap();
+        assert_eq!(pixel(&out, 0, 0), [0x10, 0x11, 0x12, 0xff]);
+    }
+
+    // Zero canvas dims are rejected — there's nothing to render.
+    #[test]
+    fn extent_zero_canvas_errors() {
+        let err = extent(img_2x2_rgba(), 0, 4, 0, 0, [0; 4]).unwrap_err();
+        assert!(err.contains("zero width/height"));
+    }
+
+    // RGB-24 (no alpha) input: the helper drops the alpha byte from
+    // the background and copies the 3-byte pixels untouched.
+    #[test]
+    fn extent_rgb24_drops_alpha_from_background() {
+        let img = RgbaImage {
+            width: 1,
+            height: 1,
+            pixels: vec![0x10, 0x20, 0x30],
+            stride: 3,
+        };
+        let out = extent(img, 2, 1, 0, 0, [0xaa, 0xbb, 0xcc, 0xff]).unwrap();
+        assert_eq!(out.stride, 6);
+        assert_eq!(out.pixels, vec![0x10, 0x20, 0x30, 0xaa, 0xbb, 0xcc]);
     }
 
     // ---- negate ----

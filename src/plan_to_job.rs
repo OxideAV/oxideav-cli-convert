@@ -178,6 +178,32 @@ pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Erro
                     json!({ "x": x, "y": y, "width": w, "height": h }),
                 );
             }
+            Op::Extent {
+                width,
+                height,
+                x,
+                y,
+                bg,
+            } => {
+                // The `oxideav-image-filter` `Extent` factory accepts
+                // `width`/`height` plus optional signed `offset_x` /
+                // `offset_y` and an RGBA `background` array. We forward
+                // everything verbatim — the background was already
+                // resolved against the source-order `-background` ops
+                // at args-parse time so the plan walker stays
+                // stateless.
+                chain = wrap(
+                    chain,
+                    "video.extent",
+                    json!({
+                        "width": width,
+                        "height": height,
+                        "offset_x": x,
+                        "offset_y": y,
+                        "background": [bg[0], bg[1], bg[2], bg[3]],
+                    }),
+                );
+            }
             Op::Negate => {
                 chain = wrap(chain, "video.negate", json!({}));
             }
@@ -883,6 +909,36 @@ mod tests {
         let job = plan_to_job(&plan_with(vec![Op::Negate]), &empty_ctx()).unwrap();
         let track = &job.outputs.values().next().unwrap().all[0];
         find_filter(&track.input, "video.negate").expect("video.negate node");
+    }
+
+    /// `Op::Extent` lowers to a `video.extent` FilterNode carrying
+    /// width / height / signed offsets / RGBA background — the four
+    /// keys the `oxideav-image-filter` `Extent` factory consumes.
+    #[test]
+    fn extent_wires_width_height_offsets_background() {
+        let job = plan_to_job(
+            &plan_with(vec![Op::Extent {
+                width: 200,
+                height: 150,
+                x: -10,
+                y: 20,
+                bg: [12, 34, 56, 200],
+            }]),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.extent").expect("video.extent node");
+        assert_eq!(f.params["width"], 200);
+        assert_eq!(f.params["height"], 150);
+        assert_eq!(f.params["offset_x"], -10);
+        assert_eq!(f.params["offset_y"], 20);
+        let bg = f.params["background"].as_array().expect("background array");
+        assert_eq!(bg.len(), 4);
+        assert_eq!(bg[0], 12);
+        assert_eq!(bg[1], 34);
+        assert_eq!(bg[2], 56);
+        assert_eq!(bg[3], 200);
     }
 
     /// End-to-end shape check: build a plan with a sharpen op,

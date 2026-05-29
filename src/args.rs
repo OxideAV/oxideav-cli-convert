@@ -41,6 +41,11 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
     let mut probe_json = false;
     let mut probe_watch = false;
     let mut mesh3d_options = Mesh3DOptions::default();
+    // Track the most recent `-background` colour in source order so
+    // `-extent` (which paints padding pixels with the active background)
+    // captures the correct value at parse time. Defaults to IM's opaque
+    // white when the user didn't set `-background` before `-extent`.
+    let mut current_bg: [u8; 4] = [255, 255, 255, 255];
 
     let mut i = 0;
     while i < args.len() {
@@ -218,6 +223,10 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
             "-background" => {
                 let v = val(i + 1)?;
                 let rgba = parse_color(v).map_err(Error::invalid)?;
+                // Bake the current background into the parse state so a
+                // subsequent `-extent` reads this value rather than the
+                // initial IM-default white.
+                current_bg = rgba;
                 ops.push(Op::Background(rgba));
                 i += 2;
             }
@@ -261,6 +270,25 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                 let (w, h, x, y) =
                     parse_crop(v).map_err(|e| Error::invalid(format!("convert: -crop: {e}")))?;
                 ops.push(Op::Crop { x, y, w, h });
+                i += 2;
+            }
+            "-extent" => {
+                // IM-style canvas re-window: `WxH`, `WxH+X+Y`, `WxH-X-Y`,
+                // or any mix of signs on the two offsets. The background
+                // colour painted under padding pixels is the one set by
+                // the most recent `-background` op in source order — we
+                // bake it into the op here so the plan walker / inline
+                // pixel-xform path don't need to track parser state.
+                let v = val(i + 1)?;
+                let (w, h, x, y) = parse_extent(v)
+                    .map_err(|e| Error::invalid(format!("convert: -extent: {e}")))?;
+                ops.push(Op::Extent {
+                    width: w,
+                    height: h,
+                    x,
+                    y,
+                    bg: current_bg,
+                });
                 i += 2;
             }
             // ---- Round-next: IM-style image-filter flags wired
@@ -973,6 +1001,87 @@ fn parse_crop(s: &str) -> Result<(u32, u32, u32, u32), String> {
     Ok((w, h, x, y))
 }
 
+/// Parse `-extent WxH[±X±Y]` — IM's canvas re-window.
+///
+/// Accepts `WxH` (offset defaults to `(0, 0)`), `WxH+X+Y`, `WxH-X-Y`,
+/// `WxH+X-Y`, or `WxH-X+Y`. Width / height must both be positive (a
+/// zero-area canvas has nothing to paint); offsets are signed so the
+/// IM convention of negative translation (moving the source toward the
+/// upper-left so its right or bottom edge can fit inside the window)
+/// rides through unchanged.
+///
+/// We deliberately reject the geometry modifiers (`%`, `!`, `^`, `<`,
+/// `>`, `@`) the same way `parse_crop` does — `-extent` in IM accepts
+/// some of those but their semantics are source-size-dependent and
+/// would need a runtime resolution pass that hasn't landed yet.
+fn parse_extent(s: &str) -> Result<(u32, u32, i32, i32), String> {
+    for mark in ['%', '!', '^', '<', '>', '@'] {
+        if s.contains(mark) {
+            return Err(format!(
+                "'{s}' uses IM modifier '{mark}' (-extent currently supports plain WxH[±X±Y] only)"
+            ));
+        }
+    }
+    // Find the boundary between `WxH` and the first signed offset (if
+    // any). The first `+` or `-` AFTER the initial character marks
+    // where the offset section starts; we keep position 0 untouched so
+    // a leading `-` on `WxH` (illegal — `W` must be positive) is
+    // surfaced by `parse_wxh`'s unsigned parse rather than mis-split as
+    // an offset.
+    let head_end = s
+        .char_indices()
+        .skip(1)
+        .find(|(_, c)| *c == '+' || *c == '-')
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    let head = &s[..head_end];
+    let tail = &s[head_end..];
+    let (w, h) = parse_wxh(head)?;
+    let (x, y) = parse_extent_offsets(tail)?;
+    Ok((w, h, x, y))
+}
+
+/// Parse the `±X±Y` tail of an `-extent` geometry string. Returns
+/// `(0, 0)` for an empty tail. Both signs are required when any
+/// offset is given — `WxH+X` (single offset) is rejected so the user
+/// gets a clearer message than "parse failed on empty Y".
+fn parse_extent_offsets(s: &str) -> Result<(i32, i32), String> {
+    if s.is_empty() {
+        return Ok((0, 0));
+    }
+    // Walk char-by-char to find the start of the Y offset — the
+    // SECOND sign character in the tail. Splitting on `+`/`-` directly
+    // would mishandle the mix-of-signs cases (`+X-Y`, `-X+Y`).
+    let bytes = s.as_bytes();
+    if bytes[0] != b'+' && bytes[0] != b'-' {
+        return Err(format!(
+            "'{s}' offset section must start with `+` or `-` (expected WxH+X+Y, WxH-X-Y, or mixed)"
+        ));
+    }
+    let mut split = None;
+    for (i, b) in bytes.iter().enumerate().skip(1) {
+        if *b == b'+' || *b == b'-' {
+            split = Some(i);
+            break;
+        }
+    }
+    let split = split
+        .ok_or_else(|| format!("'{s}' has a single offset; expected both X and Y (WxH±X±Y)"))?;
+    let x_str = &s[..split];
+    let y_str = &s[split..];
+    // Reject IM's `WxH+X+Y+Z` accidental extra-offset case.
+    if y_str[1..].contains('+') || y_str[1..].contains('-') {
+        return Err(format!("'{s}' has more than two signed offsets"));
+    }
+    let x: i32 = x_str
+        .parse()
+        .map_err(|_| format!("'{x_str}' is not a signed integer X offset"))?;
+    let y: i32 = y_str
+        .parse()
+        .map_err(|_| format!("'{y_str}' is not a signed integer Y offset"))?;
+    Ok((x, y))
+}
+
 /// Parse `-blur RxS` or `-blur R`. When sigma is omitted we follow
 /// IM's convention of `sigma = radius / 2.0`. Unlike IM we don't
 /// accept floats for radius — `Blur::new` takes `u32`.
@@ -1587,6 +1696,171 @@ mod tests {
     #[test]
     fn crop_im_modifier_rejected() {
         let err = parse(&to_vec(&["a.png", "-crop", "50%+0+0", "b.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("IM modifier"));
+    }
+
+    // ---- -extent ----
+    //
+    // Default canvas (no offset section) → `(0, 0)` offsets and the
+    // IM-default opaque white background (alpha 255) because no
+    // `-background` was set.
+    #[test]
+    fn extent_default_offset_and_background() {
+        let p = parse(&to_vec(&["a.png", "-extent", "100x80", "b.png"])).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![Op::Extent {
+                width: 100,
+                height: 80,
+                x: 0,
+                y: 0,
+                bg: [255, 255, 255, 255],
+            }]
+        );
+    }
+
+    // `WxH+X+Y` lands as positive signed offsets — basic case.
+    #[test]
+    fn extent_positive_offsets() {
+        let p = parse(&to_vec(&["a.png", "-extent", "120x90+10+5", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Extent {
+                width: 120,
+                height: 90,
+                x: 10,
+                y: 5,
+                bg: _,
+            }] => {}
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    // `WxH-X-Y` lands as negative signed offsets — exercises the
+    // IM convention of translating the source toward the upper-left.
+    #[test]
+    fn extent_negative_offsets() {
+        let p = parse(&to_vec(&["a.png", "-extent", "200x150-25-30", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Extent {
+                width: 200,
+                height: 150,
+                x: -25,
+                y: -30,
+                bg: _,
+            }] => {}
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    // Mixed signs `WxH+X-Y` / `WxH-X+Y` ride through unchanged — IM
+    // accepts every combination.
+    #[test]
+    fn extent_mixed_signs() {
+        let p = parse(&to_vec(&["a.png", "-extent", "64x64+10-5", "b.png"])).unwrap();
+        match p.ops.as_slice() {
+            [Op::Extent {
+                width: 64,
+                height: 64,
+                x: 10,
+                y: -5,
+                bg: _,
+            }] => {}
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+
+    // A `-background` op preceding `-extent` is captured into the
+    // resulting `Op::Extent.bg` so the plan walker stays stateless.
+    #[test]
+    fn extent_picks_up_prior_background() {
+        let p = parse(&to_vec(&[
+            "a.png",
+            "-background",
+            "red",
+            "-extent",
+            "50x50",
+            "b.png",
+        ]))
+        .unwrap();
+        // Two ops emitted: the explicit Background, then Extent
+        // carrying the captured colour.
+        assert_eq!(p.ops.len(), 2);
+        assert!(matches!(p.ops[0], Op::Background([255, 0, 0, 255])));
+        match &p.ops[1] {
+            Op::Extent { bg, .. } => assert_eq!(*bg, [255, 0, 0, 255]),
+            other => panic!("expected Extent, got {other:?}"),
+        }
+    }
+
+    // A `-background` AFTER the `-extent` must NOT retroactively
+    // change the captured padding colour — source order matters.
+    #[test]
+    fn extent_ignores_subsequent_background() {
+        let p = parse(&to_vec(&[
+            "a.png",
+            "-extent",
+            "50x50",
+            "-background",
+            "red",
+            "b.png",
+        ]))
+        .unwrap();
+        // First Op is Extent with the IM-default white.
+        match &p.ops[0] {
+            Op::Extent { bg, .. } => assert_eq!(*bg, [255, 255, 255, 255]),
+            other => panic!("expected Extent, got {other:?}"),
+        }
+    }
+
+    // A second `-extent` after a different `-background` picks up
+    // the new colour while the earlier Extent retains the original.
+    #[test]
+    fn extent_two_calls_capture_independent_backgrounds() {
+        let p = parse(&to_vec(&[
+            "a.png",
+            "-background",
+            "red",
+            "-extent",
+            "50x50",
+            "-background",
+            "blue",
+            "-extent",
+            "60x60",
+            "b.png",
+        ]))
+        .unwrap();
+        let extents: Vec<&Op> = p
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Op::Extent { .. }))
+            .collect();
+        assert_eq!(extents.len(), 2);
+        match extents[0] {
+            Op::Extent { width: 50, bg, .. } => assert_eq!(*bg, [255, 0, 0, 255]),
+            other => panic!("unexpected first extent: {other:?}"),
+        }
+        match extents[1] {
+            Op::Extent { width: 60, bg, .. } => assert_eq!(*bg, [0, 0, 255, 255]),
+            other => panic!("unexpected second extent: {other:?}"),
+        }
+    }
+
+    // Single-offset `WxH+X` is rejected with a clear message rather
+    // than silently treating it as `WxH+X+0`.
+    #[test]
+    fn extent_single_offset_rejected() {
+        let err = parse(&to_vec(&["a.png", "-extent", "64x64+10", "b.png"])).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("single offset"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    // Geometry modifiers (`%`, `!`, `^`, `<`, `>`, `@`) are rejected
+    // identically to `-crop`.
+    #[test]
+    fn extent_im_modifier_rejected() {
+        let err = parse(&to_vec(&["a.png", "-extent", "50%+0+0", "b.png"])).unwrap_err();
         assert!(format!("{err:?}").contains("IM modifier"));
     }
 

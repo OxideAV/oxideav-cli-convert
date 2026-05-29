@@ -27,6 +27,7 @@ rest of the workspace already knows how to do.
 | `-flip` | vertical flip (rows reversed) |
 | `-flop` | horizontal flip (columns reversed) |
 | `-crop WxH+X+Y` | extract bbox; bbox-out-of-range errors cleanly |
+| `-extent WxH[±X±Y]` | re-window onto a fixed canvas; padding painted with the active `-background` (defaults to opaque white); negative offsets translate the source toward the upper-left |
 | `-negate` | per-pixel `255 - in` on RGB channels (alpha unchanged) |
 | `-sharpen RxS` | unsharp-mask sharpening (`S` defaults to `R/2`) |
 | `-unsharp RxS+amount+threshold` | full unsharp-mask grammar (`amount`/`threshold` optional) |
