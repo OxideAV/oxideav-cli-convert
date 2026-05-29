@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `-monochrome` — IM's valueless shorthand that emits a 1-bit
+  black-and-white image with Floyd-Steinberg error diffusion. Lowers
+  to the canonical primitive chain
+  `-colorspace gray -colors 2 -dither floyd_steinberg` at args-parse
+  time, preserving source-order semantics so any neighbours (e.g.
+  a preceding `-resize` and a trailing `-strip`) sit on either side
+  of the expansion rather than being pushed around it. The dither
+  choice is hardcoded to `FloydSteinberg` regardless of any prior
+  `-dither none` to match IM's "monochrome is self-contained"
+  contract; users who want the un-dithered cut still write the chain
+  by hand. Lives in the args parser only — every downstream runner
+  (PDF side-channel, 3D-render side-channel, regular pipeline) sees
+  the lowered ops it already knows how to handle, so no plan_to_job
+  / pixel_xform / image-filter changes were needed.
+
 - `-extent WxH[±X±Y]` — IM's canvas re-window op. Places the source at
   signed offset `(x, y)` (default `(0, 0)`) on a fresh `WxH` canvas,
   painting pixels outside the source rectangle with the active

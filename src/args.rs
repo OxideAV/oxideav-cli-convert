@@ -155,6 +155,27 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                 pending_dither = Dither::parse(v).map_err(Error::invalid)?;
                 i += 2;
             }
+            // `-monochrome` (no value) — IM's "make me a 1-bit dithered
+            // black-and-white image" convenience flag. Equivalent to the
+            // chain `-colorspace gray -colors 2 -dither floyd_steinberg`,
+            // so we lower it to those three primitive ops here rather
+            // than carving out a dedicated runner path. The order
+            // matters: grayscale-first means the palette-builder sees
+            // luminance values rather than colour, so the 2-entry
+            // palette lands on black + white instead of two arbitrary
+            // colour samples. Floyd-Steinberg is IM's documented
+            // default for the 1-bit reduction (newer IM exposes
+            // `-define dither:` to override; we don't yet plumb that).
+            // A user who wants the un-dithered "Atkinson cut" behaviour
+            // can still write the chain by hand with `-dither none`.
+            "-monochrome" => {
+                ops.push(Op::Colorspace("gray".to_string()));
+                ops.push(Op::Colors {
+                    count: 2,
+                    dither: Dither::FloydSteinberg,
+                });
+                i += 1;
+            }
             "-format" => {
                 let v = val(i + 1)?;
                 ops.push(Op::Format(v.to_string()));
@@ -1615,6 +1636,101 @@ mod tests {
                 count: 64,
                 dither: Dither::FloydSteinberg
             }]
+        );
+    }
+
+    // ---- -monochrome ----
+
+    /// `-monochrome` expands to the canonical IM chain `-colorspace
+    /// gray -colors 2 -dither floyd_steinberg` so existing IM scripts
+    /// (`convert in.png -monochrome out.png`) lower to the same op
+    /// records the parser would have produced for the explicit form.
+    /// We pin both the count and the ORDER (grayscale must come first
+    /// so the 2-entry palette lands on black + white rather than two
+    /// arbitrary colour samples).
+    #[test]
+    fn monochrome_expands_to_gray_2_colors_floyd_steinberg() {
+        let p = parse(&to_vec(&["a.png", "-monochrome", "b.png"])).unwrap();
+        assert_eq!(
+            p.ops,
+            vec![
+                Op::Colorspace("gray".to_string()),
+                Op::Colors {
+                    count: 2,
+                    dither: Dither::FloydSteinberg
+                },
+            ]
+        );
+    }
+
+    /// `-monochrome` takes no value — the next positional after it
+    /// must be the output filename. Verifies the valueless-flag wiring
+    /// (no consumption of the input file as a "value").
+    #[test]
+    fn monochrome_is_valueless() {
+        let p = parse(&to_vec(&["a.png", "-monochrome", "b.png"])).unwrap();
+        assert_eq!(p.input, "a.png");
+        assert_eq!(p.output, "b.png");
+    }
+
+    /// Source-order semantics: a `-dither none` placed BEFORE
+    /// `-monochrome` does NOT bleed into the expansion — the flag
+    /// always emits its own `FloydSteinberg` choice. This pins the
+    /// "monochrome is a self-contained shorthand" contract; users who
+    /// want `-dither none` semantics write the chain by hand.
+    #[test]
+    fn monochrome_ignores_prior_pending_dither() {
+        let p = parse(&to_vec(&[
+            "a.png",
+            "-dither",
+            "none",
+            "-monochrome",
+            "b.png",
+        ]))
+        .unwrap();
+        assert_eq!(
+            p.ops,
+            vec![
+                Op::Colorspace("gray".to_string()),
+                Op::Colors {
+                    count: 2,
+                    dither: Dither::FloydSteinberg
+                },
+            ]
+        );
+    }
+
+    /// `-monochrome` is composable with other ops in source order:
+    /// upstream ops keep their record, the two expanded entries appear
+    /// at the position where `-monochrome` was given, and downstream
+    /// ops follow. Catches a regression where someone might be tempted
+    /// to push the expanded ops at the front of the vec.
+    #[test]
+    fn monochrome_keeps_source_order_with_neighbours() {
+        let p = parse(&to_vec(&[
+            "a.png",
+            "-resize",
+            "100x100",
+            "-monochrome",
+            "-strip",
+            "b.png",
+        ]))
+        .unwrap();
+        assert_eq!(
+            p.ops,
+            vec![
+                Op::Resize {
+                    width: 100,
+                    height: 100,
+                    mode: ResizeMode::Default,
+                },
+                Op::Colorspace("gray".to_string()),
+                Op::Colors {
+                    count: 2,
+                    dither: Dither::FloydSteinberg
+                },
+                Op::Strip,
+            ]
         );
     }
 

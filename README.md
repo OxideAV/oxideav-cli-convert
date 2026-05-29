@@ -42,6 +42,7 @@ rest of the workspace already knows how to do.
 | `-posterize N` | collapse to `N >= 2` levels per channel |
 | `-solarize N[%]` | invert above threshold |
 | `-colorspace gray\|grey\|rgb\|srgb` | `gray`/`grey` → grayscale factory; `rgb`/`srgb` no-op |
+| `-monochrome` | valueless IM shorthand for `-colorspace gray -colors 2 -dither floyd_steinberg` (1-bit B/W with error diffusion); always emits `floyd_steinberg` regardless of any prior `-dither none` |
 
 The geometry / negate / tonal ops above all wire through to the
 matching `oxideav-image-filter` factory on the regular pipeline path
