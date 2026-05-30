@@ -74,6 +74,14 @@ fn ping_container(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<()> {
                 plan.input
             )));
         }
+        // Multi-title and any future non-`#[non_exhaustive]` variant —
+        // `-ping` is single-stream by design.
+        _ => {
+            return Err(Error::unsupported(format!(
+                "convert -ping: {}: source kind not supported by ping",
+                plan.input
+            )));
+        }
     };
     let file_size = fs::metadata(&plan.input).map(|m| m.len()).unwrap_or(0);
     // BytesSource is Read+Seek+Send; the demuxer just needs ReadSeek.

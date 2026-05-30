@@ -812,6 +812,14 @@ fn probe_container(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Summary> 
                 plan.input
             )));
         }
+        // Multi-title and any future non-`#[non_exhaustive]` variant
+        // — convert --probe is single-stream by design.
+        _ => {
+            return Err(Error::unsupported(format!(
+                "convert --probe: {}: source kind not supported by probe",
+                plan.input
+            )));
+        }
     };
     let file_size = fs::metadata(&plan.input).map(|m| m.len()).unwrap_or(0);
     let mut handle: Box<dyn oxideav_core::ReadSeek> = Box::new(raw);
