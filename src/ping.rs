@@ -74,8 +74,20 @@ fn ping_container(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<()> {
                 plan.input
             )));
         }
-        // Multi-title and any future non-`#[non_exhaustive]` variant —
+        // Multi-title sources (BD-ROM, DVD-Video, multi-edition MKV)
+        // need a per-title fan-out the convert verb doesn't model;
         // `-ping` is single-stream by design.
+        SourceOutput::MultiTitle(_) => {
+            return Err(Error::unsupported(format!(
+                "convert -ping: {}: multi-title sources are not supported",
+                plan.input
+            )));
+        }
+        // Any future `#[non_exhaustive]`-gated variant — the local
+        // umbrella's `oxideav-core` enables non_exhaustive but the
+        // currently-published crate doesn't, so the arm appears
+        // unreachable on CI. The allow keeps both builds green.
+        #[allow(unreachable_patterns)]
         _ => {
             return Err(Error::unsupported(format!(
                 "convert -ping: {}: source kind not supported by ping",

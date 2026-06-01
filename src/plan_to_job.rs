@@ -342,6 +342,16 @@ pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Erro
             Op::AutoGamma => {
                 chain = wrap(chain, "video.auto-gamma", json!({}));
             }
+            Op::Trim { fuzz } => {
+                // The image-filter `Trim` factory accepts `fuzz` as a
+                // 0..=255 byte plus an optional `background` array. We
+                // forward only `fuzz` here — the args parser doesn't
+                // expose a per-`-trim` colour override yet, so the
+                // factory falls back to its corner-pixel auto-detection
+                // (matching IM's behaviour when neither `-bordercolor`
+                // nor `-background` is set).
+                chain = wrap(chain, "video.trim", json!({ "fuzz": fuzz }));
+            }
         }
     }
 
@@ -1393,6 +1403,32 @@ mod tests {
                 "video.negate".to_string(),
             ]
         );
+    }
+
+    /// `Op::Trim` lowers to a `video.trim` FilterNode carrying the
+    /// captured fuzz tolerance. The factory infers the reference
+    /// background from the input's `(0, 0)` pixel when no explicit
+    /// `background` array is forwarded (IM's default behaviour).
+    #[test]
+    fn trim_wires_fuzz_value() {
+        let job = plan_to_job(&plan_with(vec![Op::Trim { fuzz: 17 }]), &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.trim").expect("video.trim node");
+        assert_eq!(f.params["fuzz"], 17);
+        // No background override → factory falls back to corner pixel.
+        assert!(f.params.get("background").is_none());
+    }
+
+    /// Default `Op::Trim { fuzz: 0 }` is the canonical no-fuzz exact-
+    /// match shape — pin it explicitly so a future refactor that
+    /// switches the default representation surfaces here, not on the
+    /// pipeline executor.
+    #[test]
+    fn trim_default_fuzz_lowers_to_zero() {
+        let job = plan_to_job(&plan_with(vec![Op::Trim { fuzz: 0 }]), &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.trim").expect("video.trim node");
+        assert_eq!(f.params["fuzz"], 0);
     }
 
     #[test]

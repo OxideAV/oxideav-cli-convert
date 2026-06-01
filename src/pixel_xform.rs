@@ -34,7 +34,7 @@
 use oxideav_core::{Error, PixelFormat, VideoFrame, VideoPlane};
 use oxideav_image_filter::{
     BrightnessContrast, Gamma, Grayscale, ImageFilter, Level, Modulate, Normalize, Posterize,
-    Resize, Sepia, Sharpen, Solarize, Threshold, Unsharp, VideoStreamParams,
+    Resize, Sepia, Sharpen, Solarize, Threshold, Trim, Unsharp, VideoStreamParams,
 };
 
 use crate::op::Op;
@@ -189,6 +189,18 @@ pub fn apply_pixel_transform_chain(mut img: RgbaImage, ops: &[Op]) -> Result<Rgb
                     img = run_image_filter_resize(img, &Resize::new(out_w, out_h), out_w, out_h)?;
                 }
             }
+            // `-trim` is shape-changing: the factory computes the
+            // non-background bbox at apply() time, so the output
+            // dimensions aren't known up front. Recover them from the
+            // returned plane's stride / data length (every supported
+            // packed format has `stride = new_width * bpp`, and
+            // `data.len() == stride * new_height`). The same crop fast-
+            // paths the factory already takes (whole-image background,
+            // whole-image content) are preserved by the
+            // `run_image_filter_reshape` helper.
+            Op::Trim { fuzz } => {
+                img = run_image_filter_reshape(img, &Trim::new().with_fuzz(*fuzz))?;
+            }
             // `-define` is a sink-side concern, not a pixel transform.
             Op::Define { .. } => {}
             // Other ops aren't ours: rasteriser / encoder / pipeline
@@ -260,6 +272,71 @@ fn run_image_filter_inner(
     Ok(RgbaImage {
         width: w,
         height: h,
+        pixels: plane.data,
+        stride: plane.stride,
+    })
+}
+
+/// Same as [`run_image_filter`] but the output dimensions are
+/// **recovered** from the returned plane's stride / data length rather
+/// than declared up front. Used by [`Op::Trim`] where the bbox crop is
+/// computed inside the filter and the caller doesn't know the new size
+/// before applying. Assumes the filter produces a packed plane
+/// (`stride == new_width * bpp`, `data.len() == stride * new_height`),
+/// which every [`oxideav_image_filter`] crop / trim path satisfies.
+fn run_image_filter_reshape(img: RgbaImage, filter: &dyn ImageFilter) -> Result<RgbaImage, String> {
+    let bpp_in = bpp(&img);
+    let format = if img.is_rgb() {
+        PixelFormat::Rgb24
+    } else {
+        PixelFormat::Rgba
+    };
+    let in_w = img.width;
+    let in_h = img.height;
+    let frame = VideoFrame {
+        pts: None,
+        planes: vec![VideoPlane {
+            stride: img.stride,
+            data: img.pixels,
+        }],
+    };
+    let params = VideoStreamParams {
+        format,
+        width: in_w,
+        height: in_h,
+    };
+    let out = filter
+        .apply(&frame, params)
+        .map_err(|e: Error| format!("{e:?}"))?;
+    let plane = out
+        .planes
+        .into_iter()
+        .next()
+        .ok_or_else(|| "image-filter returned no planes".to_string())?;
+    if bpp_in == 0 || plane.stride == 0 {
+        return Err("image-filter returned a zero-stride plane".to_string());
+    }
+    // Recover (new_w, new_h) by inverting the packed-plane layout. The
+    // factories under this path emit packed strides; defensive checks
+    // catch any future regression to padded strides.
+    if plane.stride % bpp_in != 0 {
+        return Err(format!(
+            "image-filter stride {} not a multiple of bpp {bpp_in}",
+            plane.stride
+        ));
+    }
+    let new_w = (plane.stride / bpp_in) as u32;
+    if new_w == 0 || plane.data.len() % plane.stride != 0 {
+        return Err(format!(
+            "image-filter packed-plane mismatch: stride={}, data_len={}",
+            plane.stride,
+            plane.data.len()
+        ));
+    }
+    let new_h = (plane.data.len() / plane.stride) as u32;
+    Ok(RgbaImage {
+        width: new_w,
+        height: new_h,
         pixels: plane.data,
         stride: plane.stride,
     })
@@ -1062,5 +1139,89 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("exceeds input"));
+    }
+
+    /// `Op::Trim` cuts a uniform border around a smaller non-background
+    /// region. Build a 4×4 white image with a single non-white pixel at
+    /// `(1, 1)`; trim should collapse to a 1×1 image holding that pixel.
+    /// Pins the bbox-from-stride recovery used by the side-channel.
+    #[test]
+    fn apply_chain_trim_recovers_new_dims_from_stride() {
+        let bg = [0xff, 0xff, 0xff, 0xff];
+        let fg = [0x10, 0x20, 0x30, 0xff];
+        let mut data = Vec::with_capacity(64);
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let p = if x == 1 && y == 1 { &fg } else { &bg };
+                data.extend_from_slice(p);
+            }
+        }
+        let img = RgbaImage {
+            width: 4,
+            height: 4,
+            pixels: data,
+            stride: 16,
+        };
+        let out = apply_pixel_transform_chain(img, &[Op::Trim { fuzz: 0 }]).unwrap();
+        assert_eq!(out.width, 1);
+        assert_eq!(out.height, 1);
+        // The retained pixel is the foreground sample.
+        assert_eq!(&out.pixels[..4], &fg[..]);
+        // Packed stride: 1 pixel × 4 bytes.
+        assert_eq!(out.stride, 4);
+    }
+
+    /// `Op::Trim` with `fuzz` >= the actual per-channel border deviation
+    /// matches the would-be background even though the corner pixel
+    /// isn't bit-identical; the bbox shrinks to the inner content only.
+    /// Pins the `with_fuzz` plumbing.
+    #[test]
+    fn apply_chain_trim_honours_fuzz_tolerance() {
+        let bg = [0xfe, 0xfe, 0xfe, 0xff]; // not pure white
+        let fg = [0x10, 0x20, 0x30, 0xff];
+        let mut data = Vec::with_capacity(64);
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let p = if x == 2 && y == 2 { &fg } else { &bg };
+                data.extend_from_slice(p);
+            }
+        }
+        let img = RgbaImage {
+            width: 4,
+            height: 4,
+            pixels: data,
+            stride: 16,
+        };
+        // fuzz=2 covers the 2-unit deviation between bg and pure white;
+        // the corner pixel is the reference so its self-similarity is
+        // exact and only `fg` differs by more than fuzz.
+        let out = apply_pixel_transform_chain(img, &[Op::Trim { fuzz: 2 }]).unwrap();
+        assert_eq!(out.width, 1);
+        assert_eq!(out.height, 1);
+        assert_eq!(&out.pixels[..4], &fg[..]);
+    }
+
+    /// Uniform-background image — trim's "no foreground" branch collapses
+    /// to a 1×1 pixel (preserving a representable frame rather than
+    /// returning an empty buffer). Pins the factory's documented fall-
+    /// back so callers downstream of the side-channel keep a valid image.
+    #[test]
+    fn apply_chain_trim_uniform_collapses_to_1x1() {
+        let bg = [0x80, 0x80, 0x80, 0xff];
+        let mut data = Vec::with_capacity(64);
+        for _ in 0..16 {
+            data.extend_from_slice(&bg);
+        }
+        let img = RgbaImage {
+            width: 4,
+            height: 4,
+            pixels: data,
+            stride: 16,
+        };
+        let out = apply_pixel_transform_chain(img, &[Op::Trim { fuzz: 0 }]).unwrap();
+        assert_eq!(out.width, 1);
+        assert_eq!(out.height, 1);
+        // The retained pixel is the corner reference itself.
+        assert_eq!(&out.pixels[..4], &bg[..]);
     }
 }

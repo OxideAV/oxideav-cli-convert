@@ -46,6 +46,14 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
     // captures the correct value at parse time. Defaults to IM's opaque
     // white when the user didn't set `-background` before `-extent`.
     let mut current_bg: [u8; 4] = [255, 255, 255, 255];
+    // Track the most recent `-fuzz N[%]` value in source order so a
+    // following `-trim` reads this tolerance. IM treats `-fuzz` as a
+    // state setting that survives until the next `-fuzz`; pinning the
+    // value onto each emitted `Op::Trim` at parse time preserves the
+    // source-order semantics for the plan walker and side-channel
+    // (a later `-fuzz` does NOT retroactively rewrite an earlier
+    // `-trim`'s tolerance).
+    let mut current_fuzz: u8 = 0;
 
     let mut i = 0;
     while i < args.len() {
@@ -311,6 +319,26 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                     bg: current_bg,
                 });
                 i += 2;
+            }
+            // `-fuzz N[%]` updates the in-band fuzz state. IM's grammar
+            // accepts either a raw byte value (`0..=255`) or a percent
+            // (`N%`, `0..=100`) — share the `-threshold` / `-solarize`
+            // parser. The flag itself produces no `Op`; it only mutates
+            // `current_fuzz`, which a following `-trim` reads.
+            "-fuzz" => {
+                let v = val(i + 1)?;
+                current_fuzz = parse_threshold_pct(v)
+                    .map_err(|e| Error::invalid(format!("convert: -fuzz: {e}")))?;
+                i += 2;
+            }
+            // `-trim` (valueless) — auto-crop the bounding box of pixels
+            // differing from the corner-pixel reference background by
+            // more than the active `-fuzz` tolerance. The tolerance is
+            // captured at parse time so source-order semantics survive
+            // through the plan walker and the inline side-channel.
+            "-trim" => {
+                ops.push(Op::Trim { fuzz: current_fuzz });
+                i += 1;
             }
             // ---- Round-next: IM-style image-filter flags wired
             // through to the matching `oxideav-image-filter` factory. ----
@@ -3160,5 +3188,108 @@ mod tests {
     fn aa_non_integer_rejected() {
         let err = parse(&to_vec(&["in.stl", "-aa", "2.5", "out.png"])).unwrap_err();
         assert!(format!("{err:?}").contains("not a positive integer"));
+    }
+
+    // ---- -trim / -fuzz ----
+
+    /// Bare `-trim` (no preceding `-fuzz`) lands as `Op::Trim { fuzz: 0 }` —
+    /// IM's default exact-match background detection.
+    #[test]
+    fn trim_default_fuzz_is_zero() {
+        let p = parse(&to_vec(&["a.png", "-trim", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Trim { fuzz: 0 }]);
+    }
+
+    /// `-fuzz N` updates state but emits no op of its own; the next
+    /// `-trim` captures the value.
+    #[test]
+    fn fuzz_byte_then_trim_captures_value() {
+        let p = parse(&to_vec(&["a.png", "-fuzz", "12", "-trim", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Trim { fuzz: 12 }]);
+    }
+
+    /// `-fuzz N%` accepts the IM percent grammar and maps `100%` to
+    /// `255`. `10%` ≈ `26` (`10 × 2.55` rounded).
+    #[test]
+    fn fuzz_percent_then_trim_captures_scaled_value() {
+        let p = parse(&to_vec(&["a.png", "-fuzz", "10%", "-trim", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Trim { fuzz: 26 }]);
+        let p = parse(&to_vec(&["a.png", "-fuzz", "100%", "-trim", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Trim { fuzz: 255 }]);
+    }
+
+    /// A `-fuzz` placed AFTER a `-trim` does NOT retroactively rewrite
+    /// the earlier trim's tolerance (source-order semantics, identical to
+    /// `-background` + `-extent`). The second `-trim` then captures the
+    /// new fuzz.
+    #[test]
+    fn fuzz_after_trim_only_affects_following_trim() {
+        let p = parse(&to_vec(&[
+            "a.png", "-fuzz", "5", "-trim", "-fuzz", "20", "-trim", "b.png",
+        ]))
+        .unwrap();
+        assert_eq!(p.ops, vec![Op::Trim { fuzz: 5 }, Op::Trim { fuzz: 20 }]);
+    }
+
+    /// `-fuzz` with no preceding-or-following `-trim` is a recorded
+    /// state-only setting — no Op emitted, no error.
+    #[test]
+    fn fuzz_without_trim_is_no_op() {
+        let p = parse(&to_vec(&["a.png", "-fuzz", "30", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![]);
+    }
+
+    /// `-fuzz` requires a value; missing → clean "missing value" error.
+    #[test]
+    fn fuzz_missing_value_rejected() {
+        let err = parse(&to_vec(&["a.png", "-fuzz"])).unwrap_err();
+        assert!(format!("{err:?}").contains("missing value"));
+    }
+
+    /// `-fuzz` rejects garbage with the same shape as `-threshold`.
+    #[test]
+    fn fuzz_garbage_rejected() {
+        let err = parse(&to_vec(&["a.png", "-fuzz", "xyz", "-trim", "b.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("-fuzz"));
+    }
+
+    /// `-fuzz N%` with `N` outside `[0, 100]` is rejected (same shape as
+    /// `-threshold` / `-solarize`).
+    #[test]
+    fn fuzz_percent_out_of_range_rejected() {
+        let err = parse(&to_vec(&["a.png", "-fuzz", "150%", "-trim", "b.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("out of range"));
+    }
+
+    /// `-fuzz N` with `N > 255` is rejected (raw bytes only go up to
+    /// `255`; the percent grammar is the documented escape hatch).
+    #[test]
+    fn fuzz_byte_above_255_rejected() {
+        let err = parse(&to_vec(&["a.png", "-fuzz", "300", "-trim", "b.png"])).unwrap_err();
+        assert!(format!("{err:?}").contains("out of range"));
+    }
+
+    /// `-trim` composes with surrounding ops in source order — typical
+    /// IM idiom `convert in.png -trim +repage out.png` would land trim
+    /// between any prior `-resize` and a downstream `-strip`. Pins the
+    /// no-implicit-reorder contract.
+    #[test]
+    fn trim_keeps_source_order_with_neighbours() {
+        let p = parse(&to_vec(&[
+            "a.png", "-resize", "100x100", "-fuzz", "8", "-trim", "-strip", "b.png",
+        ]))
+        .unwrap();
+        assert_eq!(
+            p.ops,
+            vec![
+                Op::Resize {
+                    width: 100,
+                    height: 100,
+                    mode: ResizeMode::Default,
+                },
+                Op::Trim { fuzz: 8 },
+                Op::Strip,
+            ]
+        );
     }
 }

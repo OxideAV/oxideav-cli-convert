@@ -384,6 +384,16 @@ pub enum Op {
         y: i32,
         bg: [u8; 4],
     },
+    /// `-trim` — auto-crop to the bounding box of pixels that differ
+    /// from a reference background colour by more than `fuzz` per
+    /// channel. The reference colour is the input's `(0, 0)` pixel
+    /// (matching IM's behaviour when no `-bordercolor`/`-background`
+    /// override is set). `fuzz` defaults to `0` (exact match); a
+    /// preceding `-fuzz N[%]` flag updates the value carried on this
+    /// op at args-parse time, so source order is preserved (`-fuzz 10
+    /// -trim -fuzz 0 -trim` lands as `Trim { fuzz: 10 }, Trim { fuzz:
+    /// 0 }`).
+    Trim { fuzz: u8 },
 }
 
 /// A printf-style multi-output template. Detected by the args parser

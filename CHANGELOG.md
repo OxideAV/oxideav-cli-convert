@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `-trim` (valueless) paired with `-fuzz N[%]` — IM's auto-crop op
+  that collapses an image down to the bounding box of pixels
+  differing from the corner-pixel reference background by more
+  than the active `-fuzz` tolerance. The `-fuzz` flag updates a
+  parser-state value rather than emitting an op of its own; a
+  following `-trim` captures the value at parse time so source-
+  order semantics survive into the plan walker (`-fuzz 5 -trim
+  -fuzz 20 -trim` lands as two trims with two distinct
+  tolerances, not one). Accepts both the raw byte grammar
+  (`-fuzz 12`, `0..=255`) and IM's percent grammar (`-fuzz 10%`,
+  `0..=100%` → `0..=255` rounded). Wired through three paths:
+  the args parser (new `Op::Trim { fuzz }` variant + per-flag
+  state plumbing), the generic pipeline path (`video.trim`
+  factory in `oxideav-image-filter`), and the inline PDF /
+  mesh3d side-channel (new shape-recovering helper in
+  `pixel_xform` that inverts the packed-plane stride to read
+  back the trimmed dimensions, since the bbox isn't known at
+  apply-time). Uniform-background inputs collapse to a
+  representable `1x1` frame per the factory contract.
+
 - `-monochrome` — IM's valueless shorthand that emits a 1-bit
   black-and-white image with Floyd-Steinberg error diffusion. Lowers
   to the canonical primitive chain

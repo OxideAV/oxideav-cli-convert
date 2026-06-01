@@ -43,6 +43,8 @@ rest of the workspace already knows how to do.
 | `-solarize N[%]` | invert above threshold |
 | `-colorspace gray\|grey\|rgb\|srgb` | `gray`/`grey` → grayscale factory; `rgb`/`srgb` no-op |
 | `-monochrome` | valueless IM shorthand for `-colorspace gray -colors 2 -dither floyd_steinberg` (1-bit B/W with error diffusion); always emits `floyd_steinberg` regardless of any prior `-dither none` |
+| `-fuzz N[%]` | tolerance state for the next `-trim`; bytes (`0..=255`) or percent (`0..=100%` → `0..=255` rounded); no op emitted in isolation |
+| `-trim` | auto-crop to the bounding box of pixels differing from the corner-pixel reference background by more than the active `-fuzz` tolerance; uniform-background inputs collapse to a `1x1` representable frame |
 
 The geometry / negate / tonal ops above all wire through to the
 matching `oxideav-image-filter` factory on the regular pipeline path
