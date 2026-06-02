@@ -13,6 +13,75 @@ use crate::op::{
 };
 use oxideav_core::Error;
 
+/// Every flag the parser below recognises, stored without the leading
+/// dash(es). Single-dash IM-style ops AND the double-dash GNU-style
+/// modes (`--probe`, `--json`, `--watch`) both land in here; the
+/// caller reattaches whichever lead the user typed when rendering a
+/// suggestion. Kept as a flat sorted slice rather than a `HashSet`
+/// because the list is small (~55 entries), the lookup is a single
+/// scan inside the Levenshtein helper, and a sorted slice is trivial
+/// to keep aligned with the `match` arms below.
+///
+/// MUST stay in sync with the `match flag.as_str()` arms in [`parse`].
+/// A flag missing from this table downgrades the suggestion quality
+/// (the user mistypes a real flag and gets no hint) but doesn't break
+/// parsing, so the worst case is a quiet UX regression — easy to spot
+/// in review.
+const KNOWN_FLAG_NAMES: &[&str] = &[
+    "aa",
+    "alpha",
+    "auto-gamma",
+    "background",
+    "bg",
+    "blur",
+    "brightness-contrast",
+    "camera",
+    "colorize",
+    "colors",
+    "colorspace",
+    "contrast",
+    "crop",
+    "define",
+    "density",
+    "dither",
+    "edge",
+    "equalize",
+    "extent",
+    "flip",
+    "flop",
+    "format",
+    "fov",
+    "fuzz",
+    "gamma",
+    "gltf-format",
+    "json",
+    "level",
+    "light",
+    "modulate",
+    "monochrome",
+    "negate",
+    "normalize",
+    "ping",
+    "posterize",
+    "probe",
+    "projection",
+    "quality",
+    "render",
+    "resize",
+    "rotate",
+    "sepia",
+    "sharpen",
+    "solarize",
+    "stl-format",
+    "strip",
+    "thumbnail",
+    "threshold",
+    "trim",
+    "unsharp",
+    "vignette",
+    "watch",
+];
+
 /// Parse the slice that comes after `oxideav convert`.
 ///
 /// Returns a `ConvertPlan` on success or an `Error::Invalid` /
@@ -602,8 +671,28 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
             }
             other => {
                 // Reach here only on `-`-prefixed args (non-`-` was
-                // pushed to `positionals` above).
-                return Err(Error::invalid(format!("convert: unknown flag '{other}'")));
+                // pushed to `positionals` above). Add a "did you mean?"
+                // hint when the bogus token is a close edit of a known
+                // flag — same Levenshtein-cutoff helper the mesh3d-runner
+                // uses for extension typos. We strip the leading dashes
+                // before comparing so `-quailty` matches `-quality` at a
+                // 2-edit distance (transposition) instead of being
+                // scored 3 because of the dash overhead, and we
+                // reattach the same dash flavour (single or double) the
+                // user typed when rendering the suggestion. Unknown
+                // tokens that aren't close to any flag (e.g. `-fnord`)
+                // produce the bare error, exactly as before.
+                let (lead, bare) = if let Some(rest) = other.strip_prefix("--") {
+                    ("--", rest)
+                } else {
+                    ("-", other.strip_prefix('-').unwrap_or(other))
+                };
+                let hint = crate::suggest::closest_match(bare, KNOWN_FLAG_NAMES)
+                    .map(|s| format!(" (did you mean '{lead}{s}'?)"))
+                    .unwrap_or_default();
+                return Err(Error::invalid(format!(
+                    "convert: unknown flag '{other}'{hint}"
+                )));
             }
         }
     }
@@ -2294,7 +2383,48 @@ mod tests {
     #[test]
     fn unknown_flag_errors() {
         let err = parse(&to_vec(&["a.png", "-fnord", "42", "b.png"])).unwrap_err();
-        assert!(format!("{err:?}").contains("unknown flag"));
+        let msg = format!("{err:?}");
+        assert!(msg.contains("unknown flag"));
+        // `-fnord` isn't close enough to any known flag — no hint clause.
+        assert!(
+            !msg.contains("did you mean"),
+            "distant token should not get a hint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_flag_typo_suggests_close_match() {
+        // Single-letter transposition of `-quality`.
+        let err = parse(&to_vec(&["a.png", "-quailty", "90", "b.jpg"])).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("unknown flag"), "got: {msg}");
+        assert!(
+            msg.contains("did you mean '-quality'?"),
+            "expected quality suggestion, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_flag_typo_preserves_single_vs_double_dash() {
+        // `--prbe` is a 1-edit miss of `--probe`. The suggestion must
+        // reattach the same `--` lead the user typed, not a single dash.
+        let err = parse(&to_vec(&["--prbe", "in.png"])).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("unknown flag"), "got: {msg}");
+        assert!(
+            msg.contains("did you mean '--probe'?"),
+            "expected --probe suggestion with two dashes, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_flag_typo_resize_transposition() {
+        let err = parse(&to_vec(&["a.png", "-reszie", "100x100", "b.png"])).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("did you mean '-resize'?"),
+            "expected resize suggestion, got: {msg}"
+        );
     }
 
     #[test]

@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- "Did you mean?" hint on unknown-flag errors. A bogus `-`-prefixed
+  flag is matched against the full known-flag table (`-resize`,
+  `-quality`, `-colorspace`, …, plus the double-dash session modes
+  `--probe` / `--json` / `--watch`) via the existing
+  `suggest::closest_match` Levenshtein helper. Close edits emit a
+  `(did you mean '-quality'?)` clause appended to the bare
+  `unknown flag 'X'` error; distant typos (`-fnord`) get the bare
+  error unchanged. The lead the user typed is preserved on the
+  suggestion — `--prbe` reattaches `--` to suggest `--probe`,
+  `-quailty` reattaches `-` to suggest `-quality` — so the hint is
+  copy-paste-correct. The known-flag table is a single sorted slice
+  near the top of `args.rs` that must stay in sync with the parser's
+  match arms; a flag missing from the table just downgrades hint
+  quality on its own typos. Adds three unit tests pinning the
+  transposition (`-quailty` → `-quality`, `-reszie` → `-resize`)
+  and the dash-flavour-preservation (`--prbe` → `--probe`) cases,
+  plus a negative-assert on the existing `-fnord` test confirming
+  distant tokens still produce no hint.
+
 - `-trim` (valueless) paired with `-fuzz N[%]` — IM's auto-crop op
   that collapses an image down to the bounding box of pixels
   differing from the corner-pixel reference background by more

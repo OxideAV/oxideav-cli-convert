@@ -288,9 +288,26 @@ $ oxideav convert model.gtlf out.obj
 convert: no 3D decoder registered for input extension '.gtlf' (did you mean '.gltf'?) (known: .stl, .obj, .gltf, .glb, .usdz, .mtl)
 ```
 
-The hint fires when the bad extension is within `max(2, len/3)` edits
-of one of the supported set; unrelated typos (`.png` vs the 3D set)
-get the base error with no misleading suggestion.
+The same helper now also fires on unknown-flag errors, so a
+mistyped op (`-quailty`, `-reszie`, `--prbe`) gets a copy-paste
+correct suggestion instead of a bare "unknown flag" message:
+
+```
+$ oxideav convert a.png -quailty 90 b.jpg
+convert: unknown flag '-quailty' (did you mean '-quality'?)
+
+$ oxideav convert --prbe in.png
+convert: unknown flag '--prbe' (did you mean '--probe'?)
+```
+
+The lead the user typed (single vs double dash) is preserved on the
+suggestion so it works without further edit. Distant tokens
+(`-fnord`, `--xyzzy`) get the bare unknown-flag error with no
+misleading hint.
+
+The hint fires when the bad extension / flag is within `max(2, len/3)`
+edits of one of the supported set; unrelated typos (`.png` vs the
+3D set) get the base error with no misleading suggestion.
 
 ## Round-3 follow-ups
 
