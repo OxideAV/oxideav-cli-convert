@@ -84,6 +84,9 @@ pub fn apply_pixel_transform_chain(mut img: RgbaImage, ops: &[Op]) -> Result<Rgb
             } => {
                 img = extent(img, *width, *height, *x, *y, *bg)?;
             }
+            Op::Roll { dx, dy } => {
+                roll(&mut img, *dx, *dy);
+            }
             Op::Negate => {
                 negate(&mut img);
             }
@@ -384,6 +387,55 @@ pub fn flop(img: &mut RgbaImage) {
                 img.pixels.swap(lo + k, hi + k);
             }
         }
+    }
+}
+
+/// Circular pixel shift. `dx` shifts columns to the right by `dx`
+/// pixels (negative = left); `dy` shifts rows down by `dy` pixels
+/// (negative = up). Pixels that fall off one edge wrap around to the
+/// opposite edge — width / height / stride are unchanged.
+///
+/// Both offsets are reduced mod the corresponding dimension before
+/// applying, so a `dx` of `width + 3` shifts by exactly `3`. The
+/// implementation rebuilds the pixel buffer in place via two
+/// in-buffer-rotates (one per axis) — `O(width * height * bpp)` per
+/// axis, no allocations beyond a single one-row scratch.
+pub fn roll(img: &mut RgbaImage, dx: i32, dy: i32) {
+    let w = img.width as usize;
+    let h = img.height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let bpp = bpp(img);
+    let stride = img.stride;
+    // `rem_euclid` returns a non-negative remainder, so we don't have
+    // to special-case negative `dx`/`dy`.
+    let shift_x = (dx as i64).rem_euclid(w as i64) as usize;
+    let shift_y = (dy as i64).rem_euclid(h as i64) as usize;
+
+    // Horizontal pass — rotate each row to the right by `shift_x`
+    // pixels in place. Use `slice::rotate_right` over the byte-level
+    // row to keep things allocation-free.
+    if shift_x != 0 {
+        let byte_shift = shift_x * bpp;
+        let row_bytes = w * bpp;
+        for row in 0..h {
+            let base = row * stride;
+            // Only the leading `row_bytes` of each row are pixel data
+            // — any tail (stride > row_bytes) is padding we leave
+            // untouched.
+            img.pixels[base..base + row_bytes].rotate_right(byte_shift);
+        }
+    }
+
+    // Vertical pass — rotate the rows themselves down by `shift_y`
+    // rows. Operate on the leading `h * stride` byte block and use
+    // `slice::rotate_right` over `row_bytes`-sized chunks via a
+    // step-by-step pass with a single scratch row.
+    if shift_y != 0 {
+        let total = h * stride;
+        let byte_shift = shift_y * stride;
+        img.pixels[..total].rotate_right(byte_shift);
     }
 }
 
@@ -1223,5 +1275,97 @@ mod tests {
         assert_eq!(out.height, 1);
         // The retained pixel is the corner reference itself.
         assert_eq!(&out.pixels[..4], &bg[..]);
+    }
+
+    // ---- roll ----
+
+    /// Shifting the 2x2 fixture by `+1+0` moves each column one to the
+    /// right and wraps the rightmost column around to column 0.
+    #[test]
+    fn roll_positive_x_wraps_columns() {
+        let mut img = img_2x2_rgba();
+        roll(&mut img, 1, 0);
+        // Column 1 (formerly RHS) is now column 0.
+        assert_eq!(pixel(&img, 0, 0), [0x20, 0x21, 0x22, 0xff]);
+        assert_eq!(pixel(&img, 1, 0), [0x10, 0x11, 0x12, 0xff]);
+        assert_eq!(pixel(&img, 0, 1), [0x40, 0x41, 0x42, 0xff]);
+        assert_eq!(pixel(&img, 1, 1), [0x30, 0x31, 0x32, 0xff]);
+    }
+
+    /// Negative `dx` shifts left — equivalent to `dx = width - |dx|`
+    /// on a 2x2 grid, so `-1` lands at the same place as `+1` (the
+    /// only non-identity shift on a width-2 image).
+    #[test]
+    fn roll_negative_x_shifts_left() {
+        let mut img = img_2x2_rgba();
+        roll(&mut img, -1, 0);
+        assert_eq!(pixel(&img, 0, 0), [0x20, 0x21, 0x22, 0xff]);
+        assert_eq!(pixel(&img, 1, 0), [0x10, 0x11, 0x12, 0xff]);
+    }
+
+    /// Positive `dy` shifts rows down and wraps the bottom row to the
+    /// top.
+    #[test]
+    fn roll_positive_y_wraps_rows() {
+        let mut img = img_2x2_rgba();
+        roll(&mut img, 0, 1);
+        // Row 1 is now row 0.
+        assert_eq!(pixel(&img, 0, 0), [0x30, 0x31, 0x32, 0xff]);
+        assert_eq!(pixel(&img, 1, 0), [0x40, 0x41, 0x42, 0xff]);
+        assert_eq!(pixel(&img, 0, 1), [0x10, 0x11, 0x12, 0xff]);
+        assert_eq!(pixel(&img, 1, 1), [0x20, 0x21, 0x22, 0xff]);
+    }
+
+    /// Zero shift is the identity.
+    #[test]
+    fn roll_zero_offset_is_identity() {
+        let mut img = img_2x2_rgba();
+        let before = img.pixels.clone();
+        roll(&mut img, 0, 0);
+        assert_eq!(img.pixels, before);
+    }
+
+    /// A shift larger than the dimension is reduced modulo the
+    /// dimension — `+3` on a width-2 image is the same as `+1`.
+    #[test]
+    fn roll_offset_larger_than_dim_is_modulo() {
+        let mut a = img_2x2_rgba();
+        let mut b = img_2x2_rgba();
+        roll(&mut a, 1, 0);
+        roll(&mut b, 3, 0);
+        assert_eq!(a.pixels, b.pixels);
+    }
+
+    /// Combined `dx + dy` shift: top-left corner goes to (dx, dy).
+    /// On a 4x4 board with `(+1, +1)` the original (0, 0) lands at
+    /// (1, 1).
+    #[test]
+    fn roll_combined_dx_dy_translates_corner() {
+        let mut img = checkerboard_4x4();
+        let orig = pixel(&img, 0, 0);
+        roll(&mut img, 1, 1);
+        assert_eq!(pixel(&img, 1, 1), orig);
+    }
+
+    /// Through the chain — wire `Op::Roll` through
+    /// `apply_pixel_transform_chain` to confirm the side-channel path
+    /// is plumbed.
+    #[test]
+    fn apply_chain_roll_translates_origin() {
+        let img = img_2x2_rgba();
+        let orig_0_0 = [0x10, 0x11, 0x12, 0xff];
+        let out = apply_pixel_transform_chain(img, &[Op::Roll { dx: 1, dy: 0 }]).unwrap();
+        assert_eq!(pixel(&out, 1, 0), orig_0_0);
+    }
+
+    /// A full-cycle shift (`dx = width`, `dy = height`) is the
+    /// identity — proves the modulo reduction handles the
+    /// boundary case.
+    #[test]
+    fn roll_full_cycle_is_identity() {
+        let mut img = checkerboard_4x4();
+        let before = img.pixels.clone();
+        roll(&mut img, 4, 4);
+        assert_eq!(img.pixels, before);
     }
 }

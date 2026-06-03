@@ -394,6 +394,15 @@ pub enum Op {
     /// -trim -fuzz 0 -trim` lands as `Trim { fuzz: 10 }, Trim { fuzz:
     /// 0 }`).
     Trim { fuzz: u8 },
+    /// `-roll ±X±Y` — circular pixel shift. `dx` shifts columns
+    /// to the right by `dx` pixels (negative = left); `dy` shifts
+    /// rows down by `dy` pixels (negative = up). Pixels that fall
+    /// off one edge wrap around to the opposite edge — width and
+    /// height stay unchanged, and the total pixel count is
+    /// preserved. The IM grammar requires both X and Y signed
+    /// (`-roll +5+10`, `-roll -3+2`); a single offset (`-roll +5`)
+    /// is rejected at parse time.
+    Roll { dx: i32, dy: i32 },
 }
 
 /// A printf-style multi-output template. Detected by the args parser

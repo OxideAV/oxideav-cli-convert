@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `-roll ±X±Y` — IM-style circular pixel shift. `dx` shifts columns
+  to the right by `dx` pixels (negative = left), `dy` shifts rows
+  down by `dy` pixels (negative = up); pixels that fall off one
+  edge wrap around to the opposite edge so the visible image
+  translates as a rigid block. Width and height stay unchanged.
+  Grammar mirrors `-extent`'s `±X±Y` tail (shared parser): both
+  offsets must be present and signed (`-roll +5+10`, `-roll -3+2`,
+  `-roll +5-10`); a single offset (`-roll +5`), an unsigned value
+  (`-roll 5+10`), or an empty argument is rejected at parse time
+  with a clear message. Shifts larger than the dimension are
+  reduced mod width / height by the inline implementation so
+  `-roll +width+height` is the identity. Wired through both paths:
+  the generic pipeline (`video.roll` factory in
+  `oxideav-image-filter`) and the inline PDF / mesh3d side-channel
+  (new `pixel_xform::roll` working on `RgbaImage` with both RGB-24
+  and RGBA stride layouts via two in-place `slice::rotate_right`
+  passes — one over each row, one over the row block).
+
 - `-quality` now validates the IM-conventional `0..=100` range at
   parse time. Out-of-band values (`-quality 1000`, `-quality 150`)
   previously fell through the encoder's "drop unknown key" path and

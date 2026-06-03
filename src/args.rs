@@ -68,6 +68,7 @@ const KNOWN_FLAG_NAMES: &[&str] = &[
     "quality",
     "render",
     "resize",
+    "roll",
     "rotate",
     "sepia",
     "sharpen",
@@ -424,6 +425,18 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
             "-trim" => {
                 ops.push(Op::Trim { fuzz: current_fuzz });
                 i += 1;
+            }
+            // `-roll ±X±Y` — IM-style circular pixel shift. Both X and
+            // Y offsets must be present and signed; columns wrap around
+            // the right edge when `dx > 0`, rows wrap around the bottom
+            // edge when `dy > 0`. Width / height stay unchanged. Shares
+            // the signed-offset parser used by `-extent`'s `±X±Y` tail.
+            "-roll" => {
+                let v = val(i + 1)?;
+                let (dx, dy) =
+                    parse_roll(v).map_err(|e| Error::invalid(format!("convert: -roll: {e}")))?;
+                ops.push(Op::Roll { dx, dy });
+                i += 2;
             }
             // ---- Round-next: IM-style image-filter flags wired
             // through to the matching `oxideav-image-filter` factory. ----
@@ -1234,6 +1247,20 @@ fn parse_extent_offsets(s: &str) -> Result<(i32, i32), String> {
         .parse()
         .map_err(|_| format!("'{y_str}' is not a signed integer Y offset"))?;
     Ok((x, y))
+}
+
+/// Parse the value after `-roll`. IM's canonical grammar is
+/// `±X±Y` — both offsets present, each prefixed by an explicit sign.
+/// Reuses [`parse_extent_offsets`] for the actual signed-int split so
+/// the two flags stay grammar-identical; rejects the empty / single-
+/// offset cases with the same shape of error the user sees on
+/// `-extent`. Negative offsets are accepted as-is — the inline /
+/// pipeline shift routines wrap them mod width / height.
+fn parse_roll(s: &str) -> Result<(i32, i32), String> {
+    if s.is_empty() {
+        return Err("empty offset (expected ±X±Y, e.g. +5+10)".to_string());
+    }
+    parse_extent_offsets(s)
 }
 
 /// Parse `-blur RxS` or `-blur R`. When sigma is omitted we follow
@@ -3473,6 +3500,90 @@ mod tests {
                     mode: ResizeMode::Default,
                 },
                 Op::Trim { fuzz: 8 },
+                Op::Strip,
+            ]
+        );
+    }
+
+    // ---- -roll +X+Y ----
+
+    /// Plain `-roll +X+Y` lands as `Op::Roll { dx, dy }` with both
+    /// offsets positive.
+    #[test]
+    fn roll_positive_offsets() {
+        let p = parse(&to_vec(&["a.png", "-roll", "+5+10", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Roll { dx: 5, dy: 10 }]);
+    }
+
+    /// `-roll -X-Y` accepts negative offsets unchanged — the inline
+    /// shift handles the modulo wrap, so the args layer doesn't
+    /// normalise.
+    #[test]
+    fn roll_negative_offsets() {
+        let p = parse(&to_vec(&["a.png", "-roll", "-3-7", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Roll { dx: -3, dy: -7 }]);
+    }
+
+    /// Mixed signs (`+X-Y`, `-X+Y`) ride through the same
+    /// `parse_extent_offsets` helper as `-extent`.
+    #[test]
+    fn roll_mixed_signs() {
+        let p = parse(&to_vec(&["a.png", "-roll", "+5-10", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Roll { dx: 5, dy: -10 }]);
+    }
+
+    /// Single-offset `+X` is rejected — IM requires both X and Y
+    /// signed. Mirrors the `-extent +X` rejection path.
+    #[test]
+    fn roll_single_offset_rejected() {
+        let err = parse(&to_vec(&["a.png", "-roll", "+5", "b.png"])).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("single offset"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Empty value (e.g. `-roll ""`) is rejected with a clear
+    /// message rather than silently treated as `0,0`.
+    #[test]
+    fn roll_empty_value_rejected() {
+        let err = parse(&to_vec(&["a.png", "-roll", "", "b.png"])).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("empty offset"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Unsigned `5+10` (missing leading sign) is rejected with the
+    /// IM "must start with `+` or `-`" message — IM grammar requires
+    /// the explicit sign.
+    #[test]
+    fn roll_unsigned_value_rejected() {
+        let err = parse(&to_vec(&["a.png", "-roll", "5+10", "b.png"])).unwrap_err();
+        let s = format!("{err:?}");
+        assert!(
+            s.contains("must start with `+` or `-`") || s.contains("not a signed integer"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// `-roll` preserves source order alongside neighbours — same
+    /// no-reorder contract as `-trim` / `-flip` / `-extent`.
+    #[test]
+    fn roll_keeps_source_order_with_neighbours() {
+        let p = parse(&to_vec(&[
+            "a.png", "-resize", "100x100", "-roll", "+5+5", "-strip", "b.png",
+        ]))
+        .unwrap();
+        assert_eq!(
+            p.ops,
+            vec![
+                Op::Resize {
+                    width: 100,
+                    height: 100,
+                    mode: ResizeMode::Default,
+                },
+                Op::Roll { dx: 5, dy: 5 },
                 Op::Strip,
             ]
         );

@@ -352,6 +352,15 @@ pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Erro
                 // nor `-background` is set).
                 chain = wrap(chain, "video.trim", json!({ "fuzz": fuzz }));
             }
+            Op::Roll { dx, dy } => {
+                // The `oxideav-image-filter` `Roll` factory accepts
+                // signed `dx`/`dy` (also as `x`/`y` aliases); pixels
+                // that fall off one edge wrap around to the opposite
+                // edge so the visible image translates as a rigid
+                // block. Width/height stay unchanged, so no shape
+                // recovery is needed downstream.
+                chain = wrap(chain, "video.roll", json!({ "dx": dx, "dy": dy }));
+            }
         }
     }
 
@@ -1429,6 +1438,19 @@ mod tests {
         let track = &job.outputs.values().next().unwrap().all[0];
         let f = find_filter(&track.input, "video.trim").expect("video.trim node");
         assert_eq!(f.params["fuzz"], 0);
+    }
+
+    /// `Op::Roll` lowers to a `video.roll` FilterNode carrying the
+    /// signed `dx`/`dy` shift values. The image-filter factory
+    /// recognises both `dx`/`dy` and the `x`/`y` aliases; we forward
+    /// the canonical pair.
+    #[test]
+    fn roll_lowers_to_video_roll() {
+        let job = plan_to_job(&plan_with(vec![Op::Roll { dx: 5, dy: -10 }]), &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let f = find_filter(&track.input, "video.roll").expect("video.roll node");
+        assert_eq!(f.params["dx"], 5);
+        assert_eq!(f.params["dy"], -10);
     }
 
     #[test]
