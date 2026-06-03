@@ -18,7 +18,7 @@ rest of the workspace already knows how to do.
 | `-edge R` | Sobel magnitude |
 | `-colors N` + `-dither {none\|bayer\|floyd_steinberg}` | palette quantisation via `pixfmt → Pal8` |
 | `-format FMT` | bypass extension-based codec/container detection |
-| `-quality N` | forwarded to the sink codec when supported (JPG, WebP, …) |
+| `-quality N` | `0..=100`; forwarded to the sink codec when supported (JPG, WebP, …); out-of-range values reject at parse time |
 | `-strip` | drop metadata on write |
 | `-density N` | DPI for vector→raster (default 72; PDF / SVG inputs only) |
 | `-background COLOR` | canvas + alpha-flatten background (CSS L3 named + `#hex` 3/4/6/8) |

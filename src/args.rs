@@ -265,6 +265,22 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                         "convert: -quality: '{v}' is not a non-negative integer"
                     ))
                 })?;
+                // IM-conventional cap: every lossy codec convert
+                // forwards `-quality` to (JPEG, WebP, AVIF, …) expects
+                // `0..=100`. Without this guard `-quality 9999` and
+                // `-quality 150` silently propagate and the encoder
+                // drops the key — looking to the user like the flag
+                // was honoured. Reject up-front with a clear range so
+                // the typo (`-quality 1000` instead of `-quality 100`)
+                // surfaces at parse time. The 0/100 endpoints stay
+                // accepted: 0 is "smallest acceptable" on JPEG and
+                // 100 is "highest". Out-of-band values were never
+                // useful — codecs ignore them.
+                if q > 100 {
+                    return Err(Error::invalid(format!(
+                        "convert: -quality: {q} out of range (must be in 0..=100; common values: 75 default, 85 web, 95 archival)"
+                    )));
+                }
                 ops.push(Op::Quality(q));
                 i += 2;
             }
@@ -2437,6 +2453,45 @@ mod tests {
     fn quality_strip() {
         let p = parse(&to_vec(&["a.png", "-quality", "85", "-strip", "b.jpg"])).unwrap();
         assert_eq!(p.ops, vec![Op::Quality(85), Op::Strip]);
+    }
+
+    #[test]
+    fn quality_zero_and_hundred_accepted() {
+        // Endpoints stay accepted: 0 is JPEG's "smallest acceptable",
+        // 100 is "highest"; both round-trip through the parser.
+        let p0 = parse(&to_vec(&["a.png", "-quality", "0", "b.jpg"])).unwrap();
+        assert_eq!(p0.ops, vec![Op::Quality(0)]);
+        let p100 = parse(&to_vec(&["a.png", "-quality", "100", "b.jpg"])).unwrap();
+        assert_eq!(p100.ops, vec![Op::Quality(100)]);
+    }
+
+    #[test]
+    fn quality_out_of_range_rejected() {
+        // The common typo case (1000 instead of 100); without this
+        // guard the encoder silently dropped the over-range value.
+        let err = parse(&to_vec(&["a.png", "-quality", "1000", "b.jpg"])).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("-quality") && msg.contains("out of range"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("0..=100"),
+            "must point at the legal range; got: {msg}"
+        );
+        // And the tame just-over-100 case (150 instead of 100):
+        let err = parse(&to_vec(&["a.png", "-quality", "150", "b.jpg"])).unwrap_err();
+        assert!(format!("{err:?}").contains("out of range"));
+    }
+
+    #[test]
+    fn quality_non_numeric_rejected() {
+        // Negative integers + non-numeric strings still hit the
+        // pre-cap parse-error branch with the existing message.
+        let err = parse(&to_vec(&["a.png", "-quality", "-5", "b.jpg"])).unwrap_err();
+        assert!(format!("{err:?}").contains("not a non-negative integer"));
+        let err = parse(&to_vec(&["a.png", "-quality", "high", "b.jpg"])).unwrap_err();
+        assert!(format!("{err:?}").contains("not a non-negative integer"));
     }
 
     #[test]

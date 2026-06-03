@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `-quality` now validates the IM-conventional `0..=100` range at
+  parse time. Out-of-band values (`-quality 1000`, `-quality 150`)
+  previously fell through the encoder's "drop unknown key" path and
+  looked to the user like the flag had been honoured; they now emit
+  a clear `convert: -quality: N out of range (must be in 0..=100;
+  common values: 75 default, 85 web, 95 archival)` error. Endpoints
+  `0` (JPEG's smallest acceptable) and `100` (highest) stay
+  accepted; the existing non-numeric / negative-integer path
+  (`-quality high`, `-quality -5`) still trips the pre-cap
+  `not a non-negative integer` branch with its original message.
+  Pinned by three new args-parser tests covering the
+  endpoints-accepted, over-range-rejected, and non-numeric-
+  unchanged contracts.
+
 - "Did you mean?" hint on unknown-flag errors. A bogus `-`-prefixed
   flag is matched against the full known-flag table (`-resize`,
   `-quality`, `-colorspace`, …, plus the double-dash session modes
