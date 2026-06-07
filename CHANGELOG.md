@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.4...v0.0.5) - 2026-06-07
+
+### Added
+
+- *(convert)* -roll ±X±Y — IM-style circular pixel shift
+- *(convert)* -quality validates 0..=100 at parse time
+- *(convert)* 'did you mean?' hint on unknown -flag errors
+- *(convert)* -trim + -fuzz N[%] — IM auto-crop with tolerance state
+- *(convert)* -monochrome — IM 1-bit B/W shorthand (gray + 2 colors + Floyd-Steinberg)
+- *(convert)* -extent WxH[±X±Y] — canvas re-window with active background
+- *(convert)* comma-list + negative page-selector atoms
+- *(convert)* .ico output + -define icon:auto-resize multi-resolution
+- *(convert)* debug render modes (normal/depth) + N×N supersampling AA
+- *(convert)* gouraud/phong shading + camera/light/projection/fov/bg + FBX wire
+- *(convert)* wire USDZ encoder + 3D→raster software renderer
+- *(convert)* -resize geometry suffixes + -thumbnail + -define
+- *(convert)* --probe --watch + did-you-mean hints for unknown extensions
+- *(convert)* --probe surfaces PDF /Info, mesh3d per-mesh detail, container metadata
+- *(convert)* --probe dry-run structural inspection (+--json)
+- *(convert)* -stl-format and -gltf-format encoder option flags
+- *(convert)* 3D-asset side-channel — STL/OBJ/glTF/GLB/USDZ
+- *(convert)* -vignette / -colorize / -equalize / -auto-gamma + PDF tonal-op side-channel
+- *(convert)* IM tonal / colour-grading flags wired to image-filter
+- *(convert)* -rotate / -flip / -flop / -crop / -negate inline ops
+- *(convert)* -ping flag for IM-style header-only inspection
+
+### Fixed
+
+- *(convert)* revert pdf_runner BMP API change
+
+### Other
+
+- *(mesh3d)* route renderer through oxideav-render::make_renderer
+- wildcard arm for non-exhaustive SourceOutput
+- bump oxideav-webp pin 0.1 → 0.2
+- *(convert)* pin PDF→raster DPI math + headline-command end-to-end
+- stub encode_webp after oxideav-webp clean-room rebuild
+- ico_out test: replace 5-tuple with named DirEntry struct for clippy
+- absorb oxideav-bmp 0.1.3 BmpImage.palette + encode_bmp tuple return
+- drop alias table — registry is the only source of truth
+- registry-driven output codec lookup via ContainerRegistry
+- rustfmt sweep on round-2 PDF / fan-out additions
+- bump oxideav-webp dep to 0.1 (published)
+- bump oxideav-pdf dep to 0.1 (published)
+- refresh for PDF / page selectors / multi-format fan-out
+- round 2: page selector + multi-format raster fan-out + SVG/PDF page extraction
+- add PDF input + Scene-aware fan-out for ImageMagick-style PDF rendering
+
 ### Added
 
 - `-roll ±X±Y` — IM-style circular pixel shift. `dx` shifts columns
