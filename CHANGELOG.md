@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `plan_to_render3d_job(plan, ctx)` — Phase C-3b auto-route plumbing
+  for the 3D-asset → raster path. Builds an `oxideav_pipeline::Job`
+  whose only track input is a `TrackInput::Render3D` node (the
+  pipeline-side bridge landed in oxideav-pipeline 0.1.10). The
+  `opts` JSON carried on the node mirrors `oxideav_render::RenderOptions`
+  field-by-field — `width` / `height` / `background` are always
+  populated (canvas seeded from `-resize WxH`, default 1024 × 1024;
+  `background` seeded from `-bg`, falling back to the last
+  `-background` Op, default transparent black). `shading`,
+  `projection`, `fov_deg`, `light`, `camera`, and `aa` are emitted
+  only when the user pinned them via the matching per-format flag,
+  so the C-3e callback can fall back to the renderer's own defaults
+  for any field the user didn't set rather than re-encoding those
+  defaults here. `Op::Resize` and `Op::Background` are absorbed by
+  the renderer and stripped from the post-render filter chain to
+  avoid double-application; every other op rides the same chain
+  walker `plan_to_job` already emits. The runtime path (`lib.rs::run`
+  → `mesh3d_render::run`) stays unchanged today; the flip onto
+  `Executor::with_render_source_factory(...).run()` lands behind the
+  C-3e callback wiring.
+- `plan_to_job::RENDER3D_DEFAULT_BACKEND` constant ("scanline"), so
+  the C-3e callback dispatches on the same backend-name string the
+  helper writes into `TrackInput::Render3D.backend`.
+
+### Other
+
+- Factor the per-op filter-chain walker out of `plan_to_job` into a
+  private `build_job_from_initial` so `plan_to_render3d_job` reuses
+  the identical sink-side rules (`-strip` / `-quality` / `-format`)
+  without duplicating the 25-arm `match`.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.4...v0.0.5) - 2026-06-07
 
 ### Added

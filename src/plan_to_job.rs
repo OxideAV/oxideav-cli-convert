@@ -8,12 +8,43 @@
 //! the input (just a video stream for a PNG, both audio + video for
 //! an MP4) and dispatches filters to the matching `FilterKind` at
 //! DAG-build time.
+//!
+//! ## 3D-input auto-route (Phase C-3b)
+//!
+//! [`plan_to_render3d_job`] builds a Job whose track input is a
+//! [`TrackInput::Render3D`] node — the pipeline-side bridge for the
+//! 3D-asset → raster path that today's `mesh3d_render::run` covers via
+//! a direct in-process renderer. The companion C-3e step (cli-convert
+//! installs a [`oxideav_pipeline::RenderSourceFactory`] on the
+//! executor and flips `lib.rs::run` over) consumes this helper. Until
+//! that flip lands the existing `mesh3d_render::run` stays the live
+//! path; this helper is the plumbing it will switch onto.
 
-use crate::op::{ConvertPlan, Dither, Op};
+use crate::op::{ConvertPlan, Dither, Mesh3DOptions, Mesh3DRenderMode, Op, ProjectionMode};
 use indexmap::IndexMap;
 use oxideav_core::{Error, RuntimeContext};
-use oxideav_pipeline::{FilterNode, Job, OutputSpec, SourceRef, TrackInput, TrackSpec};
+use oxideav_pipeline::{
+    FilterNode, Job, OutputSpec, Render3DNode, SourceRef, TrackInput, TrackSpec,
+};
 use serde_json::{json, Value};
+
+/// Default canvas size for the 3D→raster path when no `-resize` flag
+/// pins it. Mirrors [`crate::mesh3d_render`]'s `DEFAULT_WIDTH` /
+/// `DEFAULT_HEIGHT` so the two routes (direct + pipeline) frame the
+/// scene identically.
+const RENDER3D_DEFAULT_WIDTH: u32 = 1024;
+const RENDER3D_DEFAULT_HEIGHT: u32 = 1024;
+
+/// Default `-bg` background fill when neither `-bg` nor `-background`
+/// is set: transparent black. Matches [`crate::mesh3d_render`]'s
+/// `DEFAULT_BG`.
+const RENDER3D_DEFAULT_BG: [u8; 4] = [0, 0, 0, 0];
+
+/// Backend id baked into [`TrackInput::Render3D::backend`] today. Only
+/// `oxideav-render`'s scanline rasteriser exists; Phase D / E will add
+/// raycast / pathtrace selectors. Centralised so the C-3e callback
+/// dispatches on the same name string.
+pub const RENDER3D_DEFAULT_BACKEND: &str = "scanline";
 
 /// Build a [`Job`] from a [`ConvertPlan`].
 ///
@@ -23,6 +54,215 @@ use serde_json::{json, Value};
 /// `oxideav-dds`) automatically extend the supported output set without
 /// needing a hard-coded entry here.
 pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Error> {
+    // Starting input: the file itself.
+    let initial: TrackInput = TrackInput::Source(SourceRef {
+        from: plan.input.clone(),
+    });
+    build_job_from_initial(plan, ctx, initial, &plan.ops)
+}
+
+/// Build a [`Job`] whose track input is a [`TrackInput::Render3D`] node
+/// — the pipeline-side bridge for the 3D-asset → raster path.
+///
+/// Phase C-3b: this returns the Job shape the C-3e callback flip will
+/// hand to [`oxideav_pipeline::Executor`]. The executor consults the
+/// installed [`oxideav_pipeline::RenderSourceFactory`] (set via
+/// [`oxideav_pipeline::Executor::with_render_source_factory`]) to
+/// materialise the [`TrackInput::Render3D`] leaf into a concrete
+/// [`oxideav_core::FrameSource`].
+///
+/// ## Opts shape
+///
+/// The `opts` JSON carried on the Render3D node mirrors
+/// [`oxideav_render::RenderOptions`] field-by-field so the C-3e
+/// callback can deserialise it directly into the renderer's option
+/// struct:
+///
+/// ```json
+/// {
+///   "width": 1024,
+///   "height": 1024,
+///   "background": [0, 0, 0, 0],
+///   "shading": "flat",          // optional; "flat"|"gouraud"|"phong"|"wireframe"|"normal-debug"|"depth-debug"
+///   "projection": "perspective",// optional; "perspective"|"orthographic"
+///   "fov_deg": 60.0,            // optional; required for perspective
+///   "light": { "azimuth_deg": ..., "elevation_deg": ..., "intensity": ... }, // optional
+///   "camera": { "elevation_deg": ..., "azimuth_deg": ..., "distance": ... }, // optional
+///   "aa": 1                     // optional; 1..=8
+/// }
+/// ```
+///
+/// ## Op absorption
+///
+/// `Op::Resize { width, height, .. }` and `Op::Background(color)` are
+/// absorbed by the renderer (width/height seed the canvas dims; the
+/// background pre-fills the framebuffer) and therefore stripped from
+/// the post-render filter chain — same policy
+/// [`crate::mesh3d_render::run`] applies via `pick_dims` /
+/// `pick_render_bg`. `-bg` (carried on [`Mesh3DOptions::bg`]) wins
+/// over `-background` to keep the renderer-clear vs. canvas-fill
+/// colours separate.
+///
+/// Every other op flows through the standard filter-chain walker.
+///
+/// ## When the Render3D variant is unavailable
+///
+/// The Render3D variant landed in oxideav-pipeline 0.1.10. Callers
+/// built against older pipeline patches see a missing variant at
+/// compile time; we depend on `oxideav-pipeline = "0.1"` so the
+/// version resolved against the workspace always carries it.
+pub fn plan_to_render3d_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Error> {
+    let (width, height) = pick_render_dims(&plan.ops);
+    let bg = pick_render_bg(&plan.ops, &plan.mesh3d_options);
+    let opts = build_render3d_opts_json(&plan.mesh3d_options, width, height, bg);
+
+    let initial = TrackInput::Render3D(Render3DNode {
+        source: plan.input.clone(),
+        backend: RENDER3D_DEFAULT_BACKEND.to_string(),
+        opts,
+    });
+
+    // The renderer absorbs `-resize` (canvas seed) and `-background`
+    // (framebuffer clear). Drop them from the post-render filter chain
+    // so the pipeline doesn't double-apply them.
+    let remaining_ops: Vec<Op> = plan
+        .ops
+        .iter()
+        .filter(|op| !is_op_absorbed_by_renderer(op))
+        .cloned()
+        .collect();
+
+    build_job_from_initial(plan, ctx, initial, &remaining_ops)
+}
+
+/// Return `true` for ops whose effect is already applied by the 3D
+/// renderer (canvas seed / framebuffer clear). Stripped from the
+/// post-render filter chain to avoid double-application.
+fn is_op_absorbed_by_renderer(op: &Op) -> bool {
+    matches!(op, Op::Resize { .. } | Op::Background(_))
+}
+
+/// Pick render-canvas dimensions from `-resize WxH` (any mode); falls
+/// back to [`RENDER3D_DEFAULT_WIDTH`] × [`RENDER3D_DEFAULT_HEIGHT`].
+/// Mirrors [`crate::mesh3d_render`]'s `pick_dims`.
+fn pick_render_dims(ops: &[Op]) -> (u32, u32) {
+    for op in ops.iter().rev() {
+        if let Op::Resize { width, height, .. } = op {
+            return (*width, *height);
+        }
+    }
+    (RENDER3D_DEFAULT_WIDTH, RENDER3D_DEFAULT_HEIGHT)
+}
+
+/// Pick the framebuffer clear colour: `-bg` (Mesh3DOptions::bg) wins,
+/// then the most recent `-background` op, then transparent black.
+/// Mirrors [`crate::mesh3d_render`]'s `pick_render_bg`.
+fn pick_render_bg(ops: &[Op], options: &Mesh3DOptions) -> [u8; 4] {
+    if let Some(bg) = options.bg {
+        return bg;
+    }
+    for op in ops.iter().rev() {
+        if let Op::Background(c) = op {
+            return *c;
+        }
+    }
+    RENDER3D_DEFAULT_BG
+}
+
+/// Translate [`Mesh3DOptions`] + canvas dims + bg into the opaque
+/// `opts` JSON value carried on [`TrackInput::Render3D`]. Field order
+/// and key names mirror [`oxideav_render::RenderOptions`] so the C-3e
+/// callback can deserialise it directly.
+///
+/// Optional fields are emitted only when the user set them via a
+/// per-format flag — letting the C-3e callback fall back to the
+/// renderer's own defaults when a key is absent rather than forcing
+/// us to hard-code those defaults here.
+fn build_render3d_opts_json(
+    options: &Mesh3DOptions,
+    width: u32,
+    height: u32,
+    bg: [u8; 4],
+) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("width".to_string(), json!(width));
+    obj.insert("height".to_string(), json!(height));
+    obj.insert(
+        "background".to_string(),
+        json!([bg[0], bg[1], bg[2], bg[3]]),
+    );
+    if let Some(mode) = options.render_mode {
+        obj.insert("shading".to_string(), json!(shading_tag(mode)));
+    }
+    if let Some(proj) = options.projection {
+        obj.insert("projection".to_string(), json!(projection_tag(proj)));
+    }
+    if let Some(fov) = options.fov_deg {
+        obj.insert("fov_deg".to_string(), json!(fov));
+    }
+    if let Some(light) = options.light {
+        obj.insert(
+            "light".to_string(),
+            json!({
+                "azimuth_deg": light.azimuth_deg,
+                "elevation_deg": light.elevation_deg,
+                "intensity": light.intensity,
+            }),
+        );
+    }
+    if let Some(cam) = options.camera {
+        obj.insert(
+            "camera".to_string(),
+            json!({
+                "elevation_deg": cam.elevation_deg,
+                "azimuth_deg": cam.azimuth_deg,
+                "distance": cam.distance,
+            }),
+        );
+    }
+    if let Some(aa) = options.aa {
+        obj.insert("aa".to_string(), json!(aa.clamp(1, 8)));
+    }
+    Value::Object(obj)
+}
+
+/// Lowercase tag mirroring `oxideav_render::ShadingMode`'s wire form.
+/// Hyphenated forms (`normal-debug`, `depth-debug`) match the IM-style
+/// `-render` arg and what `oxideav_render` parses on its side.
+fn shading_tag(mode: Mesh3DRenderMode) -> &'static str {
+    match mode {
+        Mesh3DRenderMode::Flat => "flat",
+        Mesh3DRenderMode::Wireframe => "wireframe",
+        Mesh3DRenderMode::Gouraud => "gouraud",
+        Mesh3DRenderMode::Phong => "phong",
+        Mesh3DRenderMode::NormalDebug => "normal-debug",
+        Mesh3DRenderMode::DepthDebug => "depth-debug",
+    }
+}
+
+/// Lowercase tag mirroring `oxideav_render::Projection`'s wire form.
+fn projection_tag(mode: ProjectionMode) -> &'static str {
+    match mode {
+        ProjectionMode::Perspective => "perspective",
+        ProjectionMode::Orthographic => "orthographic",
+    }
+}
+
+/// Shared back-end for [`plan_to_job`] + [`plan_to_render3d_job`]:
+/// walk the op list, fold each op into the recursive `TrackInput`
+/// chain (or into sink-side metadata), wire the codec, and assemble
+/// the one-output Job.
+///
+/// The two public entry points differ only in what `initial` they
+/// pass: the file-source variant for the regular path, the Render3D
+/// variant for the 3D auto-route. Op semantics + sink-side rules are
+/// identical from then on.
+fn build_job_from_initial(
+    plan: &ConvertPlan,
+    ctx: &RuntimeContext,
+    initial: TrackInput,
+    ops: &[Op],
+) -> Result<Job, Error> {
     // Walk ops, distinguishing track-side filters from sink-side
     // metadata (format / quality / strip).  Filters are flattened
     // into the recursive `TrackInput` chain; the rest are deferred
@@ -31,10 +271,7 @@ pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Erro
     let mut strip_metadata = false;
     let mut format_override: Option<String> = None;
 
-    // Starting input: the file itself.
-    let mut chain: TrackInput = TrackInput::Source(SourceRef {
-        from: plan.input.clone(),
-    });
+    let mut chain: TrackInput = initial;
 
     // A filter-chain step — wrap the current chain in a FilterNode.
     let wrap = |prev: TrackInput, filter: &str, params: Value| {
@@ -45,7 +282,7 @@ pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Erro
         })
     };
 
-    for op in &plan.ops {
+    for op in ops {
         match op {
             Op::Resize {
                 width,
@@ -1466,5 +1703,347 @@ mod tests {
         // -format with no matching registration → None (caller can
         // surface a "use -format CODEC" hint).
         assert!(codec_for_output(Some("nothing"), "out.unrelated", &ctx).is_none());
+    }
+
+    // ─────────────────── Phase C-3b: plan_to_render3d_job ───────────────────
+    //
+    // The new helper builds a Job whose track input is a
+    // TrackInput::Render3D node. The C-3e callback flip will route 3D →
+    // raster through Executor + RenderSourceFactory using this exact
+    // Job shape, so the tests pin the shape it emits.
+
+    use crate::op::{CameraSpec, LightSpec, Mesh3DOptions, Mesh3DRenderMode, ProjectionMode};
+
+    /// Plan factory tuned for 3D-input flows. Uses a .stl input + .png
+    /// output by default; callers override fields as needed.
+    fn render3d_plan(ops: Vec<Op>, options: Mesh3DOptions) -> ConvertPlan {
+        ConvertPlan {
+            input: "cube.stl".into(),
+            input_pages: None,
+            ops,
+            output: "out.png".into(),
+            output_template: None,
+            ping: false,
+            probe: false,
+            probe_json: false,
+            probe_watch: false,
+            mesh3d_options: options,
+        }
+    }
+
+    /// Pull the Render3D node out of a Job's only track. Panics if the
+    /// chain isn't rooted on a Render3D leaf (after peeling filter
+    /// wrappers).
+    fn find_render3d(track: &TrackSpec) -> &Render3DNode {
+        let mut cur = &track.input;
+        loop {
+            match cur {
+                TrackInput::Render3D(node) => return node,
+                TrackInput::Filter(f) => cur = f.input.as_ref(),
+                TrackInput::Convert(c) => cur = c.input.as_ref(),
+                TrackInput::Source(_) => {
+                    panic!("expected Render3D leaf at chain root, got Source")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render3d_job_uses_render3d_track_input_with_input_uri() {
+        // No ops, defaults everywhere — bare-bones Render3D Job.
+        let job = plan_to_render3d_job(
+            &render3d_plan(vec![], Mesh3DOptions::default()),
+            &empty_ctx(),
+        )
+        .unwrap();
+        assert_eq!(job.outputs.len(), 1);
+        let (key, out) = job.outputs.iter().next().unwrap();
+        assert_eq!(key, "out.png");
+        assert_eq!(out.all.len(), 1);
+        let node = find_render3d(&out.all[0]);
+        assert_eq!(node.source, "cube.stl");
+        assert_eq!(node.backend, RENDER3D_DEFAULT_BACKEND);
+    }
+
+    #[test]
+    fn render3d_default_opts_carry_canvas_size_and_transparent_bg() {
+        // No -resize, no -bg, no -background → 1024×1024 + RGBA zeros.
+        let job = plan_to_render3d_job(
+            &render3d_plan(vec![], Mesh3DOptions::default()),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let node = find_render3d(track);
+        assert_eq!(node.opts["width"], RENDER3D_DEFAULT_WIDTH);
+        assert_eq!(node.opts["height"], RENDER3D_DEFAULT_HEIGHT);
+        let bg = node.opts["background"]
+            .as_array()
+            .expect("background array");
+        assert_eq!(bg, &vec![json!(0), json!(0), json!(0), json!(0)]);
+    }
+
+    #[test]
+    fn render3d_resize_op_seeds_canvas_dims() {
+        // `-resize 640x480` (any mode) seeds the renderer's framebuffer
+        // size; the Resize op itself is absorbed and MUST NOT appear in
+        // the post-render filter chain.
+        let job = plan_to_render3d_job(
+            &render3d_plan(
+                vec![Op::Resize {
+                    width: 640,
+                    height: 480,
+                    mode: ResizeMode::Default,
+                }],
+                Mesh3DOptions::default(),
+            ),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let node = find_render3d(track);
+        assert_eq!(node.opts["width"], 640);
+        assert_eq!(node.opts["height"], 480);
+        // No video.resize filter on top — renderer already targeted
+        // the right dims.
+        assert!(
+            collect_filter_names(&track.input)
+                .iter()
+                .all(|n| n != "video.resize"),
+            "Resize should be absorbed by renderer, not also wired as a post-pass"
+        );
+    }
+
+    #[test]
+    fn render3d_bg_option_wins_over_background_op() {
+        // `-bg` lives on Mesh3DOptions; `-background` is an Op. The
+        // renderer reads `-bg` for the framebuffer clear; `-background`
+        // is reserved for `-alpha remove` canvas-fill. When both are
+        // set the opts carry `-bg`.
+        let job = plan_to_render3d_job(
+            &render3d_plan(
+                vec![Op::Background([99, 99, 99, 255])],
+                Mesh3DOptions {
+                    bg: Some([10, 20, 30, 200]),
+                    ..Mesh3DOptions::default()
+                },
+            ),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let node = find_render3d(track);
+        let bg = node.opts["background"].as_array().unwrap();
+        assert_eq!(bg, &vec![json!(10), json!(20), json!(30), json!(200)]);
+    }
+
+    #[test]
+    fn render3d_falls_back_to_background_op_when_bg_unset() {
+        // No `-bg`; an `-background` op is the next-most-specific
+        // source. Op is absorbed (the renderer pre-fills the
+        // framebuffer with it), so it MUST NOT appear in the
+        // post-render filter chain.
+        let job = plan_to_render3d_job(
+            &render3d_plan(
+                vec![Op::Background([7, 8, 9, 255])],
+                Mesh3DOptions::default(),
+            ),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let node = find_render3d(track);
+        let bg = node.opts["background"].as_array().unwrap();
+        assert_eq!(bg, &vec![json!(7), json!(8), json!(9), json!(255)]);
+    }
+
+    #[test]
+    fn render3d_carries_every_user_set_option_into_opts_json() {
+        // Pack every Mesh3DOptions field — the helper must round-trip
+        // each one into the opts JSON so the C-3e callback can rebuild
+        // the renderer's RenderOptions struct without losing data.
+        let options = Mesh3DOptions {
+            stl_format: None,
+            gltf_format: None,
+            render_mode: Some(Mesh3DRenderMode::Phong),
+            light: Some(LightSpec {
+                azimuth_deg: 12.0,
+                elevation_deg: 34.0,
+                intensity: 0.75,
+            }),
+            camera: Some(CameraSpec {
+                elevation_deg: 30.0,
+                azimuth_deg: 45.0,
+                distance: 1.5,
+            }),
+            projection: Some(ProjectionMode::Orthographic),
+            fov_deg: Some(45.0),
+            bg: Some([1, 2, 3, 4]),
+            aa: Some(4),
+        };
+        let job = plan_to_render3d_job(&render3d_plan(vec![], options), &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let node = find_render3d(track);
+        let o = &node.opts;
+        assert_eq!(o["shading"], "phong");
+        assert_eq!(o["projection"], "orthographic");
+        assert!((o["fov_deg"].as_f64().unwrap() - 45.0).abs() < 1e-6);
+        assert!((o["light"]["azimuth_deg"].as_f64().unwrap() - 12.0).abs() < 1e-6);
+        assert!((o["light"]["elevation_deg"].as_f64().unwrap() - 34.0).abs() < 1e-6);
+        assert!((o["light"]["intensity"].as_f64().unwrap() - 0.75).abs() < 1e-6);
+        assert!((o["camera"]["elevation_deg"].as_f64().unwrap() - 30.0).abs() < 1e-6);
+        assert!((o["camera"]["azimuth_deg"].as_f64().unwrap() - 45.0).abs() < 1e-6);
+        assert!((o["camera"]["distance"].as_f64().unwrap() - 1.5).abs() < 1e-6);
+        assert_eq!(o["aa"], 4);
+    }
+
+    #[test]
+    fn render3d_opts_omit_keys_for_unset_options_so_renderer_defaults_apply() {
+        // The renderer has its own defaults (Phong, perspective, 60°
+        // fov, default light, no camera override, aa=1). When the user
+        // doesn't pin a per-format flag the opts must OMIT the key so
+        // the C-3e callback uses RenderOptions::default() for it
+        // instead of us hard-coding the renderer's default twice.
+        let job = plan_to_render3d_job(
+            &render3d_plan(vec![], Mesh3DOptions::default()),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let node = find_render3d(track);
+        let o = node.opts.as_object().expect("opts object");
+        // Required keys present.
+        assert!(o.contains_key("width"));
+        assert!(o.contains_key("height"));
+        assert!(o.contains_key("background"));
+        // Optional keys absent.
+        assert!(!o.contains_key("shading"));
+        assert!(!o.contains_key("projection"));
+        assert!(!o.contains_key("fov_deg"));
+        assert!(!o.contains_key("light"));
+        assert!(!o.contains_key("camera"));
+        assert!(!o.contains_key("aa"));
+    }
+
+    #[test]
+    fn render3d_shading_tag_round_trips_every_mode() {
+        // Each Mesh3DRenderMode lowers to a distinct lowercase tag
+        // matching the wire form oxideav_render's ShadingMode expects.
+        for (mode, tag) in [
+            (Mesh3DRenderMode::Flat, "flat"),
+            (Mesh3DRenderMode::Wireframe, "wireframe"),
+            (Mesh3DRenderMode::Gouraud, "gouraud"),
+            (Mesh3DRenderMode::Phong, "phong"),
+            (Mesh3DRenderMode::NormalDebug, "normal-debug"),
+            (Mesh3DRenderMode::DepthDebug, "depth-debug"),
+        ] {
+            assert_eq!(shading_tag(mode), tag);
+            let job = plan_to_render3d_job(
+                &render3d_plan(
+                    vec![],
+                    Mesh3DOptions {
+                        render_mode: Some(mode),
+                        ..Mesh3DOptions::default()
+                    },
+                ),
+                &empty_ctx(),
+            )
+            .unwrap();
+            let track = &job.outputs.values().next().unwrap().all[0];
+            let node = find_render3d(track);
+            assert_eq!(node.opts["shading"], tag, "shading tag for {mode:?}");
+        }
+    }
+
+    #[test]
+    fn render3d_projection_tag_round_trips() {
+        assert_eq!(projection_tag(ProjectionMode::Perspective), "perspective");
+        assert_eq!(projection_tag(ProjectionMode::Orthographic), "orthographic");
+    }
+
+    #[test]
+    fn render3d_aa_is_clamped_into_1_through_8() {
+        // The renderer's own RenderOptions::validate rejects aa outside
+        // 1..=8. Clamp at the JSON-build layer so the callback can't
+        // see an out-of-range value via stale caller code.
+        for (input, expected) in [(0u32, 1u32), (1, 1), (4, 4), (8, 8), (9, 8), (u32::MAX, 8)] {
+            let job = plan_to_render3d_job(
+                &render3d_plan(
+                    vec![],
+                    Mesh3DOptions {
+                        aa: Some(input),
+                        ..Mesh3DOptions::default()
+                    },
+                ),
+                &empty_ctx(),
+            )
+            .unwrap();
+            let track = &job.outputs.values().next().unwrap().all[0];
+            let node = find_render3d(track);
+            assert_eq!(node.opts["aa"], expected, "aa={input} → {expected}");
+        }
+    }
+
+    #[test]
+    fn render3d_post_render_ops_wire_through_filter_chain() {
+        // Non-absorbed ops (rotate/blur/sharpen/…) ride on top of the
+        // Render3D leaf via the same filter-chain walker as the regular
+        // plan_to_job path. Order matches source order from inside-out.
+        let job = plan_to_render3d_job(
+            &render3d_plan(
+                vec![
+                    Op::Rotate { degrees: 90 },
+                    Op::Blur {
+                        radius: 2,
+                        sigma: 1.0,
+                    },
+                    Op::Negate,
+                ],
+                Mesh3DOptions::default(),
+            ),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let names = collect_filter_names(&track.input);
+        assert_eq!(
+            names,
+            vec![
+                "video.rotate".to_string(),
+                "video.blur".to_string(),
+                "video.negate".to_string(),
+            ]
+        );
+        // The chain still terminates on a Render3D leaf — the walker
+        // wraps it, not a Source.
+        let node = find_render3d(track);
+        assert_eq!(node.source, "cube.stl");
+    }
+
+    #[test]
+    fn render3d_strip_and_quality_still_land_in_codec_params() {
+        // Sink-side rules (strip / quality / format) ride the same
+        // path on the Render3D Job as they do on the regular Job.
+        let job = plan_to_render3d_job(
+            &render3d_plan(vec![Op::Quality(90), Op::Strip], Mesh3DOptions::default()),
+            &empty_ctx(),
+        )
+        .unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        assert_eq!(track.params["quality"], 90);
+        assert_eq!(track.params["strip_metadata"], true);
+    }
+
+    #[test]
+    fn render3d_resolves_output_codec_via_container_registry() {
+        // Output codec selection mirrors plan_to_job — registry hit
+        // wins; unknown extension stays None and lets the executor
+        // surface its own "no codec" diagnostic.
+        let mut ctx = RuntimeContext::new();
+        ctx.containers.register_extension("png", "png");
+        let job =
+            plan_to_render3d_job(&render3d_plan(vec![], Mesh3DOptions::default()), &ctx).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        assert_eq!(track.codec.as_deref(), Some("png"));
     }
 }

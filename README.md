@@ -156,6 +156,17 @@ same pixel-transform chain as the PDF runner. `-resize WxH` seeds
 the canvas dimensions before rasterisation (default 1024×1024);
 `-background COLOR` paints the canvas (default opaque white).
 
+The 3D→raster path also has a parallel pipeline-routed plumbing in
+[`plan_to_job::plan_to_render3d_job`]: it builds a `Job` whose track
+input is `TrackInput::Render3D` so the pipeline executor can drive
+the renderer through its installed `RenderSourceFactory` callback
+(Phase C-3c on oxideav-pipeline 0.1.10). `-resize` seeds the canvas
+dims; `-bg` (or `-background` when `-bg` is unset) seeds the
+framebuffer clear colour; every other op rides the same filter chain
+the regular `plan_to_job` path emits. The runtime still goes through
+the direct `mesh3d_render::run` adapter today — the `Executor`-routed
+flip is queued behind the callback wiring step.
+
 #### Per-format encoder option flags
 
 These flags override the encoder choice the registry would make from the
