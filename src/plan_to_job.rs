@@ -9,11 +9,40 @@
 //! an MP4) and dispatches filters to the matching `FilterKind` at
 //! DAG-build time.
 
-use crate::op::{ConvertPlan, Dither, Op};
+use crate::op::{ConvertPlan, Dither, Mesh3DOptions, Mesh3DRenderMode, Op, ProjectionMode};
 use indexmap::IndexMap;
 use oxideav_core::{Error, RuntimeContext};
-use oxideav_pipeline::{FilterNode, Job, OutputSpec, SourceRef, TrackInput, TrackSpec};
+use oxideav_pipeline::{
+    FilterNode, Job, OutputSpec, Render3DNode, SourceRef, TrackInput, TrackSpec,
+};
 use serde_json::{json, Value};
+
+/// Backend name handed to [`Render3DNode::backend`] for the auto-route
+/// 3D→raster pipeline path.  Mirrors the only [`oxideav_render::RenderBackend`]
+/// variant the workspace ships today (`Scanline`); the pipeline executor
+/// hands this name to the user-installed
+/// [`oxideav_pipeline::executor::RenderSourceFactory`] which deserialises
+/// the opts JSON back into the renderer's typed
+/// [`oxideav_render::RenderOptions`].
+///
+/// When future render backends (`raycast`, `pathtrace`, …) land, a new
+/// `-render-backend NAME` arg on the CLI side will override this default.
+pub const RENDER3D_DEFAULT_BACKEND: &str = "scanline";
+
+/// Default raster canvas dimensions for the 3D→raster job when no
+/// `-resize` op pins them.  Matches [`crate::mesh3d_render`]'s
+/// in-tree default so the auto-route helper produces the same canvas
+/// as the legacy side-channel runner.
+const DEFAULT_RENDER3D_WIDTH: u32 = 1024;
+const DEFAULT_RENDER3D_HEIGHT: u32 = 1024;
+
+/// Default `-bg` for the 3D render canvas: transparent black, matching
+/// [`crate::mesh3d_render`].  Composites cleanly against any downstream
+/// `-alpha remove`.
+const DEFAULT_RENDER3D_BG: [u8; 4] = [0, 0, 0, 0];
+
+/// Default vertical FOV for perspective projection (degrees).
+const DEFAULT_RENDER3D_FOV_DEG: f32 = 60.0;
 
 /// Build a [`Job`] from a [`ConvertPlan`].
 ///
@@ -402,6 +431,437 @@ pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Erro
         aliases: IndexMap::new(),
         threads: None,
     })
+}
+
+/// Build a 3D→raster [`Job`] from a [`ConvertPlan`] whose input is a
+/// 3D-asset path (`.stl`/`.obj`/`.gltf`/`.glb`/`.usdz`/`.fbx`/`.mtl`).
+///
+/// Shape:
+///
+/// * The track input is [`TrackInput::Render3D`] — the pipeline
+///   executor hands the `source` URI + `backend` name + opaque `opts`
+///   JSON to the caller-installed
+///   [`oxideav_pipeline::executor::RenderSourceFactory`].  That factory
+///   is the layer that talks to [`oxideav_render`] and the
+///   [`oxideav_mesh3d::Mesh3DRegistry`]; pipeline itself stays codec-
+///   and render-agnostic.
+/// * `Op::Resize` and `Op::Background` are absorbed by the renderer —
+///   the resize dims seed `width` / `height` on the opts struct, and
+///   the background seeds `background`.  Neither survives as a filter
+///   node because the renderer produces the canvas at the requested
+///   size directly (no downsample step, AA stays native to the raster
+///   grid).
+/// * `Mesh3DOptions::bg` wins over `Op::Background` so users can keep
+///   the IM canvas-fill semantics separate from the renderer's clear
+///   colour — mirrors [`crate::mesh3d_render`]'s `pick_render_bg`.
+/// * Every other op (rotate / flip / negate / tonal / colour-grading
+///   / strip / quality / …) is forwarded through the regular
+///   [`plan_to_job`] filter chain on top of the Render3D source so the
+///   post-rasterisation transforms keep their existing JSON dialect.
+/// * The output codec is resolved by the same
+///   [`ContainerRegistry`](oxideav_core::ContainerRegistry) lookup used
+///   by [`plan_to_job`].
+///
+/// `opts` JSON mirrors the field shape of
+/// [`oxideav_render::RenderOptions`] (one field per key, lowercase /
+/// snake_case names) so the consumer's `RenderSourceFactory` can
+/// deserialise it directly.  Keys: `width`, `height`, `background`
+/// (RGBA `[u8; 4]`), `shading`, `projection`, `fov_deg`, `light` (object
+/// with `azimuth_deg` / `elevation_deg` / `intensity`), `camera`
+/// (object with `elevation_deg` / `azimuth_deg` / `distance`, or `null`),
+/// `aa`.  Unset `Mesh3DOptions` fall back to the renderer's documented
+/// defaults so a bare `convert in.gltf out.png` produces a sensible
+/// canvas without any flag plumbing.
+pub fn plan_to_render3d_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Error> {
+    let (width, height) = pick_render3d_dims(&plan.ops);
+    let bg = pick_render3d_bg(&plan.ops, &plan.mesh3d_options);
+    let opts = build_render3d_opts(&plan.mesh3d_options, width, height, bg);
+
+    // Source node: the renderer absorbs the file IO via the installed
+    // RenderSourceFactory, so the source URI lives on Render3DNode
+    // rather than on a SourceRef leaf.
+    let mut chain = TrackInput::Render3D(Render3DNode {
+        source: plan.input.clone(),
+        backend: RENDER3D_DEFAULT_BACKEND.to_string(),
+        opts,
+    });
+
+    let mut codec_params = json!({});
+    let mut strip_metadata = false;
+    let mut format_override: Option<String> = None;
+
+    let wrap = |prev: TrackInput, filter: &str, params: Value| {
+        TrackInput::Filter(FilterNode {
+            filter: filter.to_string(),
+            params,
+            input: Box::new(prev),
+        })
+    };
+
+    for op in &plan.ops {
+        match op {
+            // Renderer absorbs these — they're encoded directly onto
+            // the RenderOptions payload, not as filter nodes.  Skipping
+            // them here avoids a redundant resize / background pass
+            // downstream of the Render3D source.
+            Op::Resize { .. } | Op::Background(_) => {}
+            // Vector-input ops with no defined behaviour on the render
+            // path; silently dropped (matches plan_to_job).
+            Op::Density(_) | Op::Alpha(_) => {}
+            // -thumbnail unrolls to Resize+Strip on the IM-CLI side;
+            // honour the strip half here, drop the resize half because
+            // the renderer already produced the canvas at the
+            // requested size via pick_render3d_dims.
+            Op::Thumbnail { .. } => strip_metadata = true,
+            Op::Define { key, value } => match value {
+                Some(v) => codec_params[key.clone()] = json!(v),
+                None => codec_params[key.clone()] = json!(true),
+            },
+            Op::Blur { radius, sigma } => {
+                chain = wrap(
+                    chain,
+                    "video.blur",
+                    json!({
+                        "radius": radius,
+                        "sigma": sigma,
+                        "planes": "all"
+                    }),
+                );
+            }
+            Op::Edge { radius } => {
+                chain = wrap(chain, "video.edge", json!({ "radius": radius }));
+            }
+            Op::Colors { count, dither } => {
+                let dither_str = match dither {
+                    Dither::None => "none",
+                    Dither::Bayer => "bayer",
+                    Dither::FloydSteinberg => "floyd_steinberg",
+                };
+                chain = wrap(
+                    chain,
+                    "video.pixfmt",
+                    json!({
+                        "format": "pal8",
+                        "dither": dither_str,
+                        "colors": count,
+                    }),
+                );
+            }
+            Op::Format(fmt) => format_override = Some(fmt.clone()),
+            Op::Quality(q) => {
+                codec_params["quality"] = json!(q);
+            }
+            Op::Strip => strip_metadata = true,
+            Op::Rotate { degrees } => {
+                chain = wrap(chain, "video.rotate", json!({ "degrees": degrees }));
+            }
+            Op::Flip => {
+                chain = wrap(chain, "video.flip", json!({}));
+            }
+            Op::Flop => {
+                chain = wrap(chain, "video.flop", json!({}));
+            }
+            Op::Crop { x, y, w, h } => {
+                chain = wrap(
+                    chain,
+                    "video.crop",
+                    json!({ "x": x, "y": y, "width": w, "height": h }),
+                );
+            }
+            Op::Extent {
+                width,
+                height,
+                x,
+                y,
+                bg,
+            } => {
+                chain = wrap(
+                    chain,
+                    "video.extent",
+                    json!({
+                        "width": width,
+                        "height": height,
+                        "offset_x": x,
+                        "offset_y": y,
+                        "background": [bg[0], bg[1], bg[2], bg[3]],
+                    }),
+                );
+            }
+            Op::Negate => {
+                chain = wrap(chain, "video.negate", json!({}));
+            }
+            Op::Sharpen { radius, sigma } => {
+                chain = wrap(
+                    chain,
+                    "video.sharpen",
+                    json!({ "radius": radius, "sigma": sigma }),
+                );
+            }
+            Op::Unsharp {
+                radius,
+                sigma,
+                amount,
+                threshold,
+            } => {
+                chain = wrap(
+                    chain,
+                    "video.unsharp",
+                    json!({
+                        "radius": radius,
+                        "sigma": sigma,
+                        "amount": amount,
+                        "threshold": threshold,
+                    }),
+                );
+            }
+            Op::Gamma { value } => {
+                chain = wrap(chain, "video.gamma", json!({ "value": value }));
+            }
+            Op::BrightnessContrast {
+                brightness,
+                contrast,
+            } => {
+                chain = wrap(
+                    chain,
+                    "video.brightness-contrast",
+                    json!({ "brightness": brightness, "contrast": contrast }),
+                );
+            }
+            Op::Contrast { delta } => {
+                let pct = (*delta as f32) * 5.0;
+                chain = wrap(chain, "video.contrast", json!({ "value": pct }));
+            }
+            Op::Sepia { threshold } => {
+                chain = wrap(chain, "video.sepia", json!({ "threshold": threshold }));
+            }
+            Op::Modulate {
+                brightness,
+                saturation,
+                hue,
+            } => {
+                let hue_degrees = (hue - 100.0) * 1.8;
+                chain = wrap(
+                    chain,
+                    "video.modulate",
+                    json!({
+                        "brightness": brightness,
+                        "saturation": saturation,
+                        "hue_degrees": hue_degrees,
+                    }),
+                );
+            }
+            Op::Level {
+                black,
+                gamma,
+                white,
+            } => {
+                chain = wrap(
+                    chain,
+                    "video.level",
+                    json!({ "black": black, "gamma": gamma, "white": white }),
+                );
+            }
+            Op::Normalize => {
+                chain = wrap(chain, "video.normalize", json!({}));
+            }
+            Op::Threshold { value } => {
+                chain = wrap(chain, "video.threshold", json!({ "value": value }));
+            }
+            Op::Posterize { levels } => {
+                chain = wrap(chain, "video.posterize", json!({ "levels": levels }));
+            }
+            Op::Solarize { value } => {
+                chain = wrap(chain, "video.solarize", json!({ "value": value }));
+            }
+            Op::Colorspace(cs) => {
+                let lower = cs.to_ascii_lowercase();
+                if lower == "gray" || lower == "grey" {
+                    chain = wrap(chain, "video.grayscale", json!({ "preserve_alpha": true }));
+                }
+            }
+            Op::Vignette {
+                radius,
+                sigma,
+                x,
+                y,
+            } => {
+                chain = wrap(
+                    chain,
+                    "video.vignette",
+                    json!({ "x": x, "y": y, "radius": radius, "sigma": sigma }),
+                );
+            }
+            Op::Colorize { color, amount } => {
+                chain = wrap(
+                    chain,
+                    "video.colorize",
+                    json!({
+                        "color": [color[0], color[1], color[2], color[3]],
+                        "amount": amount,
+                    }),
+                );
+            }
+            Op::Equalize => {
+                chain = wrap(chain, "video.equalize", json!({}));
+            }
+            Op::AutoGamma => {
+                chain = wrap(chain, "video.auto-gamma", json!({}));
+            }
+            Op::Trim { fuzz } => {
+                chain = wrap(chain, "video.trim", json!({ "fuzz": fuzz }));
+            }
+            Op::Roll { dx, dy } => {
+                chain = wrap(chain, "video.roll", json!({ "dx": dx, "dy": dy }));
+            }
+        }
+    }
+
+    if strip_metadata {
+        codec_params["strip_metadata"] = json!(true);
+    }
+    if let Some(ref f) = format_override {
+        codec_params["format"] = json!(f);
+    }
+
+    let codec = codec_for_output(format_override.as_deref(), &plan.output, ctx);
+
+    let track = TrackSpec {
+        input: chain,
+        codec,
+        params: codec_params,
+        stream_selector: None,
+    };
+
+    let mut outputs = IndexMap::new();
+    outputs.insert(
+        plan.output.clone(),
+        OutputSpec {
+            audio: vec![],
+            video: vec![],
+            subtitle: vec![],
+            all: vec![track],
+        },
+    );
+
+    Ok(Job {
+        outputs,
+        aliases: IndexMap::new(),
+        threads: None,
+    })
+}
+
+/// Pull the render canvas dimensions from the op chain: the LAST
+/// `-resize WxH` (any mode) seeds the canvas; otherwise the default
+/// 1024×1024.  Mirrors [`crate::mesh3d_render::pick_dims`] so the
+/// auto-route helper and the legacy side-channel runner agree on
+/// canvas size for the same flag combination.
+fn pick_render3d_dims(ops: &[Op]) -> (u32, u32) {
+    for op in ops.iter().rev() {
+        if let Op::Resize { width, height, .. } = op {
+            return (*width, *height);
+        }
+    }
+    (DEFAULT_RENDER3D_WIDTH, DEFAULT_RENDER3D_HEIGHT)
+}
+
+/// `-bg COLOR` (`Mesh3DOptions::bg`) wins over `-background COLOR`
+/// (`Op::Background`); both fall back to transparent black.  Mirrors
+/// [`crate::mesh3d_render::pick_render_bg`].
+fn pick_render3d_bg(ops: &[Op], options: &Mesh3DOptions) -> [u8; 4] {
+    if let Some(bg) = options.bg {
+        return bg;
+    }
+    for op in ops.iter().rev() {
+        if let Op::Background(c) = op {
+            return *c;
+        }
+    }
+    DEFAULT_RENDER3D_BG
+}
+
+/// Build the `opts` JSON payload that ships on
+/// [`Render3DNode::opts`].  Field shape mirrors
+/// [`oxideav_render::RenderOptions`] one-for-one so the consumer's
+/// installed `RenderSourceFactory` can `serde_json::from_value` it
+/// straight into the typed struct.  None-valued `Mesh3DOptions` fall
+/// back to the renderer's documented defaults (Flat shading,
+/// perspective projection, 60° FOV, default directional light at
+/// 45°/45°/1.0, auto-frame camera, 1× AA).
+fn build_render3d_opts(options: &Mesh3DOptions, width: u32, height: u32, bg: [u8; 4]) -> Value {
+    let shading = options
+        .render_mode
+        .map(shading_tag_from_mode)
+        .unwrap_or("flat");
+    let projection = options
+        .projection
+        .map(projection_tag_from_mode)
+        .unwrap_or("perspective");
+    let fov_deg = options.fov_deg.unwrap_or(DEFAULT_RENDER3D_FOV_DEG);
+    // The renderer's default light spec lives behind
+    // `LightSpec::default_light()` on the oxideav-render side; mirror
+    // the same defaults here so the JSON carries the same values the
+    // typed struct would have produced.
+    let light = options
+        .light
+        .map(|l| {
+            json!({
+                "azimuth_deg": l.azimuth_deg,
+                "elevation_deg": l.elevation_deg,
+                "intensity": l.intensity,
+            })
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "azimuth_deg": 45.0,
+                "elevation_deg": 45.0,
+                "intensity": 1.0,
+            })
+        });
+    let camera = options.camera.map(|c| {
+        json!({
+            "elevation_deg": c.elevation_deg,
+            "azimuth_deg": c.azimuth_deg,
+            "distance": c.distance,
+        })
+    });
+    let aa = options.aa.unwrap_or(1).clamp(1, 8);
+
+    json!({
+        "width": width,
+        "height": height,
+        "background": [bg[0], bg[1], bg[2], bg[3]],
+        "shading": shading,
+        "projection": projection,
+        "fov_deg": fov_deg,
+        "light": light,
+        "camera": camera,
+        "aa": aa,
+    })
+}
+
+/// Stable lowercase tag for the JSON-side `shading` field.  Matches the
+/// snake-case identifier scheme used by
+/// [`oxideav_render::ShadingMode`]'s variants (Flat/Wireframe/Gouraud/
+/// Phong are single-word, NormalDebug/DepthDebug become
+/// `normal-debug` / `depth-debug` — same dash-cased shape as
+/// `video.auto-gamma` etc. elsewhere in the JSON dialect).
+fn shading_tag_from_mode(mode: Mesh3DRenderMode) -> &'static str {
+    match mode {
+        Mesh3DRenderMode::Flat => "flat",
+        Mesh3DRenderMode::Wireframe => "wireframe",
+        Mesh3DRenderMode::Gouraud => "gouraud",
+        Mesh3DRenderMode::Phong => "phong",
+        Mesh3DRenderMode::NormalDebug => "normal-debug",
+        Mesh3DRenderMode::DepthDebug => "depth-debug",
+    }
+}
+
+/// Stable lowercase tag for the JSON-side `projection` field.
+fn projection_tag_from_mode(mode: ProjectionMode) -> &'static str {
+    match mode {
+        ProjectionMode::Perspective => "perspective",
+        ProjectionMode::Orthographic => "orthographic",
+    }
 }
 
 /// Guess the output codec from the extension, honouring `-format`
@@ -1466,5 +1926,458 @@ mod tests {
         // -format with no matching registration → None (caller can
         // surface a "use -format CODEC" hint).
         assert!(codec_for_output(Some("nothing"), "out.unrelated", &ctx).is_none());
+    }
+
+    // ---- plan_to_render3d_job coverage (Phase C-3b) ----
+
+    use crate::op::{CameraSpec as OpCameraSpec, LightSpec as OpLightSpec};
+
+    fn render3d_plan(input: &str, output: &str, ops: Vec<Op>, opts: Mesh3DOptions) -> ConvertPlan {
+        ConvertPlan {
+            input: input.into(),
+            input_pages: None,
+            ops,
+            output: output.into(),
+            output_template: None,
+            ping: false,
+            probe: false,
+            probe_json: false,
+            probe_watch: false,
+            mesh3d_options: opts,
+        }
+    }
+
+    /// Bare `convert cube.stl out.png` lowers to a single Render3D
+    /// source with the scanline backend, no surrounding filters, and
+    /// the default 1024×1024 canvas with transparent black background.
+    /// `opts` carries every key the renderer needs at default values.
+    #[test]
+    fn render3d_defaults_emit_scanline_source_at_1024x1024() {
+        let plan = render3d_plan("cube.stl", "out.png", vec![], Mesh3DOptions::default());
+        let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
+        assert_eq!(job.outputs.len(), 1);
+        let out = job.outputs.values().next().unwrap();
+        assert_eq!(out.all.len(), 1);
+        let track = &out.all[0];
+        let node = match &track.input {
+            TrackInput::Render3D(n) => n,
+            other => panic!("expected Render3D, got {other:?}"),
+        };
+        assert_eq!(node.source, "cube.stl");
+        assert_eq!(node.backend, RENDER3D_DEFAULT_BACKEND);
+        assert_eq!(node.backend, "scanline");
+        assert_eq!(node.opts["width"], 1024);
+        assert_eq!(node.opts["height"], 1024);
+        let bg = node.opts["background"]
+            .as_array()
+            .expect("background array");
+        assert_eq!(bg.len(), 4);
+        for c in bg {
+            assert_eq!(c.as_u64(), Some(0));
+        }
+        assert_eq!(node.opts["shading"], "flat");
+        assert_eq!(node.opts["projection"], "perspective");
+        assert!((node.opts["fov_deg"].as_f64().unwrap() - 60.0).abs() < 1e-6);
+        assert_eq!(node.opts["aa"], 1);
+        // Default light spec: 45°/45°/1.0 — matches LightSpec::default_light
+        // on the renderer side.
+        let l = &node.opts["light"];
+        assert!((l["azimuth_deg"].as_f64().unwrap() - 45.0).abs() < 1e-6);
+        assert!((l["elevation_deg"].as_f64().unwrap() - 45.0).abs() < 1e-6);
+        assert!((l["intensity"].as_f64().unwrap() - 1.0).abs() < 1e-6);
+        // Auto-frame camera = null.
+        assert!(node.opts["camera"].is_null());
+    }
+
+    /// `-resize WxH` seeds the render canvas dims on the opts struct
+    /// and does NOT survive as a `video.resize` filter node — the
+    /// renderer produces the canvas at the requested size directly.
+    #[test]
+    fn resize_is_absorbed_into_render_dims_not_emitted_as_filter() {
+        let plan = render3d_plan(
+            "scene.gltf",
+            "out.png",
+            vec![Op::Resize {
+                width: 800,
+                height: 600,
+                mode: ResizeMode::Default,
+            }],
+            Mesh3DOptions::default(),
+        );
+        let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let node = match &track.input {
+            TrackInput::Render3D(n) => n,
+            other => panic!("expected Render3D directly (resize absorbed), got {other:?}"),
+        };
+        assert_eq!(node.opts["width"], 800);
+        assert_eq!(node.opts["height"], 600);
+    }
+
+    /// `-background COLOR` seeds the render canvas clear colour on the
+    /// opts struct and does NOT survive as a separate node.
+    #[test]
+    fn background_op_is_absorbed_into_render_bg() {
+        let plan = render3d_plan(
+            "cube.stl",
+            "out.png",
+            vec![Op::Background([12, 34, 56, 200])],
+            Mesh3DOptions::default(),
+        );
+        let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        let node = match &track.input {
+            TrackInput::Render3D(n) => n,
+            other => panic!("expected Render3D directly, got {other:?}"),
+        };
+        let bg = node.opts["background"]
+            .as_array()
+            .expect("background array");
+        assert_eq!(bg[0], 12);
+        assert_eq!(bg[1], 34);
+        assert_eq!(bg[2], 56);
+        assert_eq!(bg[3], 200);
+    }
+
+    /// `-bg` on `Mesh3DOptions` wins over a preceding `-background`
+    /// op (mirrors `mesh3d_render::pick_render_bg`'s precedence).
+    #[test]
+    fn bg_option_overrides_background_op() {
+        let opts = Mesh3DOptions {
+            bg: Some([10, 20, 30, 255]),
+            ..Mesh3DOptions::default()
+        };
+        let plan = render3d_plan(
+            "cube.stl",
+            "out.png",
+            vec![Op::Background([99, 99, 99, 255])],
+            opts,
+        );
+        let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
+        let node = match &job.outputs.values().next().unwrap().all[0].input {
+            TrackInput::Render3D(n) => n,
+            other => panic!("expected Render3D, got {other:?}"),
+        };
+        let bg = node.opts["background"].as_array().unwrap();
+        assert_eq!(bg[0], 10);
+        assert_eq!(bg[1], 20);
+        assert_eq!(bg[2], 30);
+        assert_eq!(bg[3], 255);
+    }
+
+    /// Every `Mesh3DRenderMode` round-trips through the opts JSON via a
+    /// stable lowercase tag.
+    #[test]
+    fn render_mode_round_trips_through_opts() {
+        let cases = [
+            (Mesh3DRenderMode::Flat, "flat"),
+            (Mesh3DRenderMode::Wireframe, "wireframe"),
+            (Mesh3DRenderMode::Gouraud, "gouraud"),
+            (Mesh3DRenderMode::Phong, "phong"),
+            (Mesh3DRenderMode::NormalDebug, "normal-debug"),
+            (Mesh3DRenderMode::DepthDebug, "depth-debug"),
+        ];
+        for (mode, tag) in cases {
+            let opts = Mesh3DOptions {
+                render_mode: Some(mode),
+                ..Mesh3DOptions::default()
+            };
+            let plan = render3d_plan("cube.stl", "out.png", vec![], opts);
+            let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
+            let node = match &job.outputs.values().next().unwrap().all[0].input {
+                TrackInput::Render3D(n) => n,
+                other => panic!("expected Render3D, got {other:?}"),
+            };
+            assert_eq!(node.opts["shading"], tag, "mode={mode:?}");
+        }
+    }
+
+    /// Projection mode round-trips between `Mesh3DOptions::projection`
+    /// and the opts JSON.
+    #[test]
+    fn projection_mode_round_trips_through_opts() {
+        for (mode, tag) in [
+            (ProjectionMode::Perspective, "perspective"),
+            (ProjectionMode::Orthographic, "orthographic"),
+        ] {
+            let opts = Mesh3DOptions {
+                projection: Some(mode),
+                ..Mesh3DOptions::default()
+            };
+            let plan = render3d_plan("cube.stl", "out.png", vec![], opts);
+            let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
+            let node = match &job.outputs.values().next().unwrap().all[0].input {
+                TrackInput::Render3D(n) => n,
+                other => panic!("expected Render3D, got {other:?}"),
+            };
+            assert_eq!(node.opts["projection"], tag, "mode={mode:?}");
+        }
+    }
+
+    /// `-light A,E,I` lands on opts as a three-key sub-object.
+    #[test]
+    fn light_override_round_trips_through_opts() {
+        let opts = Mesh3DOptions {
+            light: Some(OpLightSpec {
+                azimuth_deg: 12.0,
+                elevation_deg: 34.0,
+                intensity: 0.75,
+            }),
+            ..Mesh3DOptions::default()
+        };
+        let plan = render3d_plan("cube.stl", "out.png", vec![], opts);
+        let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
+        let node = match &job.outputs.values().next().unwrap().all[0].input {
+            TrackInput::Render3D(n) => n,
+            other => panic!("expected Render3D, got {other:?}"),
+        };
+        let l = &node.opts["light"];
+        assert!((l["azimuth_deg"].as_f64().unwrap() - 12.0).abs() < 1e-6);
+        assert!((l["elevation_deg"].as_f64().unwrap() - 34.0).abs() < 1e-6);
+        assert!((l["intensity"].as_f64().unwrap() - 0.75).abs() < 1e-6);
+    }
+
+    /// `-camera E,A,D` lands on opts as a three-key sub-object; absence
+    /// stays `null`.
+    #[test]
+    fn camera_override_round_trips_through_opts() {
+        let opts = Mesh3DOptions {
+            camera: Some(OpCameraSpec {
+                elevation_deg: 30.0,
+                azimuth_deg: 45.0,
+                distance: 1.5,
+            }),
+            ..Mesh3DOptions::default()
+        };
+        let plan = render3d_plan("cube.stl", "out.png", vec![], opts);
+        let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
+        let node = match &job.outputs.values().next().unwrap().all[0].input {
+            TrackInput::Render3D(n) => n,
+            other => panic!("expected Render3D, got {other:?}"),
+        };
+        let c = &node.opts["camera"];
+        assert!((c["elevation_deg"].as_f64().unwrap() - 30.0).abs() < 1e-6);
+        assert!((c["azimuth_deg"].as_f64().unwrap() - 45.0).abs() < 1e-6);
+        assert!((c["distance"].as_f64().unwrap() - 1.5).abs() < 1e-6);
+    }
+
+    /// `-fov DEGREES` round-trips through opts as a float.
+    #[test]
+    fn fov_override_round_trips_through_opts() {
+        let opts = Mesh3DOptions {
+            fov_deg: Some(35.0),
+            ..Mesh3DOptions::default()
+        };
+        let plan = render3d_plan("cube.stl", "out.png", vec![], opts);
+        let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
+        let node = match &job.outputs.values().next().unwrap().all[0].input {
+            TrackInput::Render3D(n) => n,
+            other => panic!("expected Render3D, got {other:?}"),
+        };
+        assert!((node.opts["fov_deg"].as_f64().unwrap() - 35.0).abs() < 1e-6);
+    }
+
+    /// `-aa N` round-trips through opts; the helper clamps to `1..=8`
+    /// to match the renderer's documented range.
+    #[test]
+    fn aa_round_trips_through_opts_and_clamps_to_range() {
+        for in_aa in [1_u32, 2, 4, 8] {
+            let opts = Mesh3DOptions {
+                aa: Some(in_aa),
+                ..Mesh3DOptions::default()
+            };
+            let plan = render3d_plan("cube.stl", "out.png", vec![], opts);
+            let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
+            let node = match &job.outputs.values().next().unwrap().all[0].input {
+                TrackInput::Render3D(n) => n,
+                other => panic!("expected Render3D, got {other:?}"),
+            };
+            assert_eq!(node.opts["aa"], in_aa, "in_aa={in_aa}");
+        }
+        // Out-of-range values clamp to the [1, 8] window: 0 → 1, 9 → 8.
+        for (in_aa, expected) in [(0_u32, 1_u32), (9, 8), (100, 8)] {
+            let opts = Mesh3DOptions {
+                aa: Some(in_aa),
+                ..Mesh3DOptions::default()
+            };
+            let plan = render3d_plan("cube.stl", "out.png", vec![], opts);
+            let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
+            let node = match &job.outputs.values().next().unwrap().all[0].input {
+                TrackInput::Render3D(n) => n,
+                other => panic!("expected Render3D, got {other:?}"),
+            };
+            assert_eq!(
+                node.opts["aa"], expected,
+                "in_aa={in_aa} expected clamp→{expected}"
+            );
+        }
+    }
+
+    /// Post-rasterisation ops (rotate / flip / negate / sharpen / strip
+    /// / quality) survive as filter nodes wrapping the Render3D source,
+    /// preserving source order from innermost (= first parsed) to
+    /// outermost (= last parsed).
+    #[test]
+    fn post_raster_ops_wrap_the_render3d_source_in_source_order() {
+        let plan = render3d_plan(
+            "scene.gltf",
+            "out.png",
+            vec![
+                Op::Rotate { degrees: 90 },
+                Op::Negate,
+                Op::Sharpen {
+                    radius: 1,
+                    sigma: 0.5,
+                },
+                Op::Strip,
+                Op::Quality(85),
+            ],
+            Mesh3DOptions::default(),
+        );
+        let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        // Quality + strip land on codec params, not as filter nodes.
+        assert_eq!(track.params["quality"], 85);
+        assert_eq!(track.params["strip_metadata"], true);
+        // Walk the chain: outermost (last in source order) is sharpen,
+        // then negate, then rotate, then the Render3D leaf.
+        let outer = match &track.input {
+            TrackInput::Filter(f) => f,
+            other => panic!("expected outer filter, got {other:?}"),
+        };
+        assert_eq!(outer.filter, "video.sharpen");
+        let mid = match outer.input.as_ref() {
+            TrackInput::Filter(f) => f,
+            other => panic!("expected mid filter, got {other:?}"),
+        };
+        assert_eq!(mid.filter, "video.negate");
+        let inner = match mid.input.as_ref() {
+            TrackInput::Filter(f) => f,
+            other => panic!("expected inner filter, got {other:?}"),
+        };
+        assert_eq!(inner.filter, "video.rotate");
+        assert_eq!(inner.params["degrees"], 90);
+        // The recursion bottoms out at a Render3D node (not Source).
+        match inner.input.as_ref() {
+            TrackInput::Render3D(n) => {
+                assert_eq!(n.source, "scene.gltf");
+                assert_eq!(n.backend, "scanline");
+            }
+            other => panic!("expected Render3D leaf, got {other:?}"),
+        }
+    }
+
+    /// `Op::Thumbnail` strips metadata and lets the renderer absorb the
+    /// resize half — no `video.resize` filter survives on a 3D→raster
+    /// job.
+    #[test]
+    fn thumbnail_absorbs_resize_and_sets_strip_metadata() {
+        let plan = render3d_plan(
+            "cube.stl",
+            "out.png",
+            vec![Op::Thumbnail {
+                width: 256,
+                height: 256,
+                mode: ResizeMode::Fill,
+            }],
+            Mesh3DOptions::default(),
+        );
+        let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        // No video.resize filter because thumbnail absorbed.  The
+        // renderer canvas stays at the helper's default since
+        // Op::Thumbnail isn't consulted by pick_render3d_dims.  Strip
+        // metadata still lands on codec params per IM's contract.
+        assert_eq!(track.params["strip_metadata"], true);
+        match &track.input {
+            TrackInput::Render3D(_) => {}
+            other => panic!("expected Render3D (no surviving filters), got {other:?}"),
+        }
+    }
+
+    /// The output codec resolves through the same `ContainerRegistry`
+    /// lookup `plan_to_job` uses — register an extension, observe the
+    /// resolved codec id on the track.
+    #[test]
+    fn render3d_output_codec_resolves_via_registry() {
+        let mut ctx = RuntimeContext::new();
+        ctx.containers.register_extension("png", "png_codec");
+        let plan = render3d_plan("scene.gltf", "out.png", vec![], Mesh3DOptions::default());
+        let job = plan_to_render3d_job(&plan, &ctx).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        assert_eq!(track.codec.as_deref(), Some("png_codec"));
+    }
+
+    /// `-format FMT` override seeds the codec params bag plus the
+    /// registry-resolved codec; mirrors `plan_to_job`'s shape.
+    #[test]
+    fn render3d_format_override_threads_through_to_codec_params() {
+        let mut ctx = RuntimeContext::new();
+        ctx.containers.register_extension("jpg", "jpeg_codec");
+        let plan = render3d_plan(
+            "scene.gltf",
+            "out.unrelated",
+            vec![Op::Format("jpg".into())],
+            Mesh3DOptions::default(),
+        );
+        let job = plan_to_render3d_job(&plan, &ctx).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        assert_eq!(track.codec.as_deref(), Some("jpeg_codec"));
+        assert_eq!(track.params["format"], "jpg");
+    }
+
+    /// `-define KEY=VALUE` lands on codec params on the 3D path same as
+    /// on the regular pipeline path.
+    #[test]
+    fn render3d_define_lands_on_codec_params() {
+        let plan = render3d_plan(
+            "cube.stl",
+            "out.png",
+            vec![
+                Op::Define {
+                    key: "png:strip-comments".into(),
+                    value: None,
+                },
+                Op::Define {
+                    key: "jpeg:dct-method".into(),
+                    value: Some("float".into()),
+                },
+            ],
+            Mesh3DOptions::default(),
+        );
+        let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
+        let track = &job.outputs.values().next().unwrap().all[0];
+        assert_eq!(track.params["png:strip-comments"], true);
+        assert_eq!(track.params["jpeg:dct-method"], "float");
+    }
+
+    /// The full opts struct round-trips through `serde_json` (every
+    /// field is present, every field is a value the consumer's typed
+    /// deserialiser can read).
+    #[test]
+    fn render3d_opts_carry_every_documented_field() {
+        let plan = render3d_plan("cube.stl", "out.png", vec![], Mesh3DOptions::default());
+        let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
+        let node = match &job.outputs.values().next().unwrap().all[0].input {
+            TrackInput::Render3D(n) => n,
+            other => panic!("expected Render3D, got {other:?}"),
+        };
+        for key in [
+            "width",
+            "height",
+            "background",
+            "shading",
+            "projection",
+            "fov_deg",
+            "light",
+            "camera",
+            "aa",
+        ] {
+            assert!(
+                node.opts.get(key).is_some(),
+                "opts is missing documented field {key:?} — full opts: {}",
+                node.opts
+            );
+        }
     }
 }

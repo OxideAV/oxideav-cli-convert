@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `plan_to_render3d_job(plan, ctx) -> Result<Job, Error>` — public
+  helper that lowers a 3D-asset `ConvertPlan` into an
+  `oxideav_pipeline::Job` whose track input is a
+  `TrackInput::Render3D` source node. The pipeline executor hands the
+  source URI + `backend` name + opaque `opts` JSON to a caller-installed
+  `RenderSourceFactory`; cli-convert exposes the helper so the
+  consumer-side wiring (next-phase CLI dispatch) can route 3D inputs
+  through the same pipeline executor the regular pipeline path uses,
+  rather than the legacy side-channel runner. `Op::Resize` and
+  `Op::Background` are absorbed by the renderer (the canvas is produced
+  at the requested size directly with the requested clear colour);
+  every other op survives as a filter node wrapping the Render3D
+  source, so the post-rasterisation tonal / geometry ops keep their
+  existing JSON dialect. `Mesh3DOptions::bg` wins over an `Op::Background`
+  in source order, mirroring `mesh3d_render::pick_render_bg`'s
+  precedence. The `opts` JSON shape mirrors
+  `oxideav_render::RenderOptions` one-for-one (`width`, `height`,
+  `background`, `shading`, `projection`, `fov_deg`, `light`, `camera`,
+  `aa`) so the consumer's `RenderSourceFactory` can
+  `serde_json::from_value` it straight into the typed struct.
+- `RENDER3D_DEFAULT_BACKEND` — public `&'static str` constant naming
+  the default backend (`"scanline"`) handed to `Render3DNode::backend`.
+  Mirrors the only `RenderBackend` variant the workspace ships today;
+  when raycast / pathtrace backends land, a `-render-backend NAME`
+  arg will override the default via the same field.
+- 15 new unit tests in `plan_to_job::tests` covering: default plan +
+  options producing a 1024×1024 scanline source with transparent black
+  background; `-resize WxH` absorbed into render dims (no surviving
+  `video.resize` filter); `-background COLOR` absorbed into render
+  background (no surviving filter); `-bg` option overriding
+  `-background` op; every `Mesh3DRenderMode` round-tripping through
+  `opts["shading"]` as a stable lowercase tag (with `normal-debug` /
+  `depth-debug` dash-cased to match the existing JSON dialect);
+  `ProjectionMode` round-trip; `-light` triple round-trip;
+  `-camera` triple round-trip; `-fov DEGREES` round-trip; `-aa N`
+  round-trip with clamping to `1..=8` (matching
+  `RenderOptions::validate`); post-rasterisation ops (rotate / negate
+  / sharpen / strip / quality) surviving as filter nodes wrapping the
+  Render3D leaf in source order; `Op::Thumbnail` absorbing the resize
+  half and setting strip-metadata on codec params; output codec
+  resolving through `ContainerRegistry`; `-format FMT` override
+  threading through to codec params; `-define KEY=VALUE` landing on
+  codec params; the `opts` payload carrying every documented field.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.4...v0.0.5) - 2026-06-07
 
 ### Added
