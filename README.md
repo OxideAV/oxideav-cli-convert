@@ -1,13 +1,14 @@
 # oxideav-cli-convert
 
-The engine behind `oxideav convert`: an ImageMagick-style CLI that
-works on images, video, audio, **PDFs, vector content, and synthetic
-sources**, implemented on top of `oxideav-pipeline`.
+The engine behind `oxideav convert`: a flag-driven image/media
+conversion CLI that works on images, video, audio, **PDFs, vector
+content, and synthetic sources**, implemented on top of
+`oxideav-pipeline`.
 
 A one-frame PNG → JPG, a 90-minute MP4 → MKV with `-resize`, and a
 multi-page PDF → page-numbered PNG sequence go through related code
-paths — convert's job is to translate IM-style args into work the
-rest of the workspace already knows how to do.
+paths — convert's job is to translate the conversion flags into work
+the rest of the workspace already knows how to do.
 
 ## Supported ops
 
@@ -22,7 +23,7 @@ rest of the workspace already knows how to do.
 | `-strip` | drop metadata on write |
 | `-density N` | DPI for vector→raster (default 72; PDF / SVG inputs only) |
 | `-background COLOR` | canvas + alpha-flatten background (CSS L3 named + `#hex` 3/4/6/8) |
-| `-alpha {on\|off\|activate\|deactivate\|remove\|set\|opaque\|transparent}` | full IM grammar |
+| `-alpha {on\|off\|activate\|deactivate\|remove\|set\|opaque\|transparent}` | full alpha-op grammar |
 | `-rotate N` | quarter-turn only (`N ∈ {±90, ±180, ±270}`); 90/270 swap dims |
 | `-flip` | vertical flip (rows reversed) |
 | `-flop` | horizontal flip (columns reversed) |
@@ -42,7 +43,7 @@ rest of the workspace already knows how to do.
 | `-posterize N` | collapse to `N >= 2` levels per channel |
 | `-solarize N[%]` | invert above threshold |
 | `-colorspace gray\|grey\|rgb\|srgb` | `gray`/`grey` → grayscale factory; `rgb`/`srgb` no-op |
-| `-monochrome` | valueless IM shorthand for `-colorspace gray -colors 2 -dither floyd_steinberg` (1-bit B/W with error diffusion); always emits `floyd_steinberg` regardless of any prior `-dither none` |
+| `-monochrome` | valueless shorthand for `-colorspace gray -colors 2 -dither floyd_steinberg` (1-bit B/W with error diffusion); always emits `floyd_steinberg` regardless of any prior `-dither none` |
 | `-fuzz N[%]` | tolerance state for the next `-trim`; bytes (`0..=255`) or percent (`0..=100%` → `0..=255` rounded); no op emitted in isolation |
 | `-trim` | auto-crop to the bounding box of pixels differing from the corner-pixel reference background by more than the active `-fuzz` tolerance; uniform-background inputs collapse to a `1x1` representable frame |
 | `-roll ±X±Y` | circular pixel shift; pixels off one edge wrap to the opposite edge; both X and Y signed offsets required (`-roll +5+10`, `-roll -3+2`); width/height unchanged |
@@ -62,7 +63,7 @@ implemented` and exits cleanly — no silent misbehaviour.
 
 Ops can appear **anywhere** — before AND after the input. The first
 non-flag positional is the input; the last is the output. Multiple
-inputs (`convert in1.pdf in2.pdf out.gif`) is a documented round-3
+inputs (`convert in1.pdf in2.pdf out.gif`) is a documented
 follow-up; today it errors with a clear message.
 
 ## Inputs
@@ -78,7 +79,7 @@ follow-up; today it errors with a clear message.
 
 ### `[N]` / `[N-M]` / `[A,B,…]` page selectors
 
-ImageMagick-style suffix on PDF inputs:
+Bracket-suffix page selectors on PDF inputs:
 
 | Selector | Meaning |
 |---|---|
@@ -94,7 +95,7 @@ ImageMagick-style suffix on PDF inputs:
 
 Negative atoms `-k` resolve to `total_pages - k` (`-1` = last page).
 Comma lists preserve source order, so `[2,0]` writes page 2 first then
-page 0; duplicates are retained (IM convention — `[0,0,0]` writes the
+page 0; duplicates are retained (`[0,0,0]` writes the
 same page three times).
 
 Out-of-range indices error with a precise count: `page index 5 out
@@ -173,8 +174,8 @@ flag is paired with an extension it doesn't apply to (e.g.
 | `-camera` | `ELEVATION,AZIMUTH,DISTANCE` (each a number; distance > 0) | bbox-fit auto-frame | Orbit camera override; `distance` is a multiplier of the auto-frame radius. |
 | `-projection` | `perspective` / `persp` / `p` / `orthographic` / `ortho` / `o` | `perspective` | Picks projection matrix; ortho frames the scene on the smaller axis with a 1.2× margin. |
 | `-fov` | degrees in `(0, 180)` | `60` | Vertical FOV for perspective; ignored for orthographic. |
-| `-bg` | CSS L3 named or `#hex` colour (3 / 4 / 6 / 8 hex digits) | transparent black | Render-canvas background fill. Distinct from `-background` so callers can keep IM canvas-fill and renderer-clear separate. |
-| `-aa` | integer `1..=8` | `1` (off) | Supersampling factor for the 3D→raster renderer. The scene is rasterised at `N × output` and box-filtered back down. `1` keeps the round-44 baseline; `2`/`4` are typical. Capped at `8` so a 1024² render at max-aa stays under ~80 MB framebuffer + z-buffer. |
+| `-bg` | CSS L3 named or `#hex` colour (3 / 4 / 6 / 8 hex digits) | transparent black | Render-canvas background fill. Distinct from `-background` so callers can keep canvas-fill and renderer-clear separate. |
+| `-aa` | integer `1..=8` | `1` (off) | Supersampling factor for the 3D→raster renderer. The scene is rasterised at `N × output` and box-filtered back down. `1` is off; `2`/`4` are typical. Capped at `8` so a 1024² render at max-aa stays under ~80 MB framebuffer + z-buffer. |
 
 ### Routing matrix (PDF input)
 
@@ -310,18 +311,15 @@ The hint fires when the bad extension / flag is within `max(2, len/3)`
 edits of one of the supported set; unrelated typos (`.png` vs the
 3D set) get the base error with no misleading suggestion.
 
-## Round-3 follow-ups
+## Known follow-ups
 
-- Multi-input (`convert in1.pdf in2.pdf out.gif`) — IM allows it.
+- Multi-input (`convert in1.pdf in2.pdf out.gif`).
 - GIF + TIFF raster outputs (need palette quantisation / multi-image
   TIFF encoder respectively; both are crate-side work).
 - `-density` applied to raster inputs (silently dropped today).
 - Registering PDF as a real `Demuxer` so `oxideav probe` /
   `transcode` / `run` see it. Today this side-channels through
   `convert` only.
-
-Completed previously: `[0,2,4]` comma-separated and `[-1]` negative
-page selectors (round 77).
 
 ## License
 
