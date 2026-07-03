@@ -1,5 +1,7 @@
 # oxideav-cli-convert
 
+[![CI](https://github.com/OxideAV/oxideav-cli-convert/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-cli-convert/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-cli-convert.svg)](https://crates.io/crates/oxideav-cli-convert) [![docs.rs](https://docs.rs/oxideav-cli-convert/badge.svg)](https://docs.rs/oxideav-cli-convert) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 The engine behind `oxideav convert`: a flag-driven image/media
 conversion CLI that works on images, video, audio, **PDFs, vector
 content, and synthetic sources**, implemented on top of
