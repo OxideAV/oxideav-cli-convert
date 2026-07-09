@@ -204,14 +204,16 @@ fn into_local_image(src: RRgbaImage) -> RgbaImage {
 }
 
 fn pick_dims(ops: &[Op]) -> (u32, u32) {
-    // `-resize WxH` (any mode) seeds the canvas size; otherwise
-    // 1024x1024. Force-mode resizes still get the request honoured
-    // exactly. The post-render `apply_pixel_transform_chain` would
-    // also handle this for us, but rasterising at the final size up
-    // front avoids a downscale step and keeps anti-aliasing native to
-    // the raster grid.
+    // `-resize WxH` / `-thumbnail WxH` (any mode) seeds the canvas
+    // size; otherwise 1024x1024. Force-mode resizes still get the
+    // request honoured exactly. The post-render
+    // `apply_pixel_transform_chain` would also handle this for us
+    // (its Resize / Thumbnail arms then re-apply as an identity
+    // pass), but rasterising at the final size up front avoids a
+    // downscale step and keeps anti-aliasing native to the raster
+    // grid.
     for op in ops.iter().rev() {
-        if let Op::Resize { width, height, .. } = op {
+        if let Op::Resize { width, height, .. } | Op::Thumbnail { width, height, .. } = op {
             return (*width, *height);
         }
     }

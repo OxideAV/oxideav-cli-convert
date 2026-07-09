@@ -139,7 +139,12 @@ pub fn plan_to_render3d_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<
 /// canvas size for the same flag combination.
 fn pick_render3d_dims(ops: &[Op]) -> (u32, u32) {
     for op in ops.iter().rev() {
-        if let Op::Resize { width, height, .. } = op {
+        // `-thumbnail WxH` carries the same geometry request as
+        // `-resize WxH` (plus Strip, handled by `lower_op`). Both are
+        // absorbed by the renderer, so both must seed the canvas —
+        // ignoring Thumbnail here silently produced the 1024×1024
+        // default for `convert scene.gltf -thumbnail 256x256 out.png`.
+        if let Op::Resize { width, height, .. } | Op::Thumbnail { width, height, .. } = op {
             return (*width, *height);
         }
     }
@@ -2069,15 +2074,49 @@ mod tests {
         );
         let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
         let track = &job.outputs.values().next().unwrap().all[0];
-        // No video.resize filter because thumbnail absorbed.  The
-        // renderer canvas stays at the helper's default since
-        // Op::Thumbnail isn't consulted by pick_render3d_dims.  Strip
-        // metadata still lands on codec params per IM's contract.
+        // No video.resize filter because thumbnail absorbed. Strip
+        // metadata lands on codec params per IM's contract, AND the
+        // requested geometry seeds the render canvas — previously the
+        // dims were dropped and the canvas silently stayed at the
+        // 1024×1024 default.
         assert_eq!(track.params["strip_metadata"], true);
         match &track.input {
-            TrackInput::Render3D(_) => {}
+            TrackInput::Render3D(node) => {
+                assert_eq!(node.opts["width"], 256);
+                assert_eq!(node.opts["height"], 256);
+            }
             other => panic!("expected Render3D (no surviving filters), got {other:?}"),
         }
+    }
+
+    /// Mixed `-resize` / `-thumbnail` geometry: the LAST one in source
+    /// order wins the canvas, mirroring the last-resize-wins rule.
+    #[test]
+    fn last_geometry_op_wins_render_canvas() {
+        let plan = render3d_plan(
+            "cube.stl",
+            "out.png",
+            vec![
+                Op::Resize {
+                    width: 512,
+                    height: 512,
+                    mode: ResizeMode::Default,
+                },
+                Op::Thumbnail {
+                    width: 256,
+                    height: 128,
+                    mode: ResizeMode::Fill,
+                },
+            ],
+            Mesh3DOptions::default(),
+        );
+        let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
+        let node = match &job.outputs.values().next().unwrap().all[0].input {
+            TrackInput::Render3D(n) => n,
+            other => panic!("expected Render3D, got {other:?}"),
+        };
+        assert_eq!(node.opts["width"], 256);
+        assert_eq!(node.opts["height"], 128);
     }
 
     /// The output codec resolves through the same `ContainerRegistry`

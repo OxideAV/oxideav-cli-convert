@@ -125,6 +125,19 @@ pub fn decide(plan: &ConvertPlan) -> Result<Route, Error> {
         )));
     }
 
+    // A `%d` template only means something to the PDF side-channel's
+    // per-page fan-out today. On every other route the pipeline /
+    // icon writer would treat `page-%03d.png` as a LITERAL filename —
+    // classic silent misbehaviour — so reject with a typed error.
+    // (Video → numbered frame sequence is the obvious future consumer;
+    // this error is the breadcrumb until that lands.)
+    if plan.output_template.is_some() {
+        return Err(Error::unsupported(format!(
+            "convert: output '{}' has a `%d` template, but template fan-out only applies to multi-page (PDF) inputs today; give a literal output filename",
+            plan.output
+        )));
+    }
+
     #[cfg(feature = "ico")]
     if crate::ico_runner::is_ico_output(&plan.output) {
         return Ok(Route::IcoOutput);
@@ -370,6 +383,34 @@ mod tests {
                 "input={input} output={output}"
             );
         }
+    }
+
+    #[test]
+    fn printf_template_on_pipeline_route_is_a_typed_error() {
+        // Template fan-out only exists on the PDF side-channel today;
+        // the pipeline would write a file literally named
+        // `frame-%03d.png`. Reject instead of silently misbehaving.
+        let mut p = plan("movie.mp4", "frame-%03d.png");
+        p.output_template = Some(PrintfTemplate {
+            prefix: "frame-".into(),
+            width: 3,
+            suffix: ".png".into(),
+        });
+        let msg = format!("{}", decide(&p).expect_err("template must be rejected"));
+        assert!(msg.contains("template fan-out"), "got: {msg}");
+        assert!(msg.contains("frame-%03d.png"), "got: {msg}");
+    }
+
+    #[cfg(feature = "ico")]
+    #[test]
+    fn printf_template_on_ico_route_is_a_typed_error() {
+        let mut p = plan("logo.png", "icon-%d.ico");
+        p.output_template = Some(PrintfTemplate {
+            prefix: "icon-".into(),
+            width: 0,
+            suffix: ".ico".into(),
+        });
+        assert!(decide(&p).is_err());
     }
 
     #[test]
