@@ -3676,6 +3676,83 @@ mod tests {
         );
     }
 
+    // ---- adversarial argv: typed errors, never panics ----
+
+    /// Whatever garbage arrives, `parse` must return `Ok` or a typed
+    /// error — never panic. The corpus concentrates on the value
+    /// grammars with the most parsing surface (geometry, page
+    /// selectors, colours, numeric ranges) plus token-shape edge
+    /// cases (unicode, oversized strings, lone dashes, truncated
+    /// flag/value pairs).
+    #[test]
+    fn adversarial_argv_never_panics() {
+        let long = "x".repeat(10_000);
+        let long_selector = format!("in.pdf[{}]", "9".repeat(5_000));
+        let cases: Vec<Vec<&str>> = vec![
+            // Geometry grammar abuse.
+            vec!["in.png", "-resize", "x", "out.png"],
+            vec!["in.png", "-resize", "0x0", "out.png"],
+            vec!["in.png", "-resize", "-1x-1", "out.png"],
+            vec!["in.png", "-resize", "99999999999999999999x1", "out.png"],
+            vec!["in.png", "-resize", "8x", "out.png"],
+            vec!["in.png", "-resize", "!", "out.png"],
+            vec!["in.png", "-crop", "1x1", "out.png"],
+            vec!["in.png", "-crop", "1x1+", "out.png"],
+            vec!["in.png", "-crop", "1x1+1+1+1", "out.png"],
+            vec!["in.png", "-extent", "+5+5", "out.png"],
+            vec!["in.png", "-roll", "++", "out.png"],
+            vec!["in.png", "-roll", "5", "out.png"],
+            vec!["in.png", "-vignette", "+", "out.png"],
+            vec!["in.png", "-vignette", "1+2+3+4+5", "out.png"],
+            // Page-selector abuse.
+            vec!["in.pdf[", "out.png"],
+            vec!["in.pdf[]", "out.png"],
+            vec!["in.pdf[1-2-3]", "out.png"],
+            vec!["in.pdf[,]", "out.png"],
+            vec!["in.pdf[0,,1]", "out.png"],
+            vec!["in.pdf[abc]", "out.png"],
+            vec!["in.pdf[999999999999999999999]", "out.png"],
+            vec!["]", "out.png"],
+            vec!["[0]", "out.png"],
+            // Colour grammar abuse.
+            vec!["in.png", "-background", "#", "out.png"],
+            vec!["in.png", "-background", "#12345", "out.png"],
+            vec!["in.png", "-background", "#gggggg", "out.png"],
+            vec!["in.png", "-background", "notacolor", "out.png"],
+            vec!["in.png", "-colorize", "/", "out.png"],
+            vec!["in.png", "-colorize", "300x300x300/2", "out.png"],
+            // Numeric range / special-float abuse.
+            vec!["in.png", "-quality", "-1", "out.png"],
+            vec!["in.png", "-quality", "99999999999", "out.png"],
+            vec!["in.png", "-gamma", "NaN", "out.png"],
+            vec!["in.png", "-gamma", "inf", "out.png"],
+            vec!["in.png", "-gamma", "-0.0", "out.png"],
+            vec!["in.png", "-fov", "NaN", "out.png"],
+            vec!["in.png", "-modulate", ",,,", "out.png"],
+            vec!["in.png", "-modulate", "1,2,3,4", "out.png"],
+            vec!["in.png", "-level", "//", "out.png"],
+            vec!["in.png", "-fuzz", "300%", "out.png"],
+            vec!["in.png", "-aa", "0", "out.png"],
+            // Define / token-shape abuse.
+            vec!["in.png", "-define", "=v", "out.png"],
+            vec!["in.png", "-define", "=", "out.png"],
+            vec!["日本語.png", "出力.jpg"],
+            vec!["in.png", "-résize", "8x8", "out.png"],
+            vec![&long, "out.png"],
+            vec!["in.png", &long_selector, "out.png"],
+            // Truncated flag/value pairs and lone dashes.
+            vec!["in.png", "-resize"],
+            vec!["-"],
+            vec!["--"],
+            vec!["in.png", "-", "out.png"],
+        ];
+        for argv in cases {
+            // Must not panic; Ok vs Err is case-specific and pinned
+            // by the focused tests elsewhere in this module.
+            let _ = parse(&to_vec(&argv));
+        }
+    }
+
     // ---- `--help` mode + usage synopsis ----
 
     #[test]

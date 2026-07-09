@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `route` module — pure routing layer. `route::decide(&ConvertPlan)
+  -> Result<Route, Error>` classifies a plan into its execution path
+  (`Help` / `Ping` / `Probe` / `PdfSideChannel` / `Mesh3dToMesh3d` /
+  `Mesh3dToRaster` / `IcoOutput` / `Pipeline`, feature-gated variants
+  matching the cargo features) without performing any work; `run()`
+  is now a thin dispatcher over it. `Route` is re-exported at the
+  crate root. The full media-kind × media-kind dispatch matrix is
+  pinned by IO-free unit tests, including precedence rules (help >
+  ping > probe > input classification > output classification).
+- `--help` / `-help` — usage-synopsis mode, recognised anywhere on
+  the line, outranks every other mode. `args::usage()` generates the
+  flag list from the parser's own `KNOWN_FLAG_NAMES` table (correct
+  dash flavour per flag) so the help text cannot drift from what the
+  parser accepts. `ConvertPlan` grows a `help: bool` field.
+- `--` end-of-flags marker — everything after it is a positional even
+  when it starts with a dash, so files literally named `-weird.png`
+  are expressible.
+- Schema-validation guarantee: `plan_to_job` and
+  `plan_to_render3d_job` run the pipeline's own `Job::validate()`
+  before returning, so planner bugs surface as typed errors at plan
+  time. Pinned by tests over a 33-entry representative op corpus,
+  together with a byte-stable JSON round-trip guarantee (serialise →
+  re-parse → re-serialise identical) that makes convert-planned jobs
+  storable / replayable as `oxideav run` documents.
+- Golden plan snapshots (`tests/plan_golden.rs`): byte-exact job JSON
+  pinned for representative argv lines end-to-end (bare transcode,
+  filter chain with sink params, `-monochrome` unroll, codec-less
+  video container, full-option 3D render), plus determinism checks.
+- Flag-table sync test: every `KNOWN_FLAG_NAMES` entry is driven
+  through the parser with a minimal valid value and must parse `Ok`,
+  in both directions (stale table entry fails; accepted flag missing
+  from the table fails).
+- Adversarial argv corpus: `args::parse` must return typed errors,
+  never panic, across malformed geometry / selectors / colours /
+  numbers / unicode / oversized tokens.
+
 - `plan_to_render3d_job(plan, ctx) -> Result<Job, Error>` — public
   helper that lowers a 3D-asset `ConvertPlan` into an
   `oxideav_pipeline::Job` whose track input is a
@@ -52,6 +88,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolving through `ContainerRegistry`; `-format FMT` override
   threading through to codec params; `-define KEY=VALUE` landing on
   codec params; the `opts` payload carrying every documented field.
+
+### Fixed
+
+- f32 op values no longer widen to f64 bit-patterns in the emitted
+  job JSON: `-light 10,20,0.9` used to serialise as
+  `"intensity": 0.8999999761581421`, `-blur 1x2.3` as
+  `"sigma": 2.299999952316284`. Values now serialise via the f32's
+  shortest decimal representation (the number the user typed);
+  `-modulate` hue→degrees translates in f64 on the clean decimal so
+  round percentages give round degrees (150 → 90.0).
+- `-thumbnail WxH` now seeds the 3D render canvas on both the
+  auto-route planner (`pick_render3d_dims`) and the side-channel
+  renderer (`mesh3d_render::pick_dims`); previously the geometry was
+  absorbed but the dims dropped, silently rendering at the 1024×1024
+  default. Last geometry op (`-resize` or `-thumbnail`) in source
+  order wins.
+- A `%d` printf template on the regular pipeline or `.ico` routes is
+  now a typed `unsupported` error instead of being written through as
+  a literal output filename (template fan-out only exists on the PDF
+  side-channel today).
+- Empty positional arguments (typically an unset shell variable) are
+  rejected at parse time with an actionable message instead of
+  surfacing as an unopenable `""` filename deep inside a runner; an
+  empty input path is also rejected at plan time by the new
+  validation hook.
+
+### Changed
+
+- The ~340-line op-lowering walk duplicated between `plan_to_job` and
+  `plan_to_render3d_job` is now one shared `lower_op` (with an
+  `absorb_canvas` flag for the render path) plus a shared
+  `finish_job` tail — float handling and future op additions happen
+  in exactly one place.
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.4...v0.0.5) - 2026-06-07
 

@@ -324,6 +324,30 @@ The hint fires when the bad extension / flag is within `max(2, len/3)`
 edits of one of the supported set; unrelated typos (`.png` vs the
 3D set) get the base error with no misleading suggestion.
 
+## Planning guarantees
+
+`convert` separates *deciding* from *doing*, and the deciding half
+carries test-pinned guarantees:
+
+- **Routing is pure.** `route::decide(&plan)` classifies every
+  invocation (help / ping / probe / PDF side-channel / 3D→3D /
+  3D→raster / ico / pipeline) without doing any work; the
+  media-kind × media-kind dispatch matrix is pinned by IO-free unit
+  tests, including precedence (input classification outranks output
+  classification — `in.pdf out.ico` is PDF-runner business).
+- **Every emitted job validates.** `plan_to_job` and
+  `plan_to_render3d_job` run `oxideav_pipeline::Job::validate()`
+  before returning, so a planner bug is a typed error at plan time.
+- **Every emitted job is JSON-stable.** Serialise → re-parse →
+  re-serialise is byte-identical, and f32 flag values serialise as
+  the decimal the user typed (no f64-widening noise), so planned
+  jobs are storable / replayable / snapshot-testable `oxideav run`
+  documents. Golden snapshots pin representative argv lines.
+- **Unplannable input is a typed error, never silence or a panic** —
+  3D input × non-3D/non-raster output, `%d` templates outside the
+  PDF fan-out, empty arguments, malformed value grammars (pinned by
+  an adversarial-argv corpus).
+
 ## Known follow-ups
 
 - Multi-input (`convert in1.pdf in2.pdf out.gif`).
