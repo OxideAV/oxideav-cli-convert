@@ -55,388 +55,20 @@ pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Erro
     // Walk ops, distinguishing track-side filters from sink-side
     // metadata (format / quality / strip).  Filters are flattened
     // into the recursive `TrackInput` chain; the rest are deferred
-    // to the sink.
-    let mut codec_params = json!({});
-    let mut strip_metadata = false;
-    let mut format_override: Option<String> = None;
+    // to the sink.  Per-op lowering lives in [`lower_op`], shared
+    // with [`plan_to_render3d_job`].
+    let mut sink = SinkSide::default();
 
     // Starting input: the file itself.
     let mut chain: TrackInput = TrackInput::Source(SourceRef {
         from: plan.input.clone(),
     });
 
-    // A filter-chain step — wrap the current chain in a FilterNode.
-    let wrap = |prev: TrackInput, filter: &str, params: Value| {
-        TrackInput::Filter(FilterNode {
-            filter: filter.to_string(),
-            params,
-            input: Box::new(prev),
-        })
-    };
-
     for op in &plan.ops {
-        match op {
-            Op::Resize {
-                width,
-                height,
-                mode,
-            } => {
-                // The pipeline's resize factory takes literal target
-                // dims today. We forward `width`/`height` along with
-                // the geometry mode tag so a future executor pass can
-                // resolve the source-aware variants (Fill/Shrink/Grow/
-                // Percent/Area) against the actual frame size at
-                // DAG-build time. Until that lands, only `Default` and
-                // `Force` are pixel-accurate on the pipeline path —
-                // the source-aware modes degrade to `Default` semantics
-                // when the executor sees a mode it doesn't understand.
-                // The PDF side-channel (which already knows the source
-                // dims) honours every mode today.
-                chain = wrap(
-                    chain,
-                    "video.resize",
-                    json!({
-                        "width": width,
-                        "height": height,
-                        "interpolation": "bilinear",
-                        "mode": mode.as_tag(),
-                    }),
-                );
-            }
-            Op::Thumbnail {
-                width,
-                height,
-                mode,
-            } => {
-                // `-thumbnail` is sugar for `Resize + Strip` (and, on a
-                // future pass, EXIF auto-orient). Emit both downstream
-                // ops so the executor sees the same shape as a
-                // hand-written `-resize ... -strip`.
-                chain = wrap(
-                    chain,
-                    "video.resize",
-                    json!({
-                        "width": width,
-                        "height": height,
-                        "interpolation": "bilinear",
-                        "mode": mode.as_tag(),
-                    }),
-                );
-                strip_metadata = true;
-            }
-            Op::Define { key, value } => {
-                // Forward the literal key (preserving any `:` namespace
-                // separator) onto the codec params bag. Values that
-                // parse as integers / floats / booleans still come
-                // through as JSON strings — codecs that care about
-                // type can re-parse from the string. Bare `-define KEY`
-                // (no `=VALUE`) becomes `{"KEY": true}`.
-                match value {
-                    Some(v) => codec_params[key.clone()] = json!(v),
-                    None => codec_params[key.clone()] = json!(true),
-                }
-            }
-            Op::Blur { radius, sigma } => {
-                chain = wrap(
-                    chain,
-                    "video.blur",
-                    json!({
-                        "radius": radius,
-                        "sigma": sigma,
-                        "planes": "all"
-                    }),
-                );
-            }
-            Op::Edge { radius } => {
-                chain = wrap(chain, "video.edge", json!({ "radius": radius }));
-            }
-            Op::Colors { count, dither } => {
-                // Palette quantisation: rely on the pipeline's
-                // ConvertNode (pixfmt) which already supports
-                // `pal8` + dither via `oxideav-pixfmt`.  We nest
-                // the palette step inline as a filter-shaped node
-                // that the executor recognises by name.
-                let dither_str = match dither {
-                    Dither::None => "none",
-                    Dither::Bayer => "bayer",
-                    Dither::FloydSteinberg => "floyd_steinberg",
-                };
-                chain = wrap(
-                    chain,
-                    "video.pixfmt",
-                    json!({
-                        "format": "pal8",
-                        "dither": dither_str,
-                        "colors": count,
-                    }),
-                );
-            }
-            Op::Format(fmt) => format_override = Some(fmt.clone()),
-            Op::Quality(q) => {
-                // Codec-specific key; the encoder drops it when
-                // unsupported.  Use `quality` for JPEG/WebP, `crf`
-                // could be added by a later pass for h264/h265.
-                codec_params["quality"] = json!(q);
-            }
-            Op::Strip => strip_metadata = true,
-            // Vector-input ops; silently dropped on the raster
-            // pipeline path (raster inputs have no DPI, no
-            // composite-over-bg semantics that wouldn't conflict
-            // with `-resize`/etc., and no alpha-channel grammar to
-            // honour beyond what the encoder already does). The
-            // pdf_runner side-channel applies them when reading PDFs.
-            Op::Density(_) | Op::Background(_) | Op::Alpha(_) => {}
-            // Round-1 inline geometry / negate ops. The PDF
-            // side-channel applies these via crate::pixel_xform; the
-            // generic pipeline path now also wires them through to
-            // the matching `oxideav-image-filter` factory so non-PDF
-            // input paths (PNG/JPG/MP4/…) honour them too.
-            Op::Rotate { degrees } => {
-                chain = wrap(chain, "video.rotate", json!({ "degrees": degrees }));
-            }
-            Op::Flip => {
-                chain = wrap(chain, "video.flip", json!({}));
-            }
-            Op::Flop => {
-                chain = wrap(chain, "video.flop", json!({}));
-            }
-            Op::Crop { x, y, w, h } => {
-                chain = wrap(
-                    chain,
-                    "video.crop",
-                    json!({ "x": x, "y": y, "width": w, "height": h }),
-                );
-            }
-            Op::Extent {
-                width,
-                height,
-                x,
-                y,
-                bg,
-            } => {
-                // The `oxideav-image-filter` `Extent` factory accepts
-                // `width`/`height` plus optional signed `offset_x` /
-                // `offset_y` and an RGBA `background` array. We forward
-                // everything verbatim — the background was already
-                // resolved against the source-order `-background` ops
-                // at args-parse time so the plan walker stays
-                // stateless.
-                chain = wrap(
-                    chain,
-                    "video.extent",
-                    json!({
-                        "width": width,
-                        "height": height,
-                        "offset_x": x,
-                        "offset_y": y,
-                        "background": [bg[0], bg[1], bg[2], bg[3]],
-                    }),
-                );
-            }
-            Op::Negate => {
-                chain = wrap(chain, "video.negate", json!({}));
-            }
-            // ---- Round-next: tonal / colour-grading ops wired to
-            // the matching `oxideav-image-filter` factory. ----
-            Op::Sharpen { radius, sigma } => {
-                chain = wrap(
-                    chain,
-                    "video.sharpen",
-                    json!({ "radius": radius, "sigma": sigma }),
-                );
-            }
-            Op::Unsharp {
-                radius,
-                sigma,
-                amount,
-                threshold,
-            } => {
-                chain = wrap(
-                    chain,
-                    "video.unsharp",
-                    json!({
-                        "radius": radius,
-                        "sigma": sigma,
-                        "amount": amount,
-                        "threshold": threshold,
-                    }),
-                );
-            }
-            Op::Gamma { value } => {
-                chain = wrap(chain, "video.gamma", json!({ "value": value }));
-            }
-            Op::BrightnessContrast {
-                brightness,
-                contrast,
-            } => {
-                chain = wrap(
-                    chain,
-                    "video.brightness-contrast",
-                    json!({ "brightness": brightness, "contrast": contrast }),
-                );
-            }
-            Op::Contrast { delta } => {
-                // IM's bare `-contrast` flag bumps contrast by a single
-                // 5%-of-range step. Multiple `-contrast` accumulate
-                // linearly. Map to the brightness-contrast factory's
-                // contrast-only knob so the executor can fold this into
-                // a single LUT pass alongside any explicit
-                // `-brightness-contrast` already in the chain.
-                let pct = (*delta as f32) * 5.0;
-                chain = wrap(chain, "video.contrast", json!({ "value": pct }));
-            }
-            Op::Sepia { threshold } => {
-                chain = wrap(chain, "video.sepia", json!({ "threshold": threshold }));
-            }
-            Op::Modulate {
-                brightness,
-                saturation,
-                hue,
-            } => {
-                // IM's hue is "percent-of-base around 100" — 0 is
-                // -180°, 100 is identity, 200 is +180°. The
-                // image-filter factory accepts degrees directly via
-                // `hue_degrees`, so translate.
-                let hue_degrees = (hue - 100.0) * 1.8;
-                chain = wrap(
-                    chain,
-                    "video.modulate",
-                    json!({
-                        "brightness": brightness,
-                        "saturation": saturation,
-                        "hue_degrees": hue_degrees,
-                    }),
-                );
-            }
-            Op::Level {
-                black,
-                gamma,
-                white,
-            } => {
-                chain = wrap(
-                    chain,
-                    "video.level",
-                    json!({ "black": black, "gamma": gamma, "white": white }),
-                );
-            }
-            Op::Normalize => {
-                chain = wrap(chain, "video.normalize", json!({}));
-            }
-            Op::Threshold { value } => {
-                chain = wrap(chain, "video.threshold", json!({ "value": value }));
-            }
-            Op::Posterize { levels } => {
-                chain = wrap(chain, "video.posterize", json!({ "levels": levels }));
-            }
-            Op::Solarize { value } => {
-                chain = wrap(chain, "video.solarize", json!({ "value": value }));
-            }
-            Op::Colorspace(cs) => {
-                let lower = cs.to_ascii_lowercase();
-                if lower == "gray" || lower == "grey" {
-                    chain = wrap(chain, "video.grayscale", json!({ "preserve_alpha": true }));
-                }
-                // `rgb` / `srgb` are recorded no-ops — input keeps its
-                // colourspace, downstream encoder converts as needed.
-            }
-            // ---- Round-after-next: vignette / colorize / equalize /
-            // auto-gamma. JSON shape mirrors the image-filter factories
-            // (resolves to identity defaults when the value is absent). ----
-            Op::Vignette {
-                radius,
-                sigma,
-                x,
-                y,
-            } => {
-                chain = wrap(
-                    chain,
-                    "video.vignette",
-                    json!({ "x": x, "y": y, "radius": radius, "sigma": sigma }),
-                );
-            }
-            Op::Colorize { color, amount } => {
-                // Factory wants a 4-element JSON array for `color`.
-                chain = wrap(
-                    chain,
-                    "video.colorize",
-                    json!({
-                        "color": [color[0], color[1], color[2], color[3]],
-                        "amount": amount,
-                    }),
-                );
-            }
-            Op::Equalize => {
-                chain = wrap(chain, "video.equalize", json!({}));
-            }
-            Op::AutoGamma => {
-                chain = wrap(chain, "video.auto-gamma", json!({}));
-            }
-            Op::Trim { fuzz } => {
-                // The image-filter `Trim` factory accepts `fuzz` as a
-                // 0..=255 byte plus an optional `background` array. We
-                // forward only `fuzz` here — the args parser doesn't
-                // expose a per-`-trim` colour override yet, so the
-                // factory falls back to its corner-pixel auto-detection
-                // (matching IM's behaviour when neither `-bordercolor`
-                // nor `-background` is set).
-                chain = wrap(chain, "video.trim", json!({ "fuzz": fuzz }));
-            }
-            Op::Roll { dx, dy } => {
-                // The `oxideav-image-filter` `Roll` factory accepts
-                // signed `dx`/`dy` (also as `x`/`y` aliases); pixels
-                // that fall off one edge wrap around to the opposite
-                // edge so the visible image translates as a rigid
-                // block. Width/height stay unchanged, so no shape
-                // recovery is needed downstream.
-                chain = wrap(chain, "video.roll", json!({ "dx": dx, "dy": dy }));
-            }
-        }
+        chain = lower_op(chain, op, &mut sink, false);
     }
 
-    // Sink-side metadata handling.
-    if strip_metadata {
-        codec_params["strip_metadata"] = json!(true);
-    }
-    if let Some(ref f) = format_override {
-        codec_params["format"] = json!(f);
-    }
-
-    // The pipeline insists every filter-terminated track carry an
-    // output codec — frames can't be stream-copied.  Infer from the
-    // output extension (or `-format` override) so the IM-style
-    // `convert in.png -resize 64x64 out.jpg` works without the user
-    // stating the obvious.
-    let codec = codec_for_output(format_override.as_deref(), &plan.output, ctx);
-
-    let track = TrackSpec {
-        input: chain,
-        codec,
-        params: codec_params,
-        stream_selector: None,
-    };
-
-    let mut outputs = IndexMap::new();
-    outputs.insert(
-        plan.output.clone(),
-        OutputSpec {
-            audio: vec![],
-            video: vec![],
-            subtitle: vec![],
-            all: vec![track],
-        },
-    );
-
-    let job = Job {
-        outputs,
-        aliases: IndexMap::new(),
-        threads: None,
-    };
-    // Guarantee: every job this planner emits satisfies the pipeline
-    // schema's own invariants (non-empty source, non-blank codec ids,
-    // …). Validating here turns a planner bug into a typed error at
-    // plan time instead of an opaque executor failure later.
-    job.validate()?;
-    Ok(job)
+    finish_job(plan, ctx, chain, sink)
 }
 
 /// Build a 3D→raster [`Job`] from a [`ConvertPlan`] whose input is a
@@ -492,272 +124,12 @@ pub fn plan_to_render3d_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<
         opts,
     });
 
-    let mut codec_params = json!({});
-    let mut strip_metadata = false;
-    let mut format_override: Option<String> = None;
-
-    let wrap = |prev: TrackInput, filter: &str, params: Value| {
-        TrackInput::Filter(FilterNode {
-            filter: filter.to_string(),
-            params,
-            input: Box::new(prev),
-        })
-    };
-
+    let mut sink = SinkSide::default();
     for op in &plan.ops {
-        match op {
-            // Renderer absorbs these — they're encoded directly onto
-            // the RenderOptions payload, not as filter nodes.  Skipping
-            // them here avoids a redundant resize / background pass
-            // downstream of the Render3D source.
-            Op::Resize { .. } | Op::Background(_) => {}
-            // Vector-input ops with no defined behaviour on the render
-            // path; silently dropped (matches plan_to_job).
-            Op::Density(_) | Op::Alpha(_) => {}
-            // -thumbnail unrolls to Resize+Strip on the IM-CLI side;
-            // honour the strip half here, drop the resize half because
-            // the renderer already produced the canvas at the
-            // requested size via pick_render3d_dims.
-            Op::Thumbnail { .. } => strip_metadata = true,
-            Op::Define { key, value } => match value {
-                Some(v) => codec_params[key.clone()] = json!(v),
-                None => codec_params[key.clone()] = json!(true),
-            },
-            Op::Blur { radius, sigma } => {
-                chain = wrap(
-                    chain,
-                    "video.blur",
-                    json!({
-                        "radius": radius,
-                        "sigma": sigma,
-                        "planes": "all"
-                    }),
-                );
-            }
-            Op::Edge { radius } => {
-                chain = wrap(chain, "video.edge", json!({ "radius": radius }));
-            }
-            Op::Colors { count, dither } => {
-                let dither_str = match dither {
-                    Dither::None => "none",
-                    Dither::Bayer => "bayer",
-                    Dither::FloydSteinberg => "floyd_steinberg",
-                };
-                chain = wrap(
-                    chain,
-                    "video.pixfmt",
-                    json!({
-                        "format": "pal8",
-                        "dither": dither_str,
-                        "colors": count,
-                    }),
-                );
-            }
-            Op::Format(fmt) => format_override = Some(fmt.clone()),
-            Op::Quality(q) => {
-                codec_params["quality"] = json!(q);
-            }
-            Op::Strip => strip_metadata = true,
-            Op::Rotate { degrees } => {
-                chain = wrap(chain, "video.rotate", json!({ "degrees": degrees }));
-            }
-            Op::Flip => {
-                chain = wrap(chain, "video.flip", json!({}));
-            }
-            Op::Flop => {
-                chain = wrap(chain, "video.flop", json!({}));
-            }
-            Op::Crop { x, y, w, h } => {
-                chain = wrap(
-                    chain,
-                    "video.crop",
-                    json!({ "x": x, "y": y, "width": w, "height": h }),
-                );
-            }
-            Op::Extent {
-                width,
-                height,
-                x,
-                y,
-                bg,
-            } => {
-                chain = wrap(
-                    chain,
-                    "video.extent",
-                    json!({
-                        "width": width,
-                        "height": height,
-                        "offset_x": x,
-                        "offset_y": y,
-                        "background": [bg[0], bg[1], bg[2], bg[3]],
-                    }),
-                );
-            }
-            Op::Negate => {
-                chain = wrap(chain, "video.negate", json!({}));
-            }
-            Op::Sharpen { radius, sigma } => {
-                chain = wrap(
-                    chain,
-                    "video.sharpen",
-                    json!({ "radius": radius, "sigma": sigma }),
-                );
-            }
-            Op::Unsharp {
-                radius,
-                sigma,
-                amount,
-                threshold,
-            } => {
-                chain = wrap(
-                    chain,
-                    "video.unsharp",
-                    json!({
-                        "radius": radius,
-                        "sigma": sigma,
-                        "amount": amount,
-                        "threshold": threshold,
-                    }),
-                );
-            }
-            Op::Gamma { value } => {
-                chain = wrap(chain, "video.gamma", json!({ "value": value }));
-            }
-            Op::BrightnessContrast {
-                brightness,
-                contrast,
-            } => {
-                chain = wrap(
-                    chain,
-                    "video.brightness-contrast",
-                    json!({ "brightness": brightness, "contrast": contrast }),
-                );
-            }
-            Op::Contrast { delta } => {
-                let pct = (*delta as f32) * 5.0;
-                chain = wrap(chain, "video.contrast", json!({ "value": pct }));
-            }
-            Op::Sepia { threshold } => {
-                chain = wrap(chain, "video.sepia", json!({ "threshold": threshold }));
-            }
-            Op::Modulate {
-                brightness,
-                saturation,
-                hue,
-            } => {
-                let hue_degrees = (hue - 100.0) * 1.8;
-                chain = wrap(
-                    chain,
-                    "video.modulate",
-                    json!({
-                        "brightness": brightness,
-                        "saturation": saturation,
-                        "hue_degrees": hue_degrees,
-                    }),
-                );
-            }
-            Op::Level {
-                black,
-                gamma,
-                white,
-            } => {
-                chain = wrap(
-                    chain,
-                    "video.level",
-                    json!({ "black": black, "gamma": gamma, "white": white }),
-                );
-            }
-            Op::Normalize => {
-                chain = wrap(chain, "video.normalize", json!({}));
-            }
-            Op::Threshold { value } => {
-                chain = wrap(chain, "video.threshold", json!({ "value": value }));
-            }
-            Op::Posterize { levels } => {
-                chain = wrap(chain, "video.posterize", json!({ "levels": levels }));
-            }
-            Op::Solarize { value } => {
-                chain = wrap(chain, "video.solarize", json!({ "value": value }));
-            }
-            Op::Colorspace(cs) => {
-                let lower = cs.to_ascii_lowercase();
-                if lower == "gray" || lower == "grey" {
-                    chain = wrap(chain, "video.grayscale", json!({ "preserve_alpha": true }));
-                }
-            }
-            Op::Vignette {
-                radius,
-                sigma,
-                x,
-                y,
-            } => {
-                chain = wrap(
-                    chain,
-                    "video.vignette",
-                    json!({ "x": x, "y": y, "radius": radius, "sigma": sigma }),
-                );
-            }
-            Op::Colorize { color, amount } => {
-                chain = wrap(
-                    chain,
-                    "video.colorize",
-                    json!({
-                        "color": [color[0], color[1], color[2], color[3]],
-                        "amount": amount,
-                    }),
-                );
-            }
-            Op::Equalize => {
-                chain = wrap(chain, "video.equalize", json!({}));
-            }
-            Op::AutoGamma => {
-                chain = wrap(chain, "video.auto-gamma", json!({}));
-            }
-            Op::Trim { fuzz } => {
-                chain = wrap(chain, "video.trim", json!({ "fuzz": fuzz }));
-            }
-            Op::Roll { dx, dy } => {
-                chain = wrap(chain, "video.roll", json!({ "dx": dx, "dy": dy }));
-            }
-        }
+        chain = lower_op(chain, op, &mut sink, true);
     }
 
-    if strip_metadata {
-        codec_params["strip_metadata"] = json!(true);
-    }
-    if let Some(ref f) = format_override {
-        codec_params["format"] = json!(f);
-    }
-
-    let codec = codec_for_output(format_override.as_deref(), &plan.output, ctx);
-
-    let track = TrackSpec {
-        input: chain,
-        codec,
-        params: codec_params,
-        stream_selector: None,
-    };
-
-    let mut outputs = IndexMap::new();
-    outputs.insert(
-        plan.output.clone(),
-        OutputSpec {
-            audio: vec![],
-            video: vec![],
-            subtitle: vec![],
-            all: vec![track],
-        },
-    );
-
-    let job = Job {
-        outputs,
-        aliases: IndexMap::new(),
-        threads: None,
-    };
-    // Same guarantee as [`plan_to_job`]: the emitted job passes the
-    // pipeline schema's validation before anyone tries to execute it.
-    job.validate()?;
-    Ok(job)
+    finish_job(plan, ctx, chain, sink)
 }
 
 /// Pull the render canvas dimensions from the op chain: the LAST
@@ -806,7 +178,7 @@ fn build_render3d_opts(options: &Mesh3DOptions, width: u32, height: u32, bg: [u8
         .projection
         .map(projection_tag_from_mode)
         .unwrap_or("perspective");
-    let fov_deg = options.fov_deg.unwrap_or(DEFAULT_RENDER3D_FOV_DEG);
+    let fov_deg = f32j(options.fov_deg.unwrap_or(DEFAULT_RENDER3D_FOV_DEG));
     // The renderer's default light spec lives behind
     // `LightSpec::default_light()` on the oxideav-render side; mirror
     // the same defaults here so the JSON carries the same values the
@@ -815,9 +187,9 @@ fn build_render3d_opts(options: &Mesh3DOptions, width: u32, height: u32, bg: [u8
         .light
         .map(|l| {
             json!({
-                "azimuth_deg": l.azimuth_deg,
-                "elevation_deg": l.elevation_deg,
-                "intensity": l.intensity,
+                "azimuth_deg": f32j(l.azimuth_deg),
+                "elevation_deg": f32j(l.elevation_deg),
+                "intensity": f32j(l.intensity),
             })
         })
         .unwrap_or_else(|| {
@@ -829,9 +201,9 @@ fn build_render3d_opts(options: &Mesh3DOptions, width: u32, height: u32, bg: [u8
         });
     let camera = options.camera.map(|c| {
         json!({
-            "elevation_deg": c.elevation_deg,
-            "azimuth_deg": c.azimuth_deg,
-            "distance": c.distance,
+            "elevation_deg": f32j(c.elevation_deg),
+            "azimuth_deg": f32j(c.azimuth_deg),
+            "distance": f32j(c.distance),
         })
     });
     let aa = options.aa.unwrap_or(1).clamp(1, 8);
@@ -872,6 +244,409 @@ fn projection_tag_from_mode(mode: ProjectionMode) -> &'static str {
         ProjectionMode::Perspective => "perspective",
         ProjectionMode::Orthographic => "orthographic",
     }
+}
+
+/// Sink-side (non-filter) state accumulated while walking ops:
+/// the encoder params bag, metadata stripping, `-format` override.
+struct SinkSide {
+    codec_params: Value,
+    strip_metadata: bool,
+    format_override: Option<String>,
+}
+
+impl Default for SinkSide {
+    fn default() -> Self {
+        SinkSide {
+            codec_params: json!({}),
+            strip_metadata: false,
+            format_override: None,
+        }
+    }
+}
+
+/// Convert an `f32` op value to a JSON number without widening noise.
+///
+/// A plain `json!(x)` widens f32→f64 bit-exactly, so `-light 10,20,0.9`
+/// would emit `"intensity": 0.8999999761581421` into the job document.
+/// Round-tripping through the f32's shortest decimal representation
+/// keeps the number the user actually typed (`0.9`) — the JSON stays
+/// snapshot-clean, and a consumer narrowing f64→f32 lands on the same
+/// f32 either way (shortest-repr is round-trip-exact by definition).
+fn f32j(v: f32) -> Value {
+    json!(v.to_string().parse::<f64>().unwrap_or(f64::from(v)))
+}
+
+/// Lower one [`Op`] onto the recursive filter chain, or fold it into
+/// the sink-side state.
+///
+/// Shared by [`plan_to_job`] and [`plan_to_render3d_job`].
+/// `absorb_canvas` selects the 3D-render behaviour where the renderer
+/// produces the canvas directly ([`pick_render3d_dims`] /
+/// [`pick_render3d_bg`] already consumed `-resize` / `-background`,
+/// and the resize half of `-thumbnail` is likewise absorbed) so those
+/// ops must not ALSO survive as filter nodes — skipping them avoids a
+/// redundant resize / background pass downstream of the Render3D
+/// source.
+fn lower_op(chain: TrackInput, op: &Op, sink: &mut SinkSide, absorb_canvas: bool) -> TrackInput {
+    // A filter-chain step — wrap the current chain in a FilterNode.
+    let wrap = |prev: TrackInput, filter: &str, params: Value| {
+        TrackInput::Filter(FilterNode {
+            filter: filter.to_string(),
+            params,
+            input: Box::new(prev),
+        })
+    };
+
+    match op {
+        Op::Resize {
+            width,
+            height,
+            mode,
+        } => {
+            if absorb_canvas {
+                // Renderer absorbs the dims — encoded directly onto
+                // the RenderOptions payload, not as a filter node.
+                return chain;
+            }
+            // The pipeline's resize factory takes literal target
+            // dims today. We forward `width`/`height` along with
+            // the geometry mode tag so a future executor pass can
+            // resolve the source-aware variants (Fill/Shrink/Grow/
+            // Percent/Area) against the actual frame size at
+            // DAG-build time. Until that lands, only `Default` and
+            // `Force` are pixel-accurate on the pipeline path —
+            // the source-aware modes degrade to `Default` semantics
+            // when the executor sees a mode it doesn't understand.
+            // The PDF side-channel (which already knows the source
+            // dims) honours every mode today.
+            wrap(
+                chain,
+                "video.resize",
+                json!({
+                    "width": width,
+                    "height": height,
+                    "interpolation": "bilinear",
+                    "mode": mode.as_tag(),
+                }),
+            )
+        }
+        Op::Thumbnail {
+            width,
+            height,
+            mode,
+        } => {
+            // `-thumbnail` is sugar for `Resize + Strip` (and, on a
+            // future pass, EXIF auto-orient). On the render path the
+            // renderer already produced the canvas at the requested
+            // size via `pick_render3d_dims`, so only the strip half
+            // survives there.
+            sink.strip_metadata = true;
+            if absorb_canvas {
+                return chain;
+            }
+            wrap(
+                chain,
+                "video.resize",
+                json!({
+                    "width": width,
+                    "height": height,
+                    "interpolation": "bilinear",
+                    "mode": mode.as_tag(),
+                }),
+            )
+        }
+        Op::Define { key, value } => {
+            // Forward the literal key (preserving any `:` namespace
+            // separator) onto the codec params bag. Values that
+            // parse as integers / floats / booleans still come
+            // through as JSON strings — codecs that care about
+            // type can re-parse from the string. Bare `-define KEY`
+            // (no `=VALUE`) becomes `{"KEY": true}`.
+            match value {
+                Some(v) => sink.codec_params[key.clone()] = json!(v),
+                None => sink.codec_params[key.clone()] = json!(true),
+            }
+            chain
+        }
+        Op::Blur { radius, sigma } => wrap(
+            chain,
+            "video.blur",
+            json!({
+                "radius": radius,
+                "sigma": f32j(*sigma),
+                "planes": "all"
+            }),
+        ),
+        Op::Edge { radius } => wrap(chain, "video.edge", json!({ "radius": radius })),
+        Op::Colors { count, dither } => {
+            // Palette quantisation: rely on the pipeline's
+            // ConvertNode (pixfmt) which already supports
+            // `pal8` + dither via `oxideav-pixfmt`.  We nest
+            // the palette step inline as a filter-shaped node
+            // that the executor recognises by name.
+            let dither_str = match dither {
+                Dither::None => "none",
+                Dither::Bayer => "bayer",
+                Dither::FloydSteinberg => "floyd_steinberg",
+            };
+            wrap(
+                chain,
+                "video.pixfmt",
+                json!({
+                    "format": "pal8",
+                    "dither": dither_str,
+                    "colors": count,
+                }),
+            )
+        }
+        Op::Format(fmt) => {
+            sink.format_override = Some(fmt.clone());
+            chain
+        }
+        Op::Quality(q) => {
+            // Codec-specific key; the encoder drops it when
+            // unsupported.  Use `quality` for JPEG/WebP, `crf`
+            // could be added by a later pass for h264/h265.
+            sink.codec_params["quality"] = json!(q);
+            chain
+        }
+        Op::Strip => {
+            sink.strip_metadata = true;
+            chain
+        }
+        // Vector-input ops; dropped on both paths. Raster inputs have
+        // no DPI, no composite-over-bg semantics that wouldn't
+        // conflict with `-resize`/etc., and no alpha-channel grammar
+        // to honour beyond what the encoder already does; on the
+        // render path `-background` was already consumed by
+        // `pick_render3d_bg` before the walk. The pdf_runner
+        // side-channel applies them when reading PDFs.
+        Op::Density(_) | Op::Background(_) | Op::Alpha(_) => chain,
+        Op::Rotate { degrees } => wrap(chain, "video.rotate", json!({ "degrees": degrees })),
+        Op::Flip => wrap(chain, "video.flip", json!({})),
+        Op::Flop => wrap(chain, "video.flop", json!({})),
+        Op::Crop { x, y, w, h } => wrap(
+            chain,
+            "video.crop",
+            json!({ "x": x, "y": y, "width": w, "height": h }),
+        ),
+        Op::Extent {
+            width,
+            height,
+            x,
+            y,
+            bg,
+        } => {
+            // The `oxideav-image-filter` `Extent` factory accepts
+            // `width`/`height` plus optional signed `offset_x` /
+            // `offset_y` and an RGBA `background` array. We forward
+            // everything verbatim — the background was already
+            // resolved against the source-order `-background` ops
+            // at args-parse time so the plan walker stays
+            // stateless.
+            wrap(
+                chain,
+                "video.extent",
+                json!({
+                    "width": width,
+                    "height": height,
+                    "offset_x": x,
+                    "offset_y": y,
+                    "background": [bg[0], bg[1], bg[2], bg[3]],
+                }),
+            )
+        }
+        Op::Negate => wrap(chain, "video.negate", json!({})),
+        Op::Sharpen { radius, sigma } => wrap(
+            chain,
+            "video.sharpen",
+            json!({ "radius": radius, "sigma": f32j(*sigma) }),
+        ),
+        Op::Unsharp {
+            radius,
+            sigma,
+            amount,
+            threshold,
+        } => wrap(
+            chain,
+            "video.unsharp",
+            json!({
+                "radius": radius,
+                "sigma": f32j(*sigma),
+                "amount": f32j(*amount),
+                "threshold": threshold,
+            }),
+        ),
+        Op::Gamma { value } => wrap(chain, "video.gamma", json!({ "value": f32j(*value) })),
+        Op::BrightnessContrast {
+            brightness,
+            contrast,
+        } => wrap(
+            chain,
+            "video.brightness-contrast",
+            json!({ "brightness": f32j(*brightness), "contrast": f32j(*contrast) }),
+        ),
+        Op::Contrast { delta } => {
+            // IM's bare `-contrast` flag bumps contrast by a single
+            // 5%-of-range step. Multiple `-contrast` accumulate
+            // linearly. Map to the brightness-contrast factory's
+            // contrast-only knob so the executor can fold this into
+            // a single LUT pass alongside any explicit
+            // `-brightness-contrast` already in the chain.
+            let pct = f64::from(*delta) * 5.0;
+            wrap(chain, "video.contrast", json!({ "value": pct }))
+        }
+        Op::Sepia { threshold } => wrap(
+            chain,
+            "video.sepia",
+            json!({ "threshold": f32j(*threshold) }),
+        ),
+        Op::Modulate {
+            brightness,
+            saturation,
+            hue,
+        } => {
+            // IM's hue is "percent-of-base around 100" — 0 is
+            // -180°, 100 is identity, 200 is +180°. The
+            // image-filter factory accepts degrees directly via
+            // `hue_degrees`, so translate. The subtract/scale runs
+            // in f64 on the noise-free decimal value so round CLI
+            // inputs produce round degree values (hue=150 → 90.0,
+            // not 89.99999…).
+            let hue_clean = f32j(*hue).as_f64().unwrap_or(f64::from(*hue));
+            let hue_degrees = (hue_clean - 100.0) * 1.8;
+            wrap(
+                chain,
+                "video.modulate",
+                json!({
+                    "brightness": f32j(*brightness),
+                    "saturation": f32j(*saturation),
+                    "hue_degrees": hue_degrees,
+                }),
+            )
+        }
+        Op::Level {
+            black,
+            gamma,
+            white,
+        } => wrap(
+            chain,
+            "video.level",
+            json!({ "black": black, "gamma": f32j(*gamma), "white": white }),
+        ),
+        Op::Normalize => wrap(chain, "video.normalize", json!({})),
+        Op::Threshold { value } => wrap(chain, "video.threshold", json!({ "value": value })),
+        Op::Posterize { levels } => wrap(chain, "video.posterize", json!({ "levels": levels })),
+        Op::Solarize { value } => wrap(chain, "video.solarize", json!({ "value": value })),
+        Op::Colorspace(cs) => {
+            let lower = cs.to_ascii_lowercase();
+            if lower == "gray" || lower == "grey" {
+                return wrap(chain, "video.grayscale", json!({ "preserve_alpha": true }));
+            }
+            // `rgb` / `srgb` are recorded no-ops — input keeps its
+            // colourspace, downstream encoder converts as needed.
+            chain
+        }
+        Op::Vignette {
+            radius,
+            sigma,
+            x,
+            y,
+        } => wrap(
+            chain,
+            "video.vignette",
+            json!({
+                "x": f32j(*x),
+                "y": f32j(*y),
+                "radius": f32j(*radius),
+                "sigma": f32j(*sigma),
+            }),
+        ),
+        Op::Colorize { color, amount } => wrap(
+            chain,
+            "video.colorize",
+            json!({
+                "color": [color[0], color[1], color[2], color[3]],
+                "amount": f32j(*amount),
+            }),
+        ),
+        Op::Equalize => wrap(chain, "video.equalize", json!({})),
+        Op::AutoGamma => wrap(chain, "video.auto-gamma", json!({})),
+        Op::Trim { fuzz } => {
+            // The image-filter `Trim` factory accepts `fuzz` as a
+            // 0..=255 byte plus an optional `background` array. We
+            // forward only `fuzz` here — the args parser doesn't
+            // expose a per-`-trim` colour override yet, so the
+            // factory falls back to its corner-pixel auto-detection
+            // (matching IM's behaviour when neither `-bordercolor`
+            // nor `-background` is set).
+            wrap(chain, "video.trim", json!({ "fuzz": fuzz }))
+        }
+        Op::Roll { dx, dy } => {
+            // Signed circular shift; the `oxideav-image-filter`
+            // `Roll` factory accepts `dx`/`dy` (also `x`/`y`
+            // aliases). Pixels that fall off one edge wrap around to
+            // the opposite edge so the visible image translates as a
+            // rigid block; width/height stay unchanged, so no shape
+            // recovery is needed downstream.
+            wrap(chain, "video.roll", json!({ "dx": dx, "dy": dy }))
+        }
+    }
+}
+
+/// Shared tail for both planners: fold sink-side state into the codec
+/// params, resolve the output codec, assemble the single-output
+/// [`Job`], and enforce the schema-validation guarantee.
+fn finish_job(
+    plan: &ConvertPlan,
+    ctx: &RuntimeContext,
+    chain: TrackInput,
+    mut sink: SinkSide,
+) -> Result<Job, Error> {
+    // Sink-side metadata handling.
+    if sink.strip_metadata {
+        sink.codec_params["strip_metadata"] = json!(true);
+    }
+    if let Some(ref f) = sink.format_override {
+        sink.codec_params["format"] = json!(f);
+    }
+
+    // The pipeline insists every filter-terminated track carry an
+    // output codec — frames can't be stream-copied.  Infer from the
+    // output extension (or `-format` override) so the IM-style
+    // `convert in.png -resize 64x64 out.jpg` works without the user
+    // stating the obvious.
+    let codec = codec_for_output(sink.format_override.as_deref(), &plan.output, ctx);
+
+    let track = TrackSpec {
+        input: chain,
+        codec,
+        params: sink.codec_params,
+        stream_selector: None,
+    };
+
+    let mut outputs = IndexMap::new();
+    outputs.insert(
+        plan.output.clone(),
+        OutputSpec {
+            audio: vec![],
+            video: vec![],
+            subtitle: vec![],
+            all: vec![track],
+        },
+    );
+
+    let job = Job {
+        outputs,
+        aliases: IndexMap::new(),
+        threads: None,
+    };
+    // Guarantee: every job this planner emits satisfies the pipeline
+    // schema's own invariants (non-empty source, non-blank codec ids,
+    // …). Validating here turns a planner bug into a typed error at
+    // plan time instead of an opaque executor failure later.
+    job.validate()?;
+    Ok(job)
 }
 
 /// Guess the output codec from the extension, honouring `-format`
