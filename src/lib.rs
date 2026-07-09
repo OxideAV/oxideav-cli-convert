@@ -44,9 +44,11 @@ pub mod pixel_xform;
 pub mod plan_to_job;
 pub mod probe;
 pub mod raster_io;
+pub mod route;
 pub mod suggest;
 
 pub use op::{AlphaOp, ConvertPlan, Dither, Op, PrintfTemplate, ResizeMode};
+pub use route::Route;
 
 use oxideav_core::{Error, RuntimeContext};
 
@@ -58,93 +60,69 @@ use oxideav_core::{Error, RuntimeContext};
 pub fn run(args: &[String], ctx: &RuntimeContext) -> Result<(), Error> {
     let plan = args::parse(args)?;
 
-    // `-ping` short-circuits everything: print one IM-format header
-    // line per "image" (page / video stream) to stdout and exit
-    // without any pixel decode or output write. Routed BEFORE the PDF
-    // side-channel so the ping module owns the PDF-vs-container split
-    // for itself.
-    if plan.ping {
-        return ping::run(&plan, ctx);
-    }
+    // All routing decisions live in `route::decide` (pure, matrix-
+    // tested); this function only performs the dispatched work. See
+    // the `route` module docs for the precedence order and why input
+    // classification outranks output classification.
+    match route::decide(&plan)? {
+        // `-ping`: one IM-format header line per "image" (page /
+        // video stream) to stdout, no pixel decode, no output write.
+        // The ping module owns the PDF-vs-container split for itself.
+        Route::Ping => ping::run(&plan, ctx),
 
-    // `--probe` is the structural-inspection mode: decode the input
-    // far enough to extract metadata (page count, mesh count, sample
-    // rate, …), print a summary to stdout, and skip any output write.
-    // The args parser already enforced the "no output positional"
-    // rule, so the probe module only deals with one shape (input-only).
-    if plan.probe {
-        return probe::run(&plan, ctx);
-    }
+        // `--probe`: decode the input far enough to extract metadata
+        // (page count, mesh count, sample rate, …), print a summary
+        // to stdout, and skip any output write. The args parser
+        // already enforced the "no output positional" rule, so the
+        // probe module only deals with one shape (input-only).
+        Route::Probe => probe::run(&plan, ctx),
 
-    // Side-channel: PDF inputs go through a Scene-aware runner that
-    // bypasses the regular FrameSource pipeline. PDF pages don't fit
-    // the `Frame::Video` shape `oxideav-pipeline` expects, and the
-    // routing rule (encoder accepts Scene → pass through; otherwise
-    // fan out per page when the filename has a `%d` template) is
-    // specific to `convert`. See `pdf_runner` module docs.
-    if pdf_runner::is_pdf_input(&plan.input) {
-        return pdf_runner::run(&plan);
-    }
+        // PDF inputs go through a Scene-aware runner that bypasses
+        // the regular FrameSource pipeline. PDF pages don't fit the
+        // `Frame::Video` shape `oxideav-pipeline` expects, and the
+        // routing rule (encoder accepts Scene → pass through;
+        // otherwise fan out per page when the filename has a `%d`
+        // template) is specific to `convert`. See `pdf_runner`.
+        Route::PdfSideChannel => pdf_runner::run(&plan),
 
-    // Side-channel: 3D-asset inputs (STL/OBJ/glTF/GLB/USDZ/MTL) go
-    // through a Mesh3DRegistry-driven decode→encode bridge for
-    // same-class round-trips, OR through the 3D→raster software
-    // renderer when paired with a raster output (.png/.jpg/.bmp/
-    // .webp). 3D scenes don't fit any of the codec/container shapes
-    // the regular pipeline walks, and the dispatch contract is a
-    // separate registry from `RuntimeContext`'s codec/container/
-    // filter/source path. See `mesh3d_runner` and `mesh3d_render`
-    // module docs.
-    #[cfg(feature = "mesh3d")]
-    if mesh3d_runner::is_mesh3d_input(&plan.input) {
-        if plan.output_template.is_some() {
-            return Err(Error::invalid(format!(
-                "convert: output '{}' has a `%d` template but 3D scenes are single-document; remove the template",
-                plan.output
-            )));
-        }
-        if mesh3d_runner::is_mesh3d_output(&plan.output) {
+        // 3D-asset same-class round-trip: decode → re-encode through
+        // the `Mesh3DRegistry`. 3D scenes don't fit any of the
+        // codec/container shapes the regular pipeline walks. See
+        // `mesh3d_runner` module docs.
+        #[cfg(feature = "mesh3d")]
+        Route::Mesh3dToMesh3d => {
             if !plan.ops.is_empty() {
                 eprintln!(
                     "convert: note: raster ops ignored on 3D-asset conversion (stl/obj/gltf/glb/mtl/usdz have no pixel grid)"
                 );
             }
-            return mesh3d_runner::run(&plan.input, &plan.output, &plan.mesh3d_options);
+            mesh3d_runner::run(&plan.input, &plan.output, &plan.mesh3d_options)
         }
-        // Raster output? Route to the 3D→raster software renderer.
-        if matches!(
-            raster_io::classify_output(&plan.output),
-            Ok(raster_io::OutputClass::Raster(_))
-        ) {
-            return mesh3d_render::run(&plan.input, &plan.output, &plan.ops, &plan.mesh3d_options);
+
+        // 3D-asset input paired with a raster output: software-render
+        // the scene to RGBA, then apply raster ops and encode. See
+        // `mesh3d_render` module docs.
+        #[cfg(feature = "mesh3d")]
+        Route::Mesh3dToRaster => {
+            mesh3d_render::run(&plan.input, &plan.output, &plan.ops, &plan.mesh3d_options)
         }
-        // Anything else (e.g. .pdf, .svg, .mp4, …): emit the
-        // pairing-mismatch error with a did-you-mean hint over the
-        // 3D-output set.
-        let out_ext = plan.output.rsplit('.').next().unwrap_or("");
-        let hint = suggest::format_hint(out_ext, &["stl", "obj", "gltf", "glb", "mtl", "usdz"]);
-        return Err(Error::invalid(format!(
-            "convert: 3D input '{}' must pair with a 3D output (.stl/.obj/.gltf/.glb/.mtl/.usdz) OR a raster output (.png/.jpg/.bmp/.webp); got '{}'{hint}",
-            plan.input, plan.output
-        )));
-    }
 
-    // Side-channel: `.ico` output. The ICO container carries one OR
-    // more sub-images at different resolutions, driven on the IM CLI
-    // by `-define icon:auto-resize=W1,W2,…`. The regular pipeline
-    // path's "one Frame::Video per track" shape doesn't fit that
-    // multi-image fan-out, and the `-define` key parsing + per-size
-    // resize is convert-specific. See `ico_runner` module docs.
-    #[cfg(feature = "ico")]
-    if ico_runner::is_ico_output(&plan.output) {
-        return ico_runner::run(&plan);
-    }
+        // `.ico` output: the ICO container carries one OR more
+        // sub-images at different resolutions, driven on the IM CLI
+        // by `-define icon:auto-resize=W1,W2,…`. The regular pipeline
+        // path's "one Frame::Video per track" shape doesn't fit that
+        // multi-image fan-out. See `ico_runner` module docs.
+        #[cfg(feature = "ico")]
+        Route::IcoOutput => ico_runner::run(&plan),
 
-    let job = plan_to_job::plan_to_job(&plan, ctx)?;
-    let stats = oxideav_pipeline::Executor::new(&job, ctx).run()?;
-    eprintln!(
-        "convert: {} packet(s) read, {} frame(s) decoded, {} frame(s) written",
-        stats.packets_read, stats.frames_decoded, stats.frames_written
-    );
-    Ok(())
+        Route::Pipeline => {
+            let job = plan_to_job::plan_to_job(&plan, ctx)?;
+            let stats = oxideav_pipeline::Executor::new(&job, ctx).run()?;
+            eprintln!(
+                "convert: {} packet(s) read, {} frame(s) decoded, {} frame(s) written",
+                stats.packets_read, stats.frames_decoded, stats.frames_written
+            );
+            Ok(())
+        }
+    }
 }
