@@ -426,11 +426,17 @@ pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Erro
         },
     );
 
-    Ok(Job {
+    let job = Job {
         outputs,
         aliases: IndexMap::new(),
         threads: None,
-    })
+    };
+    // Guarantee: every job this planner emits satisfies the pipeline
+    // schema's own invariants (non-empty source, non-blank codec ids,
+    // …). Validating here turns a planner bug into a typed error at
+    // plan time instead of an opaque executor failure later.
+    job.validate()?;
+    Ok(job)
 }
 
 /// Build a 3D→raster [`Job`] from a [`ConvertPlan`] whose input is a
@@ -743,11 +749,15 @@ pub fn plan_to_render3d_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<
         },
     );
 
-    Ok(Job {
+    let job = Job {
         outputs,
         aliases: IndexMap::new(),
         threads: None,
-    })
+    };
+    // Same guarantee as [`plan_to_job`]: the emitted job passes the
+    // pipeline schema's validation before anyone tries to execute it.
+    job.validate()?;
+    Ok(job)
 }
 
 /// Pull the render canvas dimensions from the op chain: the LAST
@@ -2379,5 +2389,253 @@ mod tests {
                 node.opts
             );
         }
+    }
+
+    // ---- schema-validation + JSON round-trip guarantees ----
+
+    /// Every op the planner knows how to lower, exercised once. Kept
+    /// as a function so both the validation sweep and the round-trip
+    /// sweep iterate the same corpus — adding an `Op` variant without
+    /// extending this list is caught by the exhaustive `match` in
+    /// `plan_to_job` going non-exhaustive, and adding it HERE keeps
+    /// the guarantees covering it.
+    fn representative_op_corpus() -> Vec<Vec<Op>> {
+        vec![
+            vec![],
+            vec![Op::Resize {
+                width: 64,
+                height: 32,
+                mode: ResizeMode::Fill,
+            }],
+            vec![Op::Thumbnail {
+                width: 128,
+                height: 128,
+                mode: ResizeMode::Default,
+            }],
+            vec![Op::Define {
+                key: "jpeg:dct-method".into(),
+                value: Some("float".into()),
+            }],
+            vec![Op::Blur {
+                radius: 2,
+                sigma: 1.0,
+            }],
+            vec![Op::Edge { radius: 1 }],
+            vec![Op::Colors {
+                count: 16,
+                dither: Dither::FloydSteinberg,
+            }],
+            vec![Op::Format("png".into()), Op::Quality(85), Op::Strip],
+            vec![Op::Density(300), Op::Background([1, 2, 3, 4])],
+            vec![Op::Alpha(crate::op::AlphaOp::Remove)],
+            vec![Op::Rotate { degrees: -270 }, Op::Flip, Op::Flop],
+            vec![Op::Crop {
+                x: 1,
+                y: 2,
+                w: 3,
+                h: 4,
+            }],
+            vec![Op::Extent {
+                width: 10,
+                height: 20,
+                x: -1,
+                y: 1,
+                bg: [0, 0, 0, 255],
+            }],
+            vec![Op::Negate],
+            vec![Op::Sharpen {
+                radius: 1,
+                sigma: 0.5,
+            }],
+            vec![Op::Unsharp {
+                radius: 2,
+                sigma: 1.0,
+                amount: 0.8,
+                threshold: 3,
+            }],
+            vec![Op::Gamma { value: 2.2 }],
+            vec![Op::BrightnessContrast {
+                brightness: 10.0,
+                contrast: -5.0,
+            }],
+            vec![Op::Contrast { delta: 2 }],
+            vec![Op::Sepia { threshold: 0.8 }],
+            vec![Op::Modulate {
+                brightness: 110.0,
+                saturation: 90.0,
+                hue: 150.0,
+            }],
+            vec![Op::Level {
+                black: 16,
+                gamma: 1.1,
+                white: 235,
+            }],
+            vec![Op::Normalize, Op::Equalize, Op::AutoGamma],
+            vec![Op::Threshold { value: 128 }],
+            vec![Op::Posterize { levels: 4 }],
+            vec![Op::Solarize { value: 200 }],
+            vec![Op::Colorspace("gray".into())],
+            vec![Op::Colorspace("srgb".into())],
+            vec![Op::Vignette {
+                radius: 50.0,
+                sigma: 25.0,
+                x: 0.5,
+                y: 0.5,
+            }],
+            vec![Op::Colorize {
+                color: [200, 100, 50, 255],
+                amount: 0.4,
+            }],
+            vec![Op::Trim { fuzz: 12 }],
+            vec![Op::Roll { dx: -3, dy: 7 }],
+            // A deep mixed chain — closest to real-world flag soup.
+            vec![
+                Op::Density(150),
+                Op::Resize {
+                    width: 800,
+                    height: 600,
+                    mode: ResizeMode::Shrink,
+                },
+                Op::Background([255, 255, 255, 255]),
+                Op::Alpha(crate::op::AlphaOp::Off),
+                Op::Sharpen {
+                    radius: 1,
+                    sigma: 0.5,
+                },
+                Op::Colorspace("gray".into()),
+                Op::Colors {
+                    count: 2,
+                    dither: Dither::FloydSteinberg,
+                },
+                Op::Quality(92),
+                Op::Strip,
+                Op::Define {
+                    key: "png:compression-level".into(),
+                    value: Some("9".into()),
+                },
+            ],
+        ]
+    }
+
+    /// GUARANTEE: every job the planner emits passes the pipeline
+    /// schema's own `Job::validate()`. `plan_to_job` also enforces
+    /// this at runtime now — the test documents the invariant and
+    /// keeps the corpus honest.
+    #[test]
+    fn every_emitted_job_passes_pipeline_validation() {
+        for (i, ops) in representative_op_corpus().into_iter().enumerate() {
+            let job = plan_to_job(&plan_with(ops.clone()), &empty_ctx())
+                .unwrap_or_else(|e| panic!("corpus[{i}] {ops:?} failed to plan: {e}"));
+            job.validate()
+                .unwrap_or_else(|e| panic!("corpus[{i}] {ops:?} emitted invalid job: {e}"));
+        }
+    }
+
+    /// GUARANTEE: every emitted job survives a full trip through the
+    /// pipeline's JSON dialect — serialise, re-parse, re-serialise,
+    /// byte-identical. This is what makes `convert`-planned jobs
+    /// storable / replayable as `oxideav run` documents.
+    #[test]
+    fn every_emitted_job_round_trips_through_job_json() {
+        let mut ctx = RuntimeContext::new();
+        ctx.containers.register_extension("jpg", "mjpeg");
+        for (i, ops) in representative_op_corpus().into_iter().enumerate() {
+            let job = plan_to_job(&plan_with(ops.clone()), &ctx).unwrap();
+            let first = job.to_json_pretty();
+            let reparsed = Job::from_json(&first).unwrap_or_else(|e| {
+                panic!("corpus[{i}] {ops:?} JSON did not re-parse: {e}\n{first}")
+            });
+            reparsed
+                .validate()
+                .unwrap_or_else(|e| panic!("corpus[{i}] re-parsed job invalid: {e}"));
+            let second = reparsed.to_json_pretty();
+            assert_eq!(
+                first, second,
+                "corpus[{i}] {ops:?}: JSON round-trip not stable"
+            );
+        }
+    }
+
+    /// Same two guarantees for the 3D→raster planner: validation +
+    /// byte-stable JSON round-trip, across default and fully-specified
+    /// `Mesh3DOptions` plus post-raster op chains.
+    #[test]
+    fn every_emitted_render3d_job_validates_and_round_trips() {
+        let option_corpus = vec![
+            Mesh3DOptions::default(),
+            Mesh3DOptions {
+                render_mode: Some(Mesh3DRenderMode::Phong),
+                projection: Some(ProjectionMode::Orthographic),
+                fov_deg: Some(35.0),
+                light: Some(crate::op::LightSpec {
+                    azimuth_deg: 12.0,
+                    elevation_deg: 34.0,
+                    intensity: 0.75,
+                }),
+                camera: Some(crate::op::CameraSpec {
+                    elevation_deg: 30.0,
+                    azimuth_deg: 45.0,
+                    distance: 1.5,
+                }),
+                bg: Some([10, 20, 30, 255]),
+                aa: Some(4),
+                ..Mesh3DOptions::default()
+            },
+        ];
+        let op_corpus = vec![
+            vec![],
+            vec![
+                Op::Resize {
+                    width: 800,
+                    height: 600,
+                    mode: ResizeMode::Default,
+                },
+                Op::Background([255, 255, 255, 255]),
+                Op::Rotate { degrees: 90 },
+                Op::Negate,
+                Op::Quality(85),
+                Op::Strip,
+            ],
+        ];
+        for opts in &option_corpus {
+            for ops in &op_corpus {
+                let plan = render3d_plan("scene.gltf", "out.png", ops.clone(), opts.clone());
+                let job = plan_to_render3d_job(&plan, &empty_ctx()).unwrap();
+                job.validate()
+                    .unwrap_or_else(|e| panic!("render3d job invalid: {e} (ops={ops:?})"));
+                let first = job.to_json_pretty();
+                let reparsed = Job::from_json(&first)
+                    .unwrap_or_else(|e| panic!("render3d JSON did not re-parse: {e}\n{first}"));
+                let second = reparsed.to_json_pretty();
+                assert_eq!(first, second, "render3d JSON round-trip not stable");
+                // The Render3D node itself must survive structurally:
+                // source / backend / opts equal after the trip.
+                let orig = match &job.outputs.values().next().unwrap().all[0].input.leaf() {
+                    TrackInput::Render3D(n) => (*n).clone(),
+                    other => panic!("expected Render3D leaf, got {other:?}"),
+                };
+                let back = match &reparsed.outputs.values().next().unwrap().all[0]
+                    .input
+                    .leaf()
+                {
+                    TrackInput::Render3D(n) => (*n).clone(),
+                    other => panic!("expected Render3D leaf after re-parse, got {other:?}"),
+                };
+                assert_eq!(orig, back, "Render3D node changed across the round-trip");
+            }
+        }
+    }
+
+    /// An empty input path can never reach the executor: the planner's
+    /// validation hook rejects it with the pipeline's typed error
+    /// instead of letting an unopenable "" source fail deep inside a
+    /// run.
+    #[test]
+    fn empty_input_path_is_rejected_at_plan_time() {
+        let mut plan = plan_with(vec![]);
+        plan.input = String::new();
+        let err = plan_to_job(&plan, &empty_ctx()).expect_err("empty source must not plan");
+        let msg = format!("{err}");
+        assert!(msg.contains("empty `from`"), "got: {msg}");
     }
 }
