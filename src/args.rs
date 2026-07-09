@@ -54,6 +54,7 @@ const KNOWN_FLAG_NAMES: &[&str] = &[
     "fuzz",
     "gamma",
     "gltf-format",
+    "help",
     "json",
     "level",
     "light",
@@ -106,6 +107,7 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
     let mut ops: Vec<Op> = Vec::new();
     let mut positionals: Vec<String> = Vec::new();
     let mut pending_dither = Dither::None;
+    let mut help = false;
     let mut ping = false;
     let mut probe = false;
     let mut probe_json = false;
@@ -309,6 +311,14 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
             }
             "-ping" => {
                 ping = true;
+                i += 1;
+            }
+            // `--help` (GNU-style) and `-help` (IM-style) both print
+            // the usage synopsis. Recognised anywhere on the line and
+            // outranks everything else — positional validation is
+            // skipped so a bare `convert --help` works.
+            "--help" | "-help" => {
+                help = true;
                 i += 1;
             }
             // `--probe` is GNU-style double-dash because it's a
@@ -744,6 +754,25 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
         }
     }
 
+    // `--help` short-circuits every validation below: the user asked
+    // for the synopsis, not a conversion, so missing/extra positionals
+    // are irrelevant.
+    if help {
+        return Ok(ConvertPlan {
+            input: String::new(),
+            input_pages: None,
+            ops,
+            output: String::new(),
+            output_template: None,
+            help: true,
+            ping,
+            probe,
+            probe_json,
+            probe_watch,
+            mesh3d_options,
+        });
+    }
+
     if positionals.is_empty() {
         return Err(Error::invalid(
             "convert: no input file given (usage: convert [-op VALUE]... INPUT [-op VALUE]... OUTPUT)",
@@ -803,12 +832,52 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
         ops,
         output,
         output_template,
+        help: false,
         ping,
         probe,
         probe_json,
         probe_watch,
         mesh3d_options,
     })
+}
+
+/// Human-readable usage synopsis for the convert verb.
+///
+/// The flag list is generated from [`KNOWN_FLAG_NAMES`] — the same
+/// table that powers "did you mean?" hints and is sync-tested against
+/// the parser's `match` arms — so the help text cannot drift from
+/// what the parser actually accepts.
+pub fn usage() -> String {
+    let mut s = String::new();
+    s.push_str("usage: oxideav convert [-op VALUE]... INPUT [-op VALUE]... OUTPUT\n");
+    s.push_str("       oxideav convert --probe [--json] [--watch] INPUT\n");
+    s.push_str("       oxideav convert -ping INPUT\n");
+    s.push_str("       oxideav convert --help\n");
+    s.push('\n');
+    s.push_str("Ops may appear before AND after the input; the first non-flag\n");
+    s.push_str("positional is the input, the last is the output. `--` ends flag\n");
+    s.push_str("parsing so filenames may start with `-`. PDF inputs accept a\n");
+    s.push_str("[N] / [N-M] / [A,B,...] page-selector suffix; `%d` output\n");
+    s.push_str("templates fan out one file per selected page.\n");
+    s.push('\n');
+    s.push_str("Recognised flags (see the crate README for per-flag grammar):\n");
+    for chunk in KNOWN_FLAG_NAMES.chunks(5) {
+        s.push(' ');
+        for name in chunk {
+            // The four GNU-style mode switches take a double dash;
+            // everything else is a single-dash IM-style op.
+            let lead = if matches!(*name, "probe" | "json" | "watch" | "help") {
+                "--"
+            } else {
+                "-"
+            };
+            s.push(' ');
+            s.push_str(lead);
+            s.push_str(name);
+        }
+        s.push('\n');
+    }
+    s
 }
 
 /// Strip an ImageMagick-style `[N]` / `[N-M]` / `[A,B,…]` page-selector
@@ -3607,6 +3676,45 @@ mod tests {
         );
     }
 
+    // ---- `--help` mode + usage synopsis ----
+
+    #[test]
+    fn help_parses_with_no_positionals() {
+        for argv in [vec!["--help"], vec!["-help"]] {
+            let p = parse(&to_vec(&argv)).unwrap();
+            assert!(p.help, "argv={argv:?}");
+        }
+    }
+
+    #[test]
+    fn help_anywhere_on_a_full_line_still_wins() {
+        // Positional validation is skipped: even a line that would
+        // otherwise error (probe + output) parses once --help is on it.
+        let p = parse(&to_vec(&["in.png", "--help", "--probe", "out.png"])).unwrap();
+        assert!(p.help);
+    }
+
+    /// The usage text must mention every recognised flag — it is
+    /// generated from [`KNOWN_FLAG_NAMES`], so this pins the
+    /// generation (right dash flavour included) rather than the table.
+    #[test]
+    fn usage_lists_every_known_flag_with_correct_lead() {
+        let text = usage();
+        for name in KNOWN_FLAG_NAMES {
+            let lead = if matches!(*name, "probe" | "json" | "watch" | "help") {
+                "--"
+            } else {
+                "-"
+            };
+            let rendered = format!(" {lead}{name}");
+            assert!(
+                text.contains(&rendered),
+                "usage text is missing '{rendered}':\n{text}"
+            );
+        }
+        assert!(text.starts_with("usage: oxideav convert"));
+    }
+
     // ---- `--` end-of-flags marker + empty-argument hardening ----
 
     #[test]
@@ -3719,6 +3827,7 @@ mod tests {
             &["--probe", "in.png"],
             &["--probe", "--json", "in.png"],
             &["--probe", "--watch", "in.png"],
+            &["--help"],
         ];
 
         let mut covered: Vec<&str> = Vec::new();
@@ -3739,7 +3848,7 @@ mod tests {
             let res = parse(&to_vec(argv));
             assert!(res.is_ok(), "argv {argv:?} rejected: {:?}", res.err());
         }
-        covered.extend(["probe", "json", "watch"]);
+        covered.extend(["probe", "json", "watch", "help"]);
 
         // Table completeness: every advertised name has a test case…
         for name in KNOWN_FLAG_NAMES {

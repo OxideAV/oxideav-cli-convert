@@ -891,6 +891,11 @@ pub struct ConvertPlan {
     /// Scene-shaped source (PDF) and the output codec doesn't natively
     /// accept Scenes.
     pub output_template: Option<PrintfTemplate>,
+    /// `--help` / `-help` mode — print the usage synopsis (generated
+    /// from the parser's own flag table, so it cannot drift) to stdout
+    /// and do nothing else. Outranks every other mode; positional
+    /// arguments become optional and are not validated.
+    pub help: bool,
     /// `-ping` mode — read only the headers, print one IM-format line
     /// per "image" (page / video stream) to stdout, skip pixel decode
     /// and any output write. Output positional becomes optional.

@@ -30,6 +30,8 @@ use oxideav_core::Error;
 /// dispatches to for a given plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
+    /// `--help` / `-help`: print the usage synopsis, nothing else.
+    Help,
     /// `-ping`: print one IM-format header line per image/stream,
     /// no pixel decode, no output write.
     Ping,
@@ -59,6 +61,7 @@ impl Route {
     /// Stable lowercase tag, handy for log lines and test diagnostics.
     pub fn as_tag(&self) -> &'static str {
         match self {
+            Route::Help => "help",
             Route::Ping => "ping",
             Route::Probe => "probe",
             Route::PdfSideChannel => "pdf",
@@ -82,7 +85,11 @@ impl Route {
 /// extensionless path that exists on disk may be classified by
 /// content. Paths that don't exist are classified by extension alone.
 pub fn decide(plan: &ConvertPlan) -> Result<Route, Error> {
-    // `-ping` short-circuits everything, including `--probe`.
+    // `--help` outranks everything — the user asked for the synopsis.
+    if plan.help {
+        return Ok(Route::Help);
+    }
+    // `-ping` short-circuits everything else, including `--probe`.
     if plan.ping {
         return Ok(Route::Ping);
     }
@@ -160,6 +167,7 @@ mod tests {
             ops: vec![],
             output: output.into(),
             output_template: None,
+            help: false,
             ping: false,
             probe: false,
             probe_json: false,
@@ -192,6 +200,15 @@ mod tests {
         p.ping = true;
         p.probe = true;
         assert_eq!(decide(&p).unwrap(), Route::Ping);
+    }
+
+    #[test]
+    fn help_outranks_every_other_mode() {
+        let mut p = plan("in.pdf", "out.png");
+        p.help = true;
+        p.ping = true;
+        p.probe = true;
+        assert_eq!(decide(&p).unwrap(), Route::Help);
     }
 
     #[test]
@@ -424,6 +441,7 @@ mod tests {
 
     #[test]
     fn route_tags_are_stable() {
+        assert_eq!(Route::Help.as_tag(), "help");
         assert_eq!(Route::Ping.as_tag(), "ping");
         assert_eq!(Route::Probe.as_tag(), "probe");
         assert_eq!(Route::PdfSideChannel.as_tag(), "pdf");

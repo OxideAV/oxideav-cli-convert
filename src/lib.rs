@@ -65,6 +65,13 @@ pub fn run(args: &[String], ctx: &RuntimeContext) -> Result<(), Error> {
     // the `route` module docs for the precedence order and why input
     // classification outranks output classification.
     match route::decide(&plan)? {
+        // `--help`: print the usage synopsis (generated from the
+        // parser's own flag table) and do nothing else.
+        Route::Help => {
+            print!("{}", args::usage());
+            Ok(())
+        }
+
         // `-ping`: one IM-format header line per "image" (page /
         // video stream) to stdout, no pixel decode, no output write.
         // The ping module owns the PDF-vs-container split for itself.

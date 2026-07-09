@@ -74,6 +74,11 @@ even when it starts with a dash, so files literally named
 Empty arguments (usually an unset shell variable) are rejected at
 parse time with an actionable message.
 
+`--help` (or IM-style `-help`) prints a usage synopsis whose flag
+list is generated from the parser's own flag table — the same table
+that powers "did you mean?" hints and is sync-tested against the
+parser — so the help text cannot drift from what actually parses.
+
 ## Inputs
 
 | Form | Resolved by | Examples |
