@@ -125,6 +125,11 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
     // `-trim`'s tolerance).
     let mut current_fuzz: u8 = 0;
 
+    // `--` end-of-flags marker: everything after it is a positional,
+    // even when it starts with `-`. Lets users name files like
+    // `-weird.png` (`convert -- -weird.png out.jpg`).
+    let mut no_more_flags = false;
+
     let mut i = 0;
     while i < args.len() {
         let flag = &args[i];
@@ -134,14 +139,27 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                 .ok_or_else(|| Error::invalid(format!("convert: {flag}: missing value")))
         };
 
-        // Non-flag → positional.
-        if !flag.starts_with('-') {
+        // Non-flag → positional. An empty argument can only be a
+        // mistake (usually an unquoted empty shell variable) — reject
+        // it here with a convert-speak message instead of letting an
+        // unopenable "" filename fail somewhere deep in a runner.
+        if no_more_flags || !flag.starts_with('-') {
+            if flag.is_empty() {
+                return Err(Error::invalid(
+                    "convert: empty argument (positional filenames must be non-empty; check for an unset shell variable)",
+                ));
+            }
             positionals.push(flag.clone());
             i += 1;
             continue;
         }
 
         match flag.as_str() {
+            // GNU-style end-of-flags marker.
+            "--" => {
+                no_more_flags = true;
+                i += 1;
+            }
             "-resize" => {
                 let v = val(i + 1)?;
                 let (mode, core) = ResizeMode::split_suffix(v);
@@ -3587,5 +3605,156 @@ mod tests {
                 Op::Strip,
             ]
         );
+    }
+
+    // ---- `--` end-of-flags marker + empty-argument hardening ----
+
+    #[test]
+    fn double_dash_treats_following_dash_args_as_positionals() {
+        // A file literally named `-weird.png` is expressible.
+        let p = parse(&to_vec(&["--", "-weird.png", "-out.jpg"])).unwrap();
+        assert_eq!(p.input, "-weird.png");
+        assert_eq!(p.output, "-out.jpg");
+        assert!(p.ops.is_empty());
+    }
+
+    #[test]
+    fn flags_before_double_dash_still_parse() {
+        let p = parse(&to_vec(&["-resize", "64x64", "--", "-in.png", "out.png"])).unwrap();
+        assert_eq!(p.input, "-in.png");
+        assert_eq!(p.output, "out.png");
+        assert_eq!(p.ops.len(), 1);
+    }
+
+    #[test]
+    fn flags_after_double_dash_are_positionals_not_flags() {
+        // Three positionals (`-resize` is a filename after `--`) →
+        // multi-input error, NOT an op.
+        let err = parse(&to_vec(&["--", "-resize", "64x64", "out.png"])).unwrap_err();
+        let s = format!("{err}");
+        assert!(s.contains("multi-input"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_positional_is_rejected_with_actionable_message() {
+        for argv in [
+            vec!["", "out.png"],
+            vec!["in.png", ""],
+            vec!["--", "", "out.png"],
+        ] {
+            let err = parse(&to_vec(&argv)).unwrap_err();
+            let s = format!("{err}");
+            assert!(s.contains("empty argument"), "argv={argv:?} got: {err}");
+        }
+    }
+
+    /// Every entry in [`KNOWN_FLAG_NAMES`] must be accepted by the
+    /// parser's `match` — a table entry the parser rejects as an
+    /// unknown flag means the two drifted apart (the table exists to
+    /// power "did you mean?" hints for exactly these names, so a
+    /// stale entry would SUGGEST a flag that then errors).
+    ///
+    /// The value column supplies a minimal valid argument per flag so
+    /// the whole line parses `Ok` — catching not just unknown-flag
+    /// drift but accidental value-grammar breakage too.
+    #[test]
+    fn every_known_flag_name_is_accepted_by_the_parser() {
+        // (flag-as-typed, extra args, needs_probe)
+        let cases: &[(&str, &[&str])] = &[
+            ("-aa", &["2"]),
+            ("-alpha", &["on"]),
+            ("-auto-gamma", &[]),
+            ("-background", &["white"]),
+            ("-bg", &["white"]),
+            ("-blur", &["1x1"]),
+            ("-brightness-contrast", &["10,5"]),
+            ("-camera", &["30,45,1.5"]),
+            ("-colorize", &["red/50%"]),
+            ("-colors", &["16"]),
+            ("-colorspace", &["gray"]),
+            ("-contrast", &[]),
+            ("-crop", &["1x1+0+0"]),
+            ("-define", &["k=v"]),
+            ("-density", &["72"]),
+            ("-dither", &["none"]),
+            ("-edge", &["1"]),
+            ("-equalize", &[]),
+            ("-extent", &["10x10"]),
+            ("-flip", &[]),
+            ("-flop", &[]),
+            ("-format", &["png"]),
+            ("-fov", &["60"]),
+            ("-fuzz", &["5"]),
+            ("-gamma", &["1.2"]),
+            ("-gltf-format", &["glb"]),
+            ("-level", &["16"]),
+            ("-light", &["45,45,1.0"]),
+            ("-modulate", &["100,100,100"]),
+            ("-monochrome", &[]),
+            ("-negate", &[]),
+            ("-normalize", &[]),
+            ("-ping", &[]),
+            ("-posterize", &["4"]),
+            ("-projection", &["persp"]),
+            ("-quality", &["85"]),
+            ("-render", &["flat"]),
+            ("-resize", &["64x64"]),
+            ("-roll", &["+1+1"]),
+            ("-rotate", &["90"]),
+            ("-sepia", &["80%"]),
+            ("-sharpen", &["1x0.5"]),
+            ("-solarize", &["50%"]),
+            ("-stl-format", &["binary"]),
+            ("-strip", &[]),
+            ("-thumbnail", &["64x64"]),
+            ("-threshold", &["50%"]),
+            ("-trim", &[]),
+            ("-unsharp", &["1x1"]),
+            ("-vignette", &["50"]),
+        ];
+        // Double-dash mode switches need their own argv shapes
+        // (`--json` / `--watch` require `--probe`; `--probe` forbids
+        // an output positional).
+        let mode_cases: &[&[&str]] = &[
+            &["--probe", "in.png"],
+            &["--probe", "--json", "in.png"],
+            &["--probe", "--watch", "in.png"],
+        ];
+
+        let mut covered: Vec<&str> = Vec::new();
+        for (flag, extra) in cases {
+            let mut argv: Vec<&str> = vec!["in.png"];
+            argv.push(flag);
+            argv.extend_from_slice(extra);
+            argv.push("out.png");
+            let res = parse(&to_vec(&argv));
+            assert!(
+                res.is_ok(),
+                "flag {flag} rejected with sample value {extra:?}: {:?}",
+                res.err()
+            );
+            covered.push(flag.trim_start_matches('-'));
+        }
+        for argv in mode_cases {
+            let res = parse(&to_vec(argv));
+            assert!(res.is_ok(), "argv {argv:?} rejected: {:?}", res.err());
+        }
+        covered.extend(["probe", "json", "watch"]);
+
+        // Table completeness: every advertised name has a test case…
+        for name in KNOWN_FLAG_NAMES {
+            assert!(
+                covered.contains(name),
+                "KNOWN_FLAG_NAMES entry '{name}' has no acceptance case — add one above"
+            );
+        }
+        // …and every test case is advertised (no hidden flags that a
+        // typo could never get a hint for).
+        for name in &covered {
+            assert!(
+                KNOWN_FLAG_NAMES.contains(name),
+                "flag '{name}' parses but is missing from KNOWN_FLAG_NAMES"
+            );
+        }
     }
 }

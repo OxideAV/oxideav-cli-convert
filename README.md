@@ -68,6 +68,12 @@ non-flag positional is the input; the last is the output. Multiple
 inputs (`convert in1.pdf in2.pdf out.gif`) is a documented
 follow-up; today it errors with a clear message.
 
+A `--` marker ends flag parsing: everything after it is a positional
+even when it starts with a dash, so files literally named
+`-weird.png` are expressible (`convert -- -weird.png out.jpg`).
+Empty arguments (usually an unset shell variable) are rejected at
+parse time with an actionable message.
+
 ## Inputs
 
 | Form | Resolved by | Examples |
