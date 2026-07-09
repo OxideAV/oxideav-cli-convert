@@ -58,8 +58,9 @@ five geometry / negate ops; the new tonal ops are pipeline-only on
 the PDF path today (a follow-up will route them through the same
 inline pre-encode hook).
 
-Anything else reports `unsupported: convert: -<op> is not yet
-implemented` and exits cleanly — no silent misbehaviour.
+Anything else reports `convert: unknown flag '-<op>'` (with a "did
+you mean?" hint when the token is a close edit of a real flag) and
+exits cleanly — no silent misbehaviour.
 
 ## Arg ordering
 
@@ -128,13 +129,15 @@ routing:
 | **Raster** | `.png` `.jpg` `.bmp` `.webp`, plus any other extension a registered container claims (`qoi`, `dds`, …) | render each page to RGBA, encode |
 
 Codec lookup goes through the caller's `RuntimeContext` —
-`ContainerRegistry::container_for_extension` is consulted first, so any
-sibling crate that registers itself (e.g. `oxideav_qoi::register`,
-`oxideav_dds::register`) extends the supported output set
-automatically. A small fallback table inside `plan_to_job` covers the
-aliasing cases where the canonical encoder name differs from the
-container name (`jpg` → `mjpeg`, `wav` → `pcm_s16le`, `ogg` →
-`vorbis`, `avif` → `av1`, `ico`/`cur` → `png`).
+`ContainerRegistry::container_for_extension` is the single source of
+truth, so any sibling crate that registers itself (e.g.
+`oxideav_qoi::register`, `oxideav_dds::register`) extends the
+supported output set automatically, aliasing included (each
+registering crate owns its extension aliases, e.g. `oxideav-mjpeg`
+claims both `jpg` and `jpeg`). Extensions nobody registered
+resolve to no codec: the pipeline then infers per-track (the right
+answer for video containers like MP4/MKV that don't pin a single
+codec) or prompts for an explicit `-format CODEC`.
 
 ### Printf templates
 
