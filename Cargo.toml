@@ -53,7 +53,7 @@ oxideav-pipeline = "0.1"
 oxideav-image-filter = "0.1"
 oxideav-generator = { version = "0.1", optional = true }
 # Scene-aware inputs (PDF reader → Scene with pages) + per-page fan-out.
-oxideav-pdf = "0.1"
+oxideav-pdf = "0.2"
 oxideav-scene = "0.1"
 oxideav-raster = "0.1"
 oxideav-png = "0.1"
