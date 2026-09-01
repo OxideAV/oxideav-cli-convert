@@ -32,19 +32,28 @@
 
 pub mod args;
 #[cfg(feature = "ico")]
+#[doc(hidden)]
 pub mod ico_runner;
 #[cfg(feature = "mesh3d")]
+#[doc(hidden)]
 pub mod mesh3d_render;
 #[cfg(feature = "mesh3d")]
+#[doc(hidden)]
 pub mod mesh3d_runner;
 pub mod op;
+#[doc(hidden)]
 pub mod pdf_runner;
+#[doc(hidden)]
 pub mod ping;
+#[doc(hidden)]
 pub mod pixel_xform;
 pub mod plan_to_job;
+#[doc(hidden)]
 pub mod probe;
+#[doc(hidden)]
 pub mod raster_io;
 pub mod route;
+#[doc(hidden)]
 pub mod suggest;
 
 pub use op::{AlphaOp, ConvertPlan, Dither, Op, PrintfTemplate, ResizeMode};
