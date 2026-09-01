@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.5...v0.0.6) - 2026-09-01
+
+### Added
+
+- *(convert)* --help / -help usage synopsis generated from the parser's flag table
+- *(convert)* arg-parsing hardening — '--' end-of-flags, empty-arg rejection, flag-table sync test
+- *(convert)* golden plan snapshots + noise-free f32 JSON + shared op-lowering
+- *(convert)* schema-validation guarantee on every emitted job + JSON round-trip pinning
+- *(convert)* extract pure routing layer with matrix-pinned dispatch
+- *(convert)* plan_to_render3d_job() for 3D→raster auto-route (Phase C-3b)
+
+### Fixed
+
+- *(convert)* -thumbnail seeds the 3D render canvas + %d template rejected on non-fanout routes
+
+### Other
+
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+- *(convert)* fix two stale README claims against current behaviour
+- *(convert)* adversarial-argv no-panic corpus + CHANGELOG rollup + planning-guarantees docs
+- follow oxideav-pdf 0.2 (major-bump pin propagation)
+- add CI / crates.io / docs.rs / MIT-license badges
+- refresh to current status, drop per-round changelog cruft
+- drop release-plz.toml — use release-plz defaults across the workspace
+
 ### Added
 
 - `route` module — pure routing layer. `route::decide(&ConvertPlan)
