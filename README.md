@@ -182,6 +182,58 @@ the reserved `@out` sink; everything else stays a plain pipeline job.
 Both paths produce byte-identical files for the same encoder
 settings. `OXIDEAV_CONVERT_TIMING=1` prints per-stage timings.
 
+### Where the time goes: 12 MP HEIC → PNG
+
+Measured 2026-09-28 on an M4 Max (release build, `sips`-produced
+4032×3024 HEIC from a plasma-fractal PNG; CPU seconds via `getrusage`
+so a loaded machine does not skew the split; each stage timed in
+isolation through the crates' public APIs, then cross-checked with
+`sample` on the CLI and `OXIDEAV_CONVERT_TIMING=1`).
+
+| stage (owner) | 8-bit 4:2:0 source | 10-bit 4:2:0 source |
+|---|---|---|
+| process start + registries + plan incl. input header probe (`convert`) | 0.03 s | 0.03 s |
+| demux — one `heif` packet (`oxideav-heif`) | < 1 ms | < 1 ms |
+| decode — HEVC item (`oxideav-heif` → `oxideav-h265`) | 0.67 s | 1.58 s |
+| pixfmt to the *old* target, RGBA (`oxideav-pixfmt`) | 0.007 s | 0.010 s |
+| pixfmt to the planned target — RGB24 / RGB48 (`oxideav-pixfmt`) | 0.006 s | 0.028 s |
+| PNG encode of RGBA, 48.8 MB (`oxideav-png` → `compcol` deflate ≈ 95 %) | 4.20 s | 3.82 s |
+| PNG encode of the planned target — RGB24 36.6 MB / RGB48 73 MB | 3.12 s | 3.29 s |
+| PNG encode with `-depth 8` (RGB24) | — | 1.99 s |
+| PNG encode with `--opt filter=none` (RGB24, +80 % file size) | 0.9 s | — |
+| mux + file write (`oxideav-png` container) | 3 ms | 6 ms |
+| frame copies / allocator / executor plumbing (`oxideav-pipeline` + encoder-side buffering) | ≈ 0.1 s | ≈ 0.1 s |
+| Netpbm encode, old target 1-bit `MonoBlack` (`oxideav-pbm`) | 0.010 s | 0.012 s |
+| Netpbm encode, planned target RGB24 / RGB48 P6 | 0.004 s | 0.004 s |
+
+So the "≈ 4.6 s the PNG route spends that the PPM route does not" was
+the PNG encoder's deflate on a 48.8 MB RGBA buffer, and the PPM route
+was fast because it wrote a **1-bit thresholded bitmap** (the pipeline's
+default target for the Netpbm encoder), which is also why re-encoding
+that PPM to PNG took 0.15 s. Nothing in this crate's own code was on
+the hot path; what this crate could fix was the target layout.
+
+End-to-end CLI CPU time, same sibling-crate snapshot, before → after
+this round's planning changes:
+
+| route | before | after |
+|---|---|---|
+| 8-bit HEIC → PNG | 5.72 s (RGBA) | 4.40 s (RGB) |
+| 10-bit HEIC → PNG | 6.24 s (8-bit RGBA, 2 bits dropped) | 5.45 s (16-bit RGB, lossless); 3.57 s with `-depth 8` |
+| 8-bit HEIC → PPM | 0.82 s (1-bit P4) | 0.81 s (P6, 36.6 MB) |
+| 10-bit HEIC → PPM | 1.91 s (1-bit P4) | 1.94 s (16-bit P6, 73 MB) |
+
+With the sibling crates at their 2026-09-28 tips (multi-threaded HEVC
+item decode) the 8-bit HEIC → PNG conversion takes 2.9 s wall / 3.9 s
+CPU, the 10-bit one 3.8 s wall (2.2 s with `-depth 8`), and either
+PPM route well under a second wall.
+
+Remaining cost is owned elsewhere: deflate speed / compression level
+in `oxideav-png` (no level option is declared; `filter=none` is the
+only knob), the encoder's two full-frame copies (`send_frame`
+buffering + `video_frame_to_png_image`), and the pipeline's own copy
+into the convert stage.
+
 ### Routing matrix (3D-asset input)
 
 The `mesh3d` cargo feature (default-on) wires `oxideav-mesh3d` plus
@@ -394,6 +446,13 @@ carries test-pinned guarantees:
 - GIF + TIFF raster outputs (need palette quantisation / multi-image
   TIFF encoder respectively; both are crate-side work).
 - `-density` applied to raster inputs (silently dropped today).
+- `-quality` / `-define` on the pipeline route land in the job's
+  `codec_params`, which the pipeline does not forward to encoders;
+  `--opt quality=N` is the working channel for encoders that declare
+  a `quality` option.
+- The planned encoder layout applies to plain conversions (and to the
+  frame-tap path); with filter ops in between the pipeline's own
+  running-layout assumption decides.
 - Registering PDF as a real `Demuxer` so `oxideav probe` /
   `transcode` / `run` see it. Today this side-channels through
   `convert` only.
