@@ -45,6 +45,7 @@ fn ctx() -> RuntimeContext {
     oxideav_source::register(&mut ctx);
     oxideav_png::register(&mut ctx);
     oxideav_mjpeg::register(&mut ctx);
+    oxideav_image_filter::register(&mut ctx);
     ctx
 }
 
@@ -308,4 +309,179 @@ fn jpg_output_resolves_to_the_mjpeg_encoder() {
     let out = &job.outputs["out.jpg"];
     let track = out.all.first().or(out.video.first()).expect("one track");
     assert_eq!(track.codec.as_deref(), Some("mjpeg"));
+}
+
+fn convert_err(args: &[&str]) -> String {
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    format!(
+        "{}",
+        oxideav_cli_convert::run(&args, &ctx()).expect_err("convert must fail")
+    )
+}
+
+/// The encoder options path (convert's own encode + mux) produces the
+/// same bytes as the pipeline's for the same encoder settings — here
+/// the PNG encoder's default filter policy spelled out explicitly.
+#[test]
+fn opt_path_matches_the_plain_path_byte_for_byte() {
+    let dir = temp_dir("optsame");
+    let src = dir.join("in.jpg");
+    write_jpeg444(&src, 24, 16);
+    let (plain, tapped) = (dir.join("plain.png"), dir.join("tap.png"));
+    convert(&[src.to_str().unwrap(), plain.to_str().unwrap()]);
+    convert(&[
+        src.to_str().unwrap(),
+        "--opt",
+        "filter=adaptive",
+        tapped.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        fs::read(&plain).unwrap(),
+        fs::read(&tapped).unwrap(),
+        "same encoder settings → same file"
+    );
+}
+
+/// `--opt` reaches the encoder: an interlaced PNG carries IHDR
+/// interlace method 1 and still decodes to the same samples.
+#[test]
+fn opt_reaches_the_encoder() {
+    let dir = temp_dir("optinterlace");
+    let (src, out) = (dir.join("in.png"), dir.join("out.png"));
+    let px = pattern(24, 16, 3);
+    write_png(&src, PngPixelFormat::Rgb24, 24, 16, px.clone());
+    convert(&[
+        src.to_str().unwrap(),
+        "--opt",
+        "interlace=true",
+        out.to_str().unwrap(),
+    ]);
+    let bytes = fs::read(&out).unwrap();
+    // Signature (8) + IHDR length/type (8) + width, height, depth,
+    // colour type, compression, filter → interlace method at 28.
+    assert_eq!(&bytes[12..16], b"IHDR");
+    assert_eq!(bytes[28], 1, "Adam7 interlace");
+    assert_eq!(read_png(&out).data, px);
+}
+
+#[test]
+fn unknown_opt_key_is_a_typed_error() {
+    let dir = temp_dir("optunknown");
+    let src = dir.join("in.png");
+    write_png(&src, PngPixelFormat::Rgb24, 4, 4, pattern(4, 4, 3));
+    let out = dir.join("out.png");
+    let msg = convert_err(&[
+        src.to_str().unwrap(),
+        "--opt",
+        "bogus=1",
+        out.to_str().unwrap(),
+    ]);
+    assert!(msg.contains("has no option 'bogus'"), "{msg}");
+    assert!(msg.contains("interlace"), "lists the known keys: {msg}");
+    assert!(!out.exists(), "nothing written on a refused option");
+}
+
+#[test]
+fn bad_opt_value_is_a_typed_error() {
+    let dir = temp_dir("optbadvalue");
+    let src = dir.join("in.png");
+    write_png(&src, PngPixelFormat::Rgb24, 4, 4, pattern(4, 4, 3));
+    let msg = convert_err(&[
+        src.to_str().unwrap(),
+        "--opt",
+        "interlace=maybe",
+        dir.join("out.png").to_str().unwrap(),
+    ]);
+    assert!(msg.contains("expected a boolean"), "{msg}");
+}
+
+#[test]
+fn opt_without_an_image_encoder_is_refused() {
+    let dir = temp_dir("optnoenc");
+    let src = dir.join("in.png");
+    write_png(&src, PngPixelFormat::Rgb24, 4, 4, pattern(4, 4, 3));
+    let msg = convert_err(&[
+        src.to_str().unwrap(),
+        "--opt",
+        "interlace=true",
+        dir.join("out.unregistered").to_str().unwrap(),
+    ]);
+    assert!(msg.contains("--opt"), "{msg}");
+}
+
+/// Three distinct frames, as an APNG.
+fn write_apng3(path: &PathBuf, w: u32, h: u32) -> Vec<Vec<u8>> {
+    let frames: Vec<Vec<u8>> = (0..3u8)
+        .map(|k| {
+            pattern(w, h, 3)
+                .iter()
+                .map(|b| b.wrapping_add(k * 60))
+                .collect()
+        })
+        .collect();
+    let imgs: Vec<PngImage> = frames
+        .iter()
+        .map(|px| PngImage {
+            width: w,
+            height: h,
+            pixel_format: PngPixelFormat::Rgb24,
+            stride: w as usize * 3,
+            data: px.clone(),
+            palette: Vec::new(),
+        })
+        .collect();
+    let bytes = oxideav_png::encode_apng(&imgs, 10, 0).expect("apng encode");
+    fs::write(path, bytes).expect("write apng");
+    frames
+}
+
+/// `%d` fans out one file per frame of the stream, 0-based.
+#[test]
+fn template_fans_out_every_frame() {
+    let dir = temp_dir("fanout");
+    let src = dir.join("anim.png");
+    let frames = write_apng3(&src, 20, 12);
+    let tmpl = dir.join("frame-%02d.png");
+    convert(&[src.to_str().unwrap(), tmpl.to_str().unwrap()]);
+    for (i, px) in frames.iter().enumerate() {
+        let f = dir.join(format!("frame-{i:02}.png"));
+        let got = read_png(&f);
+        assert_eq!(got.pixel_format, PngPixelFormat::Rgb24);
+        assert_eq!(&got.data, px, "frame {i}");
+    }
+    assert!(!dir.join("frame-03.png").exists());
+}
+
+/// A single still through a template writes index 0.
+#[test]
+fn template_on_a_still_writes_index_zero() {
+    let dir = temp_dir("fanout1");
+    let src = dir.join("in.png");
+    let px = pattern(8, 8, 3);
+    write_png(&src, PngPixelFormat::Rgb24, 8, 8, px.clone());
+    convert(&[
+        src.to_str().unwrap(),
+        dir.join("o_%d.png").to_str().unwrap(),
+    ]);
+    assert_eq!(read_png(&dir.join("o_0.png")).data, px);
+}
+
+/// Fan-out composes with filter ops: the frame geometry after the
+/// ops is read off the frames themselves.
+#[test]
+fn template_with_a_geometry_op_uses_the_filtered_size() {
+    let dir = temp_dir("fanoutcrop");
+    let src = dir.join("anim.png");
+    write_apng3(&src, 20, 12);
+    let tmpl = dir.join("c%d.png");
+    convert(&[
+        src.to_str().unwrap(),
+        "-crop",
+        "10x6+2+3",
+        tmpl.to_str().unwrap(),
+    ]);
+    for i in 0..3 {
+        let got = read_png(&dir.join(format!("c{i}.png")));
+        assert_eq!((got.width, got.height), (10, 6), "frame {i}");
+    }
 }

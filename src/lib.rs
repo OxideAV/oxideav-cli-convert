@@ -31,6 +31,8 @@
 //! ```
 
 pub mod args;
+#[doc(hidden)]
+pub mod frame_tap;
 #[cfg(feature = "ico")]
 #[doc(hidden)]
 pub mod ico_runner;
@@ -57,6 +59,27 @@ pub mod raster_io;
 pub mod route;
 #[doc(hidden)]
 pub mod suggest;
+
+/// `OXIDEAV_CONVERT_TIMING=1` stage spans for the pipeline route.
+mod timing {
+    use std::time::Duration;
+
+    /// True when `OXIDEAV_CONVERT_TIMING` is set to a non-empty value
+    /// other than `0`.
+    pub fn enabled() -> bool {
+        std::env::var_os("OXIDEAV_CONVERT_TIMING").is_some_and(|v| !v.is_empty() && v != "0")
+    }
+
+    /// Print one `convert: timing: <stage> <ms>` line per span.
+    pub fn report(spans: &[(&str, Duration)]) {
+        for (stage, d) in spans {
+            eprintln!(
+                "convert: timing: {stage:<44} {:>9.1} ms",
+                d.as_secs_f64() * 1000.0
+            );
+        }
+    }
+}
 
 pub use op::{AlphaOp, ConvertPlan, Dither, Op, PrintfTemplate, ResizeMode};
 pub use route::Route;
@@ -134,15 +157,50 @@ pub fn run(args: &[String], ctx: &RuntimeContext) -> Result<(), Error> {
         Route::IcoOutput => ico_runner::run(&plan),
 
         Route::Pipeline => {
-            let (job, notes) = plan_to_job::plan_to_job_with_notes(&plan, ctx)?;
-            for note in notes {
+            let timing = timing::enabled();
+            let t0 = std::time::Instant::now();
+            let planned = plan_to_job::plan_pipeline(&plan, ctx)?;
+            let t_plan = t0.elapsed();
+            for note in &planned.notes {
                 eprintln!("{note}");
             }
-            let stats = oxideav_pipeline::Executor::new(&job, ctx).run()?;
-            eprintln!(
-                "convert: {} packet(s) read, {} frame(s) decoded, {} frame(s) written",
-                stats.packets_read, stats.frames_decoded, stats.frames_written
-            );
+            match planned.tap {
+                None => {
+                    let t1 = std::time::Instant::now();
+                    let stats = oxideav_pipeline::Executor::new(&planned.job, ctx).run()?;
+                    eprintln!(
+                        "convert: {} packet(s) read, {} frame(s) decoded, {} frame(s) written",
+                        stats.packets_read, stats.frames_decoded, stats.frames_written
+                    );
+                    if timing {
+                        timing::report(&[
+                            ("plan (incl. input header probe)", t_plan),
+                            ("pipeline (demux+decode+convert+encode+mux)", t1.elapsed()),
+                            ("total", t0.elapsed()),
+                        ]);
+                    }
+                }
+                Some(tap) => {
+                    let t1 = std::time::Instant::now();
+                    let (stats, written) = frame_tap::run(&planned.job, ctx, &tap)?;
+                    eprintln!(
+                        "convert: {} packet(s) read, {} frame(s) decoded, {} file(s) written",
+                        stats.packets_read, stats.frames_decoded, written.files
+                    );
+                    if timing {
+                        let run = t1.elapsed();
+                        let first = written.first_frame.unwrap_or_default();
+                        timing::report(&[
+                            ("plan (incl. input header probe)", t_plan),
+                            ("first frame (demux+decode+filters+convert)", first),
+                            ("encode", written.encode),
+                            ("mux + write", written.mux),
+                            ("run", run),
+                            ("total", t0.elapsed()),
+                        ]);
+                    }
+                }
+            }
             Ok(())
         }
     }

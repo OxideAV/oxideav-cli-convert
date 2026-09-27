@@ -63,6 +63,7 @@ const KNOWN_FLAG_NAMES: &[&str] = &[
     "monochrome",
     "negate",
     "normalize",
+    "opt",
     "ping",
     "posterize",
     "probe",
@@ -294,6 +295,26 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                     }
                 };
                 ops.push(Op::Depth(d));
+                i += 2;
+            }
+            // `--opt KEY=VALUE` — encoder option for still-image
+            // sinks. GNU-style double dash: it is not an IM op. The
+            // key is validated against the target encoder's schema at
+            // plan time (the parser does not know the output codec).
+            "--opt" | "-opt" => {
+                let v = val(i + 1)?;
+                let (key, value) = v.split_once('=').ok_or_else(|| {
+                    Error::invalid(format!("convert: --opt: '{v}' is not KEY=VALUE"))
+                })?;
+                if key.is_empty() {
+                    return Err(Error::invalid(format!(
+                        "convert: --opt: '{v}' has an empty KEY (expected KEY=VALUE)"
+                    )));
+                }
+                ops.push(Op::EncoderOpt {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                });
                 i += 2;
             }
             "-quality" => {
@@ -883,7 +904,7 @@ pub fn usage() -> String {
         for name in chunk {
             // The four GNU-style mode switches take a double dash;
             // everything else is a single-dash IM-style op.
-            let lead = if matches!(*name, "probe" | "json" | "watch" | "help") {
+            let lead = if matches!(*name, "probe" | "json" | "watch" | "help" | "opt") {
                 "--"
             } else {
                 "-"
@@ -3753,6 +3774,11 @@ mod tests {
             // Define / token-shape abuse.
             vec!["in.png", "-define", "=v", "out.png"],
             vec!["in.png", "-define", "=", "out.png"],
+            vec!["in.png", "--opt", "=", "out.png"],
+            vec!["in.png", "--opt", "==", "out.png"],
+            vec!["in.png", "--opt"],
+            vec!["in.png", "-depth", "", "out.png"],
+            vec!["in.png", "-depth", "99999999999", "out.png"],
             vec!["日本語.png", "出力.jpg"],
             vec!["in.png", "-résize", "8x8", "out.png"],
             vec![&long, "out.png"],
@@ -3795,7 +3821,7 @@ mod tests {
     fn usage_lists_every_known_flag_with_correct_lead() {
         let text = usage();
         for name in KNOWN_FLAG_NAMES {
-            let lead = if matches!(*name, "probe" | "json" | "watch" | "help") {
+            let lead = if matches!(*name, "probe" | "json" | "watch" | "help" | "opt") {
                 "--"
             } else {
                 "-"
@@ -3860,6 +3886,54 @@ mod tests {
     /// the whole line parses `Ok` — catching not just unknown-flag
     /// drift but accidental value-grammar breakage too.
     #[test]
+    fn opt_parses_key_value_pairs_in_order() {
+        let p = parse(&to_vec(&[
+            "a.png",
+            "--opt",
+            "filter=none",
+            "--opt",
+            "tiles=2x2",
+            "b.png",
+        ]))
+        .unwrap();
+        assert_eq!(
+            p.ops,
+            vec![
+                Op::EncoderOpt {
+                    key: "filter".into(),
+                    value: "none".into()
+                },
+                Op::EncoderOpt {
+                    key: "tiles".into(),
+                    value: "2x2".into()
+                },
+            ]
+        );
+        // `=` inside the value is kept verbatim; an empty value is legal.
+        let p = parse(&to_vec(&[
+            "a.png", "--opt", "k=a=b", "--opt", "e=", "b.png",
+        ]))
+        .unwrap();
+        assert_eq!(
+            p.ops,
+            vec![
+                Op::EncoderOpt {
+                    key: "k".into(),
+                    value: "a=b".into()
+                },
+                Op::EncoderOpt {
+                    key: "e".into(),
+                    value: String::new()
+                },
+            ]
+        );
+        for bad in ["novalue", "=v"] {
+            let err = parse(&to_vec(&["a.png", "--opt", bad, "b.png"])).unwrap_err();
+            assert!(format!("{err}").contains("--opt"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn depth_accepts_the_two_storage_depths() {
         let p = parse(&to_vec(&["a.heic", "-depth", "8", "b.png"])).unwrap();
         assert_eq!(p.ops, vec![Op::Depth(8)]);
@@ -3911,6 +3985,7 @@ mod tests {
             ("-monochrome", &[]),
             ("-negate", &[]),
             ("-normalize", &[]),
+            ("--opt", &["filter=none"]),
             ("-ping", &[]),
             ("-posterize", &["4"]),
             ("-projection", &["persp"]),

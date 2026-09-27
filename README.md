@@ -22,6 +22,8 @@ the rest of the workspace already knows how to do.
 | `-colors N` + `-dither {none\|bayer\|floyd_steinberg}` | palette quantisation via `pixfmt → Pal8` |
 | `-format FMT` | bypass extension-based codec/container detection |
 | `-quality N` | `0..=100`; forwarded to the sink codec when supported (JPG, WebP, …); out-of-range values reject at parse time |
+| `-depth 8\|16` | output bit depth per channel for still-image outputs (a 10-bit HEIC → `-depth 8` → 8-bit PNG); without it the source's own depth is kept when the encoder can carry it |
+| `--opt KEY=VALUE` | encoder option for still-image outputs, repeatable; validated against the target encoder's declared options (`oxideav info <codec>`), unknown keys / ill-typed values are typed errors |
 | `-strip` | drop metadata on write |
 | `-density N` | DPI for vector→raster (default 72; PDF / SVG inputs only) |
 | `-background COLOR` | canvas + alpha-flatten background (CSS L3 named + `#hex` 3/4/6/8) |
@@ -142,9 +144,43 @@ codec) or prompts for an explicit `-format CODEC`.
 ### Printf templates
 
 When the output filename contains a single `%[0-9]*d` token (e.g.
-`page-%03d.png`), convert fans out to one file per selected page,
-substituting the index. Multiple `%d`s, `%s`, `%x`, etc. are
-rejected with a precise error.
+`page-%03d.png`), convert fans out to one file per selected page
+(PDF inputs) or per frame (everything else — image sequences,
+animations, video; indices are 0-based), substituting the index.
+Multiple `%d`s, `%s`, `%x`, etc. are rejected with a precise error.
+
+## Still-image outputs
+
+When the output resolves to an image encoder (`png`, `ppm`/`pgm`/
+`pbm`/`pam`, `heic`, `avif`, `tga`, `jpg`, …) the planner reads the
+input's container header (no decode) and plans three things the
+pipeline's generic defaults get wrong:
+
+- **Which stream.** HEIF / AVIF files with an image-sequence track
+  open as stream 0 = the primary still plus one stream per track.
+  `convert seq.heics out.png` writes the primary still (with a stderr
+  note); `convert seq.heics frame-%03d.png` writes every frame of the
+  first image-sequence track. Single-video inputs are unaffected.
+- **Which encoder input layout.** For a plain conversion the encoder
+  gets the accepted layout that loses nothing the source carries
+  (colour, alpha, bit depth) at the fewest bits per pixel — YUV →
+  PNG is RGB (the pipeline default was RGBA with a synthetic opaque
+  alpha: 33% more data through deflate), 10-bit YUV → PNG is 16-bit
+  RGB, and YUV → Netpbm is a real pixmap instead of a thresholded
+  1-bit bitmap. The Netpbm extensions pick their family (`.pbm`
+  bilevel, `.pgm` gray, `.ppm` colour without alpha; `.pam` any);
+  `-depth 8|16` caps or raises the depth.
+- **Which codec + options.** `.jpg` resolves to the `mjpeg` codec;
+  `.avif` writes AV1 (`codec=av1` on the `heif` encoder), `.heic`
+  HEVC; `--opt KEY=VALUE` sets any option the encoder declares, e.g.
+  `convert in.png --opt qp=30 --opt tiles=2x2 out.heic` or
+  `convert in.png --opt quality=90 out.avif`.
+
+Encoder options and `%d` fan-out run through `convert`'s own encode +
+mux stage (`frame_tap`), fed decoded frames by the executor through
+the reserved `@out` sink; everything else stays a plain pipeline job.
+Both paths produce byte-identical files for the same encoder
+settings. `OXIDEAV_CONVERT_TIMING=1` prints per-stage timings.
 
 ### Routing matrix (3D-asset input)
 
@@ -347,9 +383,10 @@ carries test-pinned guarantees:
   jobs are storable / replayable / snapshot-testable `oxideav run`
   documents. Golden snapshots pin representative argv lines.
 - **Unplannable input is a typed error, never silence or a panic** —
-  3D input × non-3D/non-raster output, `%d` templates outside the
-  PDF fan-out, empty arguments, malformed value grammars (pinned by
-  an adversarial-argv corpus).
+  3D input × non-3D/non-raster output, `%d` templates or `--opt` on
+  outputs that are not still images, unknown / ill-typed encoder
+  options, empty arguments, malformed value grammars (pinned by an
+  adversarial-argv corpus).
 
 ## Known follow-ups
 

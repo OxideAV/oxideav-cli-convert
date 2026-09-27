@@ -22,6 +22,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of RGBA with a synthetic opaque alpha (identical colour
   samples, 25% less data through deflate: 12 MP 8-bit HEIC → PNG CPU
   5.7 s → 4.4 s); >8-bit YUV → PNG keeps its precision as 16-bit RGB.
+- Frame tap (`frame_tap` module) — `convert`'s own encode + mux for
+  still-image outputs, fed decoded frames by the executor through the
+  reserved `@out` sink. Used when the plan needs it:
+  - `--opt KEY=VALUE` (repeatable): encoder options, validated at plan
+    time against the target encoder's declared options schema
+    (unknown key → typed error listing the known ones; values checked
+    against the declared kind) and handed to the encoder. The
+    pipeline's track `codec_params` never reach the encoder, so this
+    is the only working option channel on the convert path.
+  - `.avif` / `.avifs` outputs infer `codec=av1` for the `heif`
+    encoder (they were written as HEVC with a `heic` brand).
+  - `%d` output templates on the pipeline route fan out one file per
+    frame (0-based): image sequences (the first non-still stream —
+    HEIF / AVIF put the primary still at stream 0), animations,
+    video. Filter ops compose; the frame geometry after them is read
+    off the frames.
+  Same encoder settings produce byte-identical files on both paths.
+- `OXIDEAV_CONVERT_TIMING=1` — per-stage wall-clock spans on stderr
+  for the pipeline route (plan incl. header probe, executor; on the
+  frame-tap path first-frame arrival, encode, mux + write).
 - `-depth 8|16` — per-channel output depth for still-image sinks
   (a 10-bit HEIC → `-depth 8` → 8-bit PNG; 12 MP: 3.6 s CPU).
 - Netpbm extensions pick their family: `.pbm` bilevel, `.pgm`

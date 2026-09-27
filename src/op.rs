@@ -259,6 +259,12 @@ pub enum Op {
     /// deeper layout (`-depth 16`). Without it the source's own depth
     /// is kept when the encoder can carry it.
     Depth(u8),
+    /// `--opt KEY=VALUE` — an encoder option for still-image sinks,
+    /// validated against the target encoder's declared options schema
+    /// (the keys `oxideav info <codec>` lists) and handed to the
+    /// encoder `convert` builds for the output. Repeatable; a later
+    /// value for the same key wins.
+    EncoderOpt { key: String, value: String },
     /// `-density N` — DPI for vector→raster conversion. PDF / SVG
     /// pages are measured in PostScript points (1/72 inch); a page at
     /// 300 DPI rasterises to `points × (300 / 72)` pixels per axis.

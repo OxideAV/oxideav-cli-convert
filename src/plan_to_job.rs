@@ -9,10 +9,11 @@
 //! an MP4) and dispatches filters to the matching `FilterKind` at
 //! DAG-build time.
 
+use crate::frame_tap::{TapSpec, TAP_SINK};
 use crate::image_sink::{self, LayoutHint};
 use crate::op::{ConvertPlan, Dither, Mesh3DOptions, Mesh3DRenderMode, Op, ProjectionMode};
 use indexmap::IndexMap;
-use oxideav_core::{Error, MediaType, PixelFormat, RuntimeContext};
+use oxideav_core::{Error, MediaType, PixelFormat, RuntimeContext, StreamInfo};
 use oxideav_pipeline::schema::{ConvertNode, StreamSelector};
 use oxideav_pipeline::{
     FilterNode, Job, OutputSpec, Render3DNode, SourceRef, TrackInput, TrackSpec,
@@ -53,18 +54,19 @@ const DEFAULT_RENDER3D_FOV_DEG: f32 = 60.0;
 /// register a container (e.g. `oxideav-png`, `oxideav-qoi`,
 /// `oxideav-dds`) automatically extend the supported output set without
 /// needing a hard-coded entry here.
+///
+/// When the plan needs `convert`'s own still-image writer (encoder
+/// options, `%d` per-frame fan-out) the job's single output is the
+/// reserved [`TAP_SINK`] (`@out`) with no codec: [`crate::run`] binds
+/// it to [`crate::frame_tap`], which encodes and muxes.
 pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Error> {
-    plan_to_job_with_notes(plan, ctx).map(|(job, _)| job)
+    plan_pipeline(plan, ctx).map(|p| p.job)
 }
 
-/// [`plan_to_job`] plus the human-facing planning notes (e.g. "the
-/// input carries several video streams; stream #0 was selected") that
-/// [`crate::run`] prints to stderr. Kept separate so the public
-/// planner stays side-effect free.
-pub(crate) fn plan_to_job_with_notes(
-    plan: &ConvertPlan,
-    ctx: &RuntimeContext,
-) -> Result<(Job, Vec<String>), Error> {
+/// [`plan_to_job`] plus the planning notes and the frame-tap writer
+/// spec [`crate::run`] needs. Kept separate so the public planner
+/// stays side-effect free.
+pub(crate) fn plan_pipeline(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Planned, Error> {
     // Walk ops, distinguishing track-side filters from sink-side
     // metadata (format / quality / strip).  Filters are flattened
     // into the recursive `TrackInput` chain; the rest are deferred
@@ -142,7 +144,7 @@ pub fn plan_to_render3d_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<
         chain = lower_op(chain, op, &mut sink, true);
     }
 
-    finish_job(plan, ctx, chain, sink, false).map(|(job, _)| job)
+    finish_job(plan, ctx, chain, sink, false).map(|p| p.job)
 }
 
 /// Pull the render canvas dimensions from the op chain: the LAST
@@ -272,6 +274,8 @@ struct SinkSide {
     format_override: Option<String>,
     /// `-depth N` — consumed by the still-image target selection.
     depth: Option<u8>,
+    /// `--opt KEY=VALUE` pairs, in command-line order.
+    encoder_opts: Vec<(String, String)>,
 }
 
 impl Default for SinkSide {
@@ -281,6 +285,7 @@ impl Default for SinkSide {
             strip_metadata: false,
             format_override: None,
             depth: None,
+            encoder_opts: Vec::new(),
         }
     }
 }
@@ -437,6 +442,10 @@ fn lower_op(chain: TrackInput, op: &Op, sink: &mut SinkSide, absorb_canvas: bool
         }
         Op::Depth(d) => {
             sink.depth = Some(*d);
+            chain
+        }
+        Op::EncoderOpt { key, value } => {
+            sink.encoder_opts.push((key.clone(), value.clone()));
             chain
         }
         // Vector-input ops; dropped on both paths. Raster inputs have
@@ -619,6 +628,26 @@ fn lower_op(chain: TrackInput, op: &Op, sink: &mut SinkSide, absorb_canvas: bool
     }
 }
 
+/// Result of planning the regular pipeline route: the job, the
+/// human-facing notes [`crate::run`] prints to stderr, and — when the
+/// plan needs `convert`'s own still-image writer (encoder options,
+/// `%d` fan-out) — the writer spec for the job's [`TAP_SINK`] output.
+pub(crate) struct Planned {
+    pub job: Job,
+    pub notes: Vec<String>,
+    pub tap: Option<TapSpec>,
+}
+
+/// What the still-image planning learned about the input.
+struct StillInput {
+    /// Video-stream ordinal the track is pinned to.
+    ordinal: usize,
+    /// The input's video streams (container order).
+    streams: Vec<StreamInfo>,
+    /// The output encoder's accepted layouts.
+    accepted: Vec<PixelFormat>,
+}
+
 /// Shared tail for both planners: fold sink-side state into the codec
 /// params, resolve the output codec, assemble the single-output
 /// [`Job`], and enforce the schema-validation guarantee.
@@ -628,15 +657,17 @@ fn lower_op(chain: TrackInput, op: &Op, sink: &mut SinkSide, absorb_canvas: bool
 /// encoder and the input's container header can be read, the track
 /// is pinned to one video stream and — for a plain conversion — to
 /// the encoder input layout that loses nothing the source carries.
-/// The 3D-render planner passes `false` (its source is a renderer, not
-/// a file with streams).
+/// Encoder options and `%d` fan-out additionally route the frames to
+/// `convert`'s own writer ([`crate::frame_tap`]). The 3D-render
+/// planner passes `false` (its source is a renderer, not a file with
+/// streams).
 fn finish_job(
     plan: &ConvertPlan,
     ctx: &RuntimeContext,
-    mut chain: TrackInput,
+    chain: TrackInput,
     mut sink: SinkSide,
     probe_input: bool,
-) -> Result<(Job, Vec<String>), Error> {
+) -> Result<Planned, Error> {
     // Sink-side metadata handling.
     if sink.strip_metadata {
         sink.codec_params["strip_metadata"] = json!(true);
@@ -652,53 +683,80 @@ fn finish_job(
     // stating the obvious.
     let codec = codec_for_output(sink.format_override.as_deref(), &plan.output, ctx);
 
+    // Encoder options: `--opt` (validated against the encoder's
+    // declared schema) plus the extension-implied ones (`.avif` ⇒
+    // `codec=av1`).
+    let out_ext = sink
+        .format_override
+        .clone()
+        .or_else(|| ext_of(&plan.output).map(str::to_string));
+    let options = image_sink::encoder_options(
+        ctx,
+        codec.as_deref(),
+        out_ext.as_deref(),
+        &sink.encoder_opts,
+    )?;
+    let fanout = plan.output_template.is_some();
+    let wants_tap = fanout || !options.is_empty();
+
     let mut notes = Vec::new();
     let still = if probe_input {
-        plan_still_sink(
-            plan,
-            ctx,
-            codec.as_deref(),
-            sink.depth,
-            &mut chain,
-            &mut notes,
-        )
+        still_input(plan, ctx, codec.as_deref(), fanout, &mut notes)
     } else {
         None
     };
-    if still.is_none() && sink.depth.is_some() {
-        notes
-            .push("convert: note: -depth applies to still-image outputs only; ignored".to_string());
-    }
 
-    let track = TrackSpec {
-        input: chain,
-        codec,
-        params: sink.codec_params,
-        stream_selector: still.map(|ordinal| StreamSelector {
-            kind: Some(MediaType::Video),
-            index: Some(ordinal as u32),
-        }),
+    let (job, tap) = match (still, wants_tap) {
+        (Some(si), false) => {
+            let job = still_job(plan, chain, codec, sink, &si, &mut notes)?;
+            (job, None)
+        }
+        (Some(si), true) => {
+            let (job, tap) = tap_job(plan, ctx, chain, codec, sink, si, options)?;
+            (job, Some(tap))
+        }
+        (None, true) => {
+            let what = if fanout {
+                format!(
+                    "a `%d` output template ('{}') fans out one file per frame",
+                    plan.output
+                )
+            } else {
+                "encoder options (--opt, or ones the output extension implies)".to_string()
+            };
+            return Err(Error::unsupported(format!(
+                "convert: {what} — that needs a still-image output format (png, ppm, heic, avif, …) and an input file whose streams can be read"
+            )));
+        }
+        (None, false) => {
+            if sink.depth.is_some() {
+                notes.push(
+                    "convert: note: -depth applies to still-image outputs only; ignored"
+                        .to_string(),
+                );
+            }
+            let track = TrackSpec {
+                input: chain,
+                codec,
+                params: sink.codec_params,
+                stream_selector: None,
+            };
+            let out = OutputSpec {
+                audio: vec![],
+                video: vec![],
+                subtitle: vec![],
+                all: vec![track],
+            };
+            (single_output_job(&plan.output, out)?, None)
+        }
     };
+    Ok(Planned { job, notes, tap })
+}
 
-    // A still-image sink takes exactly one video stream; everything
-    // else keeps the historical `all` fan-out (the pipeline resolves
-    // per-kind lists at DAG-build time).
-    let (video, all) = if still.is_some() {
-        (vec![track], vec![])
-    } else {
-        (vec![], vec![track])
-    };
+/// Wrap one output spec into a validated [`Job`].
+fn single_output_job(key: &str, out: OutputSpec) -> Result<Job, Error> {
     let mut outputs = IndexMap::new();
-    outputs.insert(
-        plan.output.clone(),
-        OutputSpec {
-            audio: vec![],
-            video,
-            subtitle: vec![],
-            all,
-        },
-    );
-
+    outputs.insert(key.to_string(), out);
     let job = Job {
         outputs,
         aliases: IndexMap::new(),
@@ -709,63 +767,202 @@ fn finish_job(
     // …). Validating here turns a planner bug into a typed error at
     // plan time instead of an opaque executor failure later.
     job.validate()?;
-    Ok((job, notes))
+    Ok(job)
 }
 
-/// Still-image sink planning (see [`crate::image_sink`]). Returns the
-/// video-stream ordinal the track is pinned to, or `None` when the
+/// Probe the input for the still-image planning. `None` when the
 /// output is not an image encoder or the input's stream list cannot
 /// be read from its header (the caller then keeps the historical job
-/// shape). May wrap `chain` in an explicit convert node.
-fn plan_still_sink(
+/// shape).
+fn still_input(
     plan: &ConvertPlan,
     ctx: &RuntimeContext,
     codec: Option<&str>,
-    depth: Option<u8>,
-    chain: &mut TrackInput,
+    fanout: bool,
     notes: &mut Vec<String>,
-) -> Option<usize> {
+) -> Option<StillInput> {
     let accepted = image_sink::encoder_accepted_formats(ctx, codec?)?;
     let streams = image_sink::probe_video_streams(&plan.input, ctx)?;
     if streams.is_empty() {
         return None;
     }
-    let ordinal = 0;
+    let ordinal = if fanout {
+        image_sink::fanout_stream(&streams)
+    } else {
+        0
+    };
     if streams.len() > 1 {
-        notes.push(format!(
-            "convert: note: '{}' has {} video streams; writing video stream #0 (the primary still image)",
-            plan.input,
-            streams.len()
-        ));
+        notes.push(if fanout {
+            format!(
+                "convert: note: '{}' has {} video streams; writing the frames of video stream #{ordinal}",
+                plan.input,
+                streams.len()
+            )
+        } else {
+            format!(
+                "convert: note: '{}' has {} video streams; writing video stream #0 (the primary still image); use a `%d` output template for the image-sequence frames",
+                plan.input,
+                streams.len()
+            )
+        });
     }
+    Some(StillInput {
+        ordinal,
+        streams,
+        accepted,
+    })
+}
+
+fn video_selector(ordinal: usize) -> StreamSelector {
+    StreamSelector {
+        kind: Some(MediaType::Video),
+        index: Some(ordinal as u32),
+    }
+}
+
+fn wrap_convert(chain: TrackInput, target: PixelFormat) -> TrackInput {
+    match pixfmt_name(target) {
+        Some(name) => TrackInput::Convert(ConvertNode {
+            convert: name,
+            input: Box::new(chain),
+        }),
+        None => chain,
+    }
+}
+
+/// Plain still-image job: the pipeline encodes and muxes; the planner
+/// pins the stream and (for a plain conversion) the encoder layout.
+fn still_job(
+    plan: &ConvertPlan,
+    mut chain: TrackInput,
+    codec: Option<String>,
+    sink: SinkSide,
+    si: &StillInput,
+    notes: &mut Vec<String>,
+) -> Result<Job, Error> {
     // Only a plain conversion has a known encoder input layout: filter
     // ops may change it, and the pipeline tracks it no better.
-    if !matches!(chain, TrackInput::Source(_)) {
-        if depth.is_some() {
-            notes.push(
-                "convert: note: -depth applies to plain conversions (no filter ops) today; ignored"
-                    .to_string(),
-            );
+    if matches!(chain, TrackInput::Source(_)) {
+        let hint = LayoutHint::for_output(&plan.output);
+        if let Some(target) = si.streams[si.ordinal]
+            .params
+            .pixel_format
+            .and_then(|src| image_sink::pick_sink_format(src, &si.accepted, hint, sink.depth))
+        {
+            chain = wrap_convert(chain, target);
         }
-        return Some(ordinal);
+    } else if sink.depth.is_some() {
+        notes.push(
+            "convert: note: -depth applies to plain conversions (no filter ops) unless encoder options are given; ignored"
+                .to_string(),
+        );
     }
+    let track = TrackSpec {
+        input: chain,
+        codec,
+        params: sink.codec_params,
+        stream_selector: Some(video_selector(si.ordinal)),
+    };
+    single_output_job(
+        &plan.output,
+        OutputSpec {
+            audio: vec![],
+            video: vec![track],
+            subtitle: vec![],
+            all: vec![],
+        },
+    )
+}
+
+/// Frame-tap job: the executor decodes / filters / converts into the
+/// reserved [`TAP_SINK`]; [`crate::frame_tap`] encodes and muxes.
+fn tap_job(
+    plan: &ConvertPlan,
+    ctx: &RuntimeContext,
+    chain: TrackInput,
+    codec: Option<String>,
+    sink: SinkSide,
+    si: StillInput,
+    options: Vec<(String, String)>,
+) -> Result<(Job, TapSpec), Error> {
+    let codec = codec.ok_or_else(|| Error::unsupported("convert: no output codec"))?;
+    let stream = si.streams[si.ordinal].clone();
+    let src = stream.params.pixel_format.ok_or_else(|| {
+        Error::unsupported(format!(
+            "convert: '{}' does not declare the pixel layout of video stream #{}",
+            plan.input, si.ordinal
+        ))
+    })?;
     let hint = LayoutHint::for_output(&plan.output);
-    let target = streams[ordinal]
-        .params
-        .pixel_format
-        .and_then(|src| image_sink::pick_sink_format(src, &accepted, hint, depth))
-        .and_then(pixfmt_name);
-    if let Some(name) = target {
-        let placeholder = TrackInput::Source(SourceRef {
-            from: String::new(),
+    // The layout the frames reach the writer in: the planner's pick,
+    // else what the pipeline itself would pick (the source when the
+    // encoder takes it, otherwise the encoder's first choice).
+    let target =
+        image_sink::pick_sink_format(src, &si.accepted, hint, sink.depth).unwrap_or_else(|| {
+            if si.accepted.is_empty() || si.accepted.contains(&src) {
+                src
+            } else {
+                si.accepted[0]
+            }
         });
-        let input = std::mem::replace(chain, placeholder);
-        *chain = TrackInput::Convert(ConvertNode {
-            convert: name,
-            input: Box::new(input),
-        });
-    }
-    Some(ordinal)
+    let bare = matches!(chain, TrackInput::Source(_));
+    let chain = if target != src {
+        let wrapped = wrap_convert(chain, target);
+        if !wrapped.is_convert() {
+            return Err(Error::unsupported(format!(
+                "convert: no job-schema name for the {target:?} layout"
+            )));
+        }
+        wrapped
+    } else {
+        chain
+    };
+    let dims = if bare {
+        stream.params.width.zip(stream.params.height)
+    } else {
+        None
+    };
+    let container_key = sink
+        .format_override
+        .clone()
+        .or_else(|| ext_of(&plan.output).map(str::to_string))
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let container = ctx
+        .containers
+        .container_for_extension(&container_key)
+        .ok_or_else(|| {
+            Error::format_not_found(format!(
+                "convert: no container registered for '.{container_key}'"
+            ))
+        })?
+        .to_string();
+    let track = TrackSpec {
+        input: chain,
+        codec: None,
+        params: json!({}),
+        stream_selector: Some(video_selector(si.ordinal)),
+    };
+    let job = single_output_job(
+        TAP_SINK,
+        OutputSpec {
+            audio: vec![],
+            video: vec![track],
+            subtitle: vec![],
+            all: vec![],
+        },
+    )?;
+    let tap = TapSpec {
+        codec,
+        container,
+        options,
+        frame_format: target,
+        dims,
+        stream,
+        output: plan.output.clone(),
+        template: plan.output_template.clone(),
+    };
+    Ok((job, tap))
 }
 
 /// Canonical short name the job schema parses back into `fmt`
@@ -774,6 +971,13 @@ fn plan_still_sink(
 fn pixfmt_name(fmt: PixelFormat) -> Option<String> {
     let name = format!("{fmt:?}").to_ascii_lowercase();
     (oxideav_pipeline::schema::parse_pixel_format(&name).ok() == Some(fmt)).then_some(name)
+}
+
+fn ext_of(path: &str) -> Option<&str> {
+    let last = path.rsplit('/').next().unwrap_or(path);
+    let last = last.split('?').next().unwrap_or(last);
+    let dot = last.rfind('.')?;
+    Some(&last[dot + 1..])
 }
 
 /// Guess the output codec from the extension, honouring `-format`

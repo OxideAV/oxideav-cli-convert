@@ -132,23 +132,24 @@ pub fn decide(plan: &ConvertPlan) -> Result<Route, Error> {
         )));
     }
 
-    // A `%d` template only means something to the PDF side-channel's
-    // per-page fan-out today. On every other route the pipeline /
-    // icon writer would treat `page-%03d.png` as a LITERAL filename —
-    // classic silent misbehaviour — so reject with a typed error.
-    // (Video → numbered frame sequence is the obvious future consumer;
-    // this error is the breadcrumb until that lands.)
-    if plan.output_template.is_some() {
-        return Err(Error::unsupported(format!(
-            "convert: output '{}' has a `%d` template, but template fan-out only applies to multi-page (PDF) inputs today; give a literal output filename",
-            plan.output
-        )));
-    }
-
     #[cfg(feature = "ico")]
     if crate::ico_runner::is_ico_output(&plan.output) {
+        // The icon writer bundles every size into ONE file; a `%d`
+        // template would be taken as a literal filename.
+        if plan.output_template.is_some() {
+            return Err(Error::unsupported(format!(
+                "convert: output '{}' has a `%d` template, but an .ico holds every size in one file; give a literal output filename",
+                plan.output
+            )));
+        }
         return Ok(Route::IcoOutput);
     }
+
+    // A `%d` template on the pipeline route fans out one file per
+    // frame of the selected stream (image sequences, animations,
+    // video). Whether the output can do that — a still-image encoder
+    // and an input whose streams can be read — is the planner's call:
+    // it needs the registries, which this pure layer does not see.
 
     Ok(Route::Pipeline)
 }
@@ -403,19 +404,17 @@ mod tests {
     }
 
     #[test]
-    fn printf_template_on_pipeline_route_is_a_typed_error() {
-        // Template fan-out only exists on the PDF side-channel today;
-        // the pipeline would write a file literally named
-        // `frame-%03d.png`. Reject instead of silently misbehaving.
+    fn printf_template_on_pipeline_route_routes_to_the_planner() {
+        // Per-frame fan-out is planned on the pipeline route; the
+        // router no longer gatekeeps it (the planner refuses outputs
+        // that cannot fan out, with a typed error).
         let mut p = plan("movie.mp4", "frame-%03d.png");
         p.output_template = Some(PrintfTemplate {
             prefix: "frame-".into(),
             width: 3,
             suffix: ".png".into(),
         });
-        let msg = format!("{}", decide(&p).expect_err("template must be rejected"));
-        assert!(msg.contains("template fan-out"), "got: {msg}");
-        assert!(msg.contains("frame-%03d.png"), "got: {msg}");
+        assert_eq!(decide(&p).unwrap(), Route::Pipeline);
     }
 
     #[cfg(feature = "ico")]

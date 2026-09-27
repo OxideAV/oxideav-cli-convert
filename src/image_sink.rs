@@ -28,7 +28,8 @@
 //! the demux, decode, conversion, encode and mux.
 
 use oxideav_core::{
-    CodecId, MediaType, PixelFormat, ReadSeek, RuntimeContext, SourceOutput, StreamInfo,
+    CodecId, Error, MediaType, OptionField, OptionKind, PixelFormat, ReadSeek, RuntimeContext,
+    SourceOutput, StreamInfo, TimeBase,
 };
 use oxideav_pixfmt::FormatInfo;
 
@@ -251,6 +252,105 @@ pub fn encoder_accepted_formats(ctx: &RuntimeContext, codec: &str) -> Option<Vec
         .filter(|(_, i)| i.make_encoder.is_some() && i.caps.media_type == MediaType::Video)
         .min_by_key(|(order, i)| (i.caps.priority, *order))
         .map(|(_, i)| i.caps.accepted_pixel_formats.clone())
+}
+
+/// Build the encoder option list for a still-image output.
+///
+/// * `user` — `--opt KEY=VALUE` pairs in command-line order (a later
+///   value for a key wins). Each key must be declared by the target
+///   encoder's options schema and each value must parse as the
+///   declared kind; otherwise a typed error names the key and the
+///   accepted set.
+/// * Extension-implied options are added when the user did not set
+///   the key: a `.avif` / `.avifs` output written through an encoder
+///   whose `codec` option offers `av1` gets `codec=av1` (the same
+///   inference `oxideav transcode` makes). Other extensions (`.heic`,
+///   …) name the encoder's default and add nothing.
+///
+/// Returns an empty list when there is nothing to set.
+pub fn encoder_options(
+    ctx: &RuntimeContext,
+    codec: Option<&str>,
+    ext: Option<&str>,
+    user: &[(String, String)],
+) -> oxideav_core::Result<Vec<(String, String)>> {
+    let schema = codec.and_then(|c| ctx.codecs.encoder_options_schema(&CodecId::new(c)));
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, v) in user {
+        let Some(codec) = codec else {
+            return Err(Error::invalid(format!(
+                "convert: --opt {k}={v}: the output has no encoder to hand options to"
+            )));
+        };
+        let fields = schema.unwrap_or(&[]);
+        let field = fields.iter().find(|f| f.name == k).ok_or_else(|| {
+            let known: Vec<&str> = fields.iter().map(|f| f.name).collect();
+            let known = if known.is_empty() {
+                "it declares no options".to_string()
+            } else {
+                format!("known: {}", known.join(", "))
+            };
+            Error::invalid(format!(
+                "convert: --opt {k}={v}: encoder '{codec}' has no option '{k}' ({known})"
+            ))
+        })?;
+        check_option_value(field, v).map_err(|why| {
+            Error::invalid(format!("convert: --opt {k}={v}: {why} ({})", field.help))
+        })?;
+        out.retain(|(ek, _)| ek != k);
+        out.push((k.clone(), v.clone()));
+    }
+    let avif =
+        ext.is_some_and(|e| e.eq_ignore_ascii_case("avif") || e.eq_ignore_ascii_case("avifs"));
+    if avif && !out.iter().any(|(k, _)| k == "codec") {
+        let offers_av1 = schema
+            .and_then(|fields| fields.iter().find(|f| f.name == "codec"))
+            .is_some_and(|f| matches!(f.kind, OptionKind::Enum(vals) if vals.contains(&"av1")));
+        if offers_av1 {
+            out.push(("codec".to_string(), "av1".to_string()));
+        }
+    }
+    Ok(out)
+}
+
+/// Check `raw` against the declared kind of `field` (the encoder does
+/// the definitive parse; this surfaces a typo before any decoding).
+fn check_option_value(field: &OptionField, raw: &str) -> Result<(), String> {
+    let ok = match field.kind {
+        OptionKind::Bool => matches!(
+            raw,
+            "true" | "1" | "yes" | "on" | "false" | "0" | "no" | "off"
+        ),
+        OptionKind::U32 => raw.parse::<u32>().is_ok(),
+        OptionKind::I32 => raw.parse::<i32>().is_ok(),
+        OptionKind::F32 => raw.parse::<f32>().is_ok_and(f32::is_finite),
+        OptionKind::String => true,
+        OptionKind::Enum(vals) => vals.contains(&raw),
+    };
+    if ok {
+        return Ok(());
+    }
+    Err(match field.kind {
+        OptionKind::Bool => "expected a boolean (true/false/1/0/yes/no/on/off)".to_string(),
+        OptionKind::U32 => "expected a non-negative integer".to_string(),
+        OptionKind::I32 => "expected an integer".to_string(),
+        OptionKind::F32 => "expected a finite number".to_string(),
+        OptionKind::Enum(vals) => format!("expected one of {}", vals.join(" | ")),
+        OptionKind::String => unreachable!("strings always pass"),
+    })
+}
+
+/// Video-stream ordinal a `%d` fan-out writes: the first stream that
+/// is not a single still image (HEIF / AVIF put the primary still at
+/// stream 0 and the image-sequence tracks after it), else stream 0. A
+/// still is a stream whose timeline is one tick of a 1/1 time base —
+/// how the HEIF demuxer exposes its image items.
+pub fn fanout_stream(streams: &[StreamInfo]) -> usize {
+    let is_still = |s: &StreamInfo| s.time_base == TimeBase::new(1, 1) && s.duration == Some(1);
+    if streams.len() < 2 {
+        return 0;
+    }
+    streams.iter().position(|s| !is_still(s)).unwrap_or(0)
 }
 
 /// The input's video streams in container order, read from the
