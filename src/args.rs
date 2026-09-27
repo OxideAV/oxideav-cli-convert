@@ -43,6 +43,7 @@ const KNOWN_FLAG_NAMES: &[&str] = &[
     "crop",
     "define",
     "density",
+    "depth",
     "dither",
     "edge",
     "equalize",
@@ -277,6 +278,22 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
             "-format" => {
                 let v = val(i + 1)?;
                 ops.push(Op::Format(v.to_string()));
+                i += 2;
+            }
+            // `-depth N` — IM's per-channel output depth. Only the
+            // two storage depths still-image encoders carry are
+            // meaningful; anything else is a typo worth surfacing.
+            "-depth" => {
+                let v = val(i + 1)?;
+                let d: u8 = match v.parse() {
+                    Ok(d @ (8 | 16)) => d,
+                    _ => {
+                        return Err(Error::invalid(format!(
+                            "convert: -depth: '{v}' must be 8 or 16"
+                        )))
+                    }
+                };
+                ops.push(Op::Depth(d));
                 i += 2;
             }
             "-quality" => {
@@ -3843,6 +3860,21 @@ mod tests {
     /// the whole line parses `Ok` — catching not just unknown-flag
     /// drift but accidental value-grammar breakage too.
     #[test]
+    fn depth_accepts_the_two_storage_depths() {
+        let p = parse(&to_vec(&["a.heic", "-depth", "8", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Depth(8)]);
+        let p = parse(&to_vec(&["a.heic", "-depth", "16", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Depth(16)]);
+        for bad in ["12", "0", "abc", "-8", "256"] {
+            let err = parse(&to_vec(&["a.heic", "-depth", bad, "b.png"])).unwrap_err();
+            assert!(
+                format!("{err}").contains("-depth") && format!("{err}").contains("8 or 16"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn every_known_flag_name_is_accepted_by_the_parser() {
         // (flag-as-typed, extra args, needs_probe)
         let cases: &[(&str, &[&str])] = &[
@@ -3861,6 +3893,7 @@ mod tests {
             ("-crop", &["1x1+0+0"]),
             ("-define", &["k=v"]),
             ("-density", &["72"]),
+            ("-depth", &["8"]),
             ("-dither", &["none"]),
             ("-edge", &["1"]),
             ("-equalize", &[]),

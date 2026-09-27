@@ -253,6 +253,12 @@ pub enum Op {
     /// `-strip` — request that metadata (EXIF, XMP, ID3, etc.) be
     /// dropped on write.
     Strip,
+    /// `-depth N` — output bit depth per channel for still-image
+    /// sinks (`8` or `16`). Caps the encoder input layout the planner
+    /// picks (a 10-bit HEIC → `-depth 8` → 8-bit PNG) or asks for the
+    /// deeper layout (`-depth 16`). Without it the source's own depth
+    /// is kept when the encoder can carry it.
+    Depth(u8),
     /// `-density N` — DPI for vector→raster conversion. PDF / SVG
     /// pages are measured in PostScript points (1/72 inch); a page at
     /// 300 DPI rasterises to `points × (300 / 72)` pixels per axis.

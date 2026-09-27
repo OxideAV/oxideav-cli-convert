@@ -197,38 +197,115 @@ fn decode_first_frame(path: &PathBuf) -> (VideoFrame, PixelFormat, u32, u32) {
     )
 }
 
-/// The reference RGB samples: the decoded source frame through the
-/// default `oxideav-pixfmt` conversion.
-fn reference_rgb(path: &PathBuf) -> Vec<u8> {
+/// The reference samples: the decoded source frame through the
+/// default `oxideav-pixfmt` conversion to `to`.
+fn reference(path: &PathBuf, to: PixelFormat) -> Vec<u8> {
     let (frame, fmt, w, h) = decode_first_frame(path);
-    let rgb = oxideav_pixfmt::convert(
+    let out = oxideav_pixfmt::convert(
         &frame,
         oxideav_pixfmt::FrameInfo::new(fmt, w, h),
-        PixelFormat::Rgb24,
+        to,
         &oxideav_pixfmt::ConvertOptions::default(),
     )
     .expect("reference conversion");
-    rgb.planes[0].data.clone()
+    out.planes[0].data.clone()
+}
+
+fn reference_rgb(path: &PathBuf) -> Vec<u8> {
+    reference(path, PixelFormat::Rgb24)
 }
 
 /// YUV source → PNG: the colour samples must be exactly the decoded
-/// frame through the default pixfmt conversion. Today the pipeline
-/// picks the PNG encoder's first accepted layout (RGBA) for a YUV
-/// source, synthesising an opaque alpha channel.
+/// frame through the default pixfmt conversion, carried as RGB — the
+/// planner pins the encoder input to the narrowest layout that loses
+/// nothing (the pipeline's own default, the PNG encoder's first
+/// accepted layout, would synthesise an opaque alpha channel).
 #[test]
-fn yuv444_jpeg_to_png_samples_match_the_reference_conversion() {
+fn yuv444_jpeg_to_png_is_rgb_with_the_reference_samples() {
     let dir = temp_dir("jpeg444");
     let (src, out) = (dir.join("in.jpg"), dir.join("out.png"));
     write_jpeg444(&src, 24, 16);
     convert(&[src.to_str().unwrap(), out.to_str().unwrap()]);
     let got = read_png(&out);
     assert_eq!((got.width, got.height), (24, 16));
-    assert_eq!(got.pixel_format, PngPixelFormat::Rgba);
-    let rgb: Vec<u8> = got
-        .data
-        .chunks_exact(4)
-        .flat_map(|p| [p[0], p[1], p[2]])
+    assert_eq!(got.pixel_format, PngPixelFormat::Rgb24);
+    assert_eq!(got.data, reference_rgb(&src), "RGB samples changed");
+}
+
+/// `-depth 16` asks for the deep layout even for an 8-bit source; the
+/// samples are the converter's own 16-bit reconstruction.
+#[test]
+fn depth_16_widens_a_yuv_source() {
+    let dir = temp_dir("depth16");
+    let (src, out) = (dir.join("in.jpg"), dir.join("out.png"));
+    write_jpeg444(&src, 24, 16);
+    convert(&[src.to_str().unwrap(), "-depth", "16", out.to_str().unwrap()]);
+    let got = read_png(&out);
+    assert_eq!(got.pixel_format, PngPixelFormat::Rgb48Le);
+    assert_eq!(got.data, reference(&src, PixelFormat::Rgb48Le));
+}
+
+/// `-depth 8` caps a 16-bit source.
+#[test]
+fn depth_8_narrows_a_sixteen_bit_png() {
+    let dir = temp_dir("depth8");
+    let (src, out) = (dir.join("in.png"), dir.join("out.png"));
+    let px = pattern(24, 16, 6);
+    write_png(&src, PngPixelFormat::Rgb48Le, 24, 16, px.clone());
+    convert(&[src.to_str().unwrap(), "-depth", "8", out.to_str().unwrap()]);
+    let got = read_png(&out);
+    assert_eq!(got.pixel_format, PngPixelFormat::Rgb24);
+    let high: Vec<u8> = px.chunks_exact(2).map(|w| w[1]).collect();
+    assert_eq!(got.data, high, "16 → 8 keeps the high byte");
+}
+
+/// The job the planner emits for a still-image sink: one video track
+/// pinned to video stream #0, with the explicit conversion node when
+/// the source layout is not the pick.
+#[test]
+fn still_sink_job_pins_stream_and_layout() {
+    let dir = temp_dir("jobshape");
+    let src = dir.join("in.jpg");
+    write_jpeg444(&src, 24, 16);
+    let argv: Vec<String> = [src.to_str().unwrap(), "out.png"]
+        .iter()
+        .map(|s| s.to_string())
         .collect();
-    assert!(got.data.chunks_exact(4).all(|p| p[3] == 255));
-    assert_eq!(rgb, reference_rgb(&src), "RGB samples changed");
+    let plan = oxideav_cli_convert::args::parse(&argv).unwrap();
+    let job = oxideav_cli_convert::plan_to_job::plan_to_job(&plan, &ctx()).unwrap();
+    let out = &job.outputs["out.png"];
+    assert!(out.all.is_empty(), "still sinks do not fan out over kinds");
+    assert_eq!(out.video.len(), 1);
+    let track = &out.video[0];
+    assert_eq!(track.codec.as_deref(), Some("png"));
+    let sel = track.stream_selector.as_ref().expect("selector");
+    assert_eq!(sel.index, Some(0));
+    let conv = track.input.as_convert().expect("explicit convert node");
+    assert_eq!(conv.convert, "rgb24");
+
+    // A PNG input the encoder takes as-is gets no conversion node.
+    let png = dir.join("in.png");
+    write_png(&png, PngPixelFormat::Rgb24, 4, 4, pattern(4, 4, 3));
+    let argv: Vec<String> = [png.to_str().unwrap(), "out.png"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let plan = oxideav_cli_convert::args::parse(&argv).unwrap();
+    let job = oxideav_cli_convert::plan_to_job::plan_to_job(&plan, &ctx()).unwrap();
+    assert!(job.outputs["out.png"].video[0].input.is_source());
+}
+
+/// The JPEG container carries the `mjpeg` codec: a `.jpg` output must
+/// resolve to the codec that has the encoder, not the container name.
+#[test]
+fn jpg_output_resolves_to_the_mjpeg_encoder() {
+    let argv: Vec<String> = ["in.png", "out.jpg"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let plan = oxideav_cli_convert::args::parse(&argv).unwrap();
+    let job = oxideav_cli_convert::plan_to_job::plan_to_job(&plan, &ctx()).unwrap();
+    let out = &job.outputs["out.jpg"];
+    let track = out.all.first().or(out.video.first()).expect("one track");
+    assert_eq!(track.codec.as_deref(), Some("mjpeg"));
 }

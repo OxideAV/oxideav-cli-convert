@@ -9,9 +9,11 @@
 //! an MP4) and dispatches filters to the matching `FilterKind` at
 //! DAG-build time.
 
+use crate::image_sink::{self, LayoutHint};
 use crate::op::{ConvertPlan, Dither, Mesh3DOptions, Mesh3DRenderMode, Op, ProjectionMode};
 use indexmap::IndexMap;
-use oxideav_core::{Error, RuntimeContext};
+use oxideav_core::{Error, MediaType, PixelFormat, RuntimeContext};
+use oxideav_pipeline::schema::{ConvertNode, StreamSelector};
 use oxideav_pipeline::{
     FilterNode, Job, OutputSpec, Render3DNode, SourceRef, TrackInput, TrackSpec,
 };
@@ -52,6 +54,17 @@ const DEFAULT_RENDER3D_FOV_DEG: f32 = 60.0;
 /// `oxideav-dds`) automatically extend the supported output set without
 /// needing a hard-coded entry here.
 pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Error> {
+    plan_to_job_with_notes(plan, ctx).map(|(job, _)| job)
+}
+
+/// [`plan_to_job`] plus the human-facing planning notes (e.g. "the
+/// input carries several video streams; stream #0 was selected") that
+/// [`crate::run`] prints to stderr. Kept separate so the public
+/// planner stays side-effect free.
+pub(crate) fn plan_to_job_with_notes(
+    plan: &ConvertPlan,
+    ctx: &RuntimeContext,
+) -> Result<(Job, Vec<String>), Error> {
     // Walk ops, distinguishing track-side filters from sink-side
     // metadata (format / quality / strip).  Filters are flattened
     // into the recursive `TrackInput` chain; the rest are deferred
@@ -68,7 +81,7 @@ pub fn plan_to_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<Job, Erro
         chain = lower_op(chain, op, &mut sink, false);
     }
 
-    finish_job(plan, ctx, chain, sink)
+    finish_job(plan, ctx, chain, sink, true)
 }
 
 /// Build a 3D→raster [`Job`] from a [`ConvertPlan`] whose input is a
@@ -129,7 +142,7 @@ pub fn plan_to_render3d_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<
         chain = lower_op(chain, op, &mut sink, true);
     }
 
-    finish_job(plan, ctx, chain, sink)
+    finish_job(plan, ctx, chain, sink, false).map(|(job, _)| job)
 }
 
 /// Pull the render canvas dimensions from the op chain: the LAST
@@ -257,6 +270,8 @@ struct SinkSide {
     codec_params: Value,
     strip_metadata: bool,
     format_override: Option<String>,
+    /// `-depth N` — consumed by the still-image target selection.
+    depth: Option<u8>,
 }
 
 impl Default for SinkSide {
@@ -265,6 +280,7 @@ impl Default for SinkSide {
             codec_params: json!({}),
             strip_metadata: false,
             format_override: None,
+            depth: None,
         }
     }
 }
@@ -417,6 +433,10 @@ fn lower_op(chain: TrackInput, op: &Op, sink: &mut SinkSide, absorb_canvas: bool
         }
         Op::Strip => {
             sink.strip_metadata = true;
+            chain
+        }
+        Op::Depth(d) => {
+            sink.depth = Some(*d);
             chain
         }
         // Vector-input ops; dropped on both paths. Raster inputs have
@@ -602,12 +622,21 @@ fn lower_op(chain: TrackInput, op: &Op, sink: &mut SinkSide, absorb_canvas: bool
 /// Shared tail for both planners: fold sink-side state into the codec
 /// params, resolve the output codec, assemble the single-output
 /// [`Job`], and enforce the schema-validation guarantee.
+///
+/// `probe_input` enables the still-image sink planning (see
+/// [`crate::image_sink`]): when the output resolves to an image
+/// encoder and the input's container header can be read, the track
+/// is pinned to one video stream and — for a plain conversion — to
+/// the encoder input layout that loses nothing the source carries.
+/// The 3D-render planner passes `false` (its source is a renderer, not
+/// a file with streams).
 fn finish_job(
     plan: &ConvertPlan,
     ctx: &RuntimeContext,
-    chain: TrackInput,
+    mut chain: TrackInput,
     mut sink: SinkSide,
-) -> Result<Job, Error> {
+    probe_input: bool,
+) -> Result<(Job, Vec<String>), Error> {
     // Sink-side metadata handling.
     if sink.strip_metadata {
         sink.codec_params["strip_metadata"] = json!(true);
@@ -623,21 +652,50 @@ fn finish_job(
     // stating the obvious.
     let codec = codec_for_output(sink.format_override.as_deref(), &plan.output, ctx);
 
+    let mut notes = Vec::new();
+    let still = if probe_input {
+        plan_still_sink(
+            plan,
+            ctx,
+            codec.as_deref(),
+            sink.depth,
+            &mut chain,
+            &mut notes,
+        )
+    } else {
+        None
+    };
+    if still.is_none() && sink.depth.is_some() {
+        notes
+            .push("convert: note: -depth applies to still-image outputs only; ignored".to_string());
+    }
+
     let track = TrackSpec {
         input: chain,
         codec,
         params: sink.codec_params,
-        stream_selector: None,
+        stream_selector: still.map(|ordinal| StreamSelector {
+            kind: Some(MediaType::Video),
+            index: Some(ordinal as u32),
+        }),
     };
 
+    // A still-image sink takes exactly one video stream; everything
+    // else keeps the historical `all` fan-out (the pipeline resolves
+    // per-kind lists at DAG-build time).
+    let (video, all) = if still.is_some() {
+        (vec![track], vec![])
+    } else {
+        (vec![], vec![track])
+    };
     let mut outputs = IndexMap::new();
     outputs.insert(
         plan.output.clone(),
         OutputSpec {
             audio: vec![],
-            video: vec![],
+            video,
             subtitle: vec![],
-            all: vec![track],
+            all,
         },
     );
 
@@ -651,7 +709,71 @@ fn finish_job(
     // …). Validating here turns a planner bug into a typed error at
     // plan time instead of an opaque executor failure later.
     job.validate()?;
-    Ok(job)
+    Ok((job, notes))
+}
+
+/// Still-image sink planning (see [`crate::image_sink`]). Returns the
+/// video-stream ordinal the track is pinned to, or `None` when the
+/// output is not an image encoder or the input's stream list cannot
+/// be read from its header (the caller then keeps the historical job
+/// shape). May wrap `chain` in an explicit convert node.
+fn plan_still_sink(
+    plan: &ConvertPlan,
+    ctx: &RuntimeContext,
+    codec: Option<&str>,
+    depth: Option<u8>,
+    chain: &mut TrackInput,
+    notes: &mut Vec<String>,
+) -> Option<usize> {
+    let accepted = image_sink::encoder_accepted_formats(ctx, codec?)?;
+    let streams = image_sink::probe_video_streams(&plan.input, ctx)?;
+    if streams.is_empty() {
+        return None;
+    }
+    let ordinal = 0;
+    if streams.len() > 1 {
+        notes.push(format!(
+            "convert: note: '{}' has {} video streams; writing video stream #0 (the primary still image)",
+            plan.input,
+            streams.len()
+        ));
+    }
+    // Only a plain conversion has a known encoder input layout: filter
+    // ops may change it, and the pipeline tracks it no better.
+    if !matches!(chain, TrackInput::Source(_)) {
+        if depth.is_some() {
+            notes.push(
+                "convert: note: -depth applies to plain conversions (no filter ops) today; ignored"
+                    .to_string(),
+            );
+        }
+        return Some(ordinal);
+    }
+    let hint = LayoutHint::for_output(&plan.output);
+    let target = streams[ordinal]
+        .params
+        .pixel_format
+        .and_then(|src| image_sink::pick_sink_format(src, &accepted, hint, depth))
+        .and_then(pixfmt_name);
+    if let Some(name) = target {
+        let placeholder = TrackInput::Source(SourceRef {
+            from: String::new(),
+        });
+        let input = std::mem::replace(chain, placeholder);
+        *chain = TrackInput::Convert(ConvertNode {
+            convert: name,
+            input: Box::new(input),
+        });
+    }
+    Some(ordinal)
+}
+
+/// Canonical short name the job schema parses back into `fmt`
+/// (`Rgb48Le` → `rgb48le`), or `None` when the schema has no name for
+/// it — the planner then leaves the choice to the pipeline.
+fn pixfmt_name(fmt: PixelFormat) -> Option<String> {
+    let name = format!("{fmt:?}").to_ascii_lowercase();
+    (oxideav_pipeline::schema::parse_pixel_format(&name).ok() == Some(fmt)).then_some(name)
 }
 
 /// Guess the output codec from the extension, honouring `-format`
@@ -674,19 +796,7 @@ fn codec_for_output(
     output: &str,
     ctx: &RuntimeContext,
 ) -> Option<String> {
-    let ext = format_override
-        .map(|s| s.to_ascii_lowercase())
-        .or_else(|| ext_of(output).map(|s| s.to_ascii_lowercase()))?;
-    ctx.containers
-        .container_for_extension(&ext)
-        .map(|s| s.to_string())
-}
-
-fn ext_of(path: &str) -> Option<&str> {
-    let last = path.rsplit('/').next().unwrap_or(path);
-    let last = last.split('?').next().unwrap_or(last);
-    let dot = last.rfind('.')?;
-    Some(&last[dot + 1..])
+    image_sink::resolve_output_codec(format_override, output, ctx)
 }
 
 #[cfg(test)]

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Still-image sink planning (`image_sink` module). When the output
+  resolves to an image encoder and the input's container header can be
+  read, the planner (a) pins the track to one video stream — HEIF /
+  AVIF files carrying an image-sequence track open as stream 0 = the
+  primary still plus one stream per track, and the single-image muxers
+  used to refuse the second stream (`.heics` / `.avis` → `.png` now
+  writes the primary still, with a stderr note); and (b) for a plain
+  conversion, pins the encoder input to the accepted layout that loses
+  nothing the source carries (colour, alpha, bit depth) at the fewest
+  bits per pixel, via an explicit convert node. YUV → PNG is now RGB
+  instead of RGBA with a synthetic opaque alpha (identical colour
+  samples, 25% less data through deflate: 12 MP 8-bit HEIC → PNG CPU
+  5.7 s → 4.4 s); >8-bit YUV → PNG keeps its precision as 16-bit RGB.
+- `-depth 8|16` — per-channel output depth for still-image sinks
+  (a 10-bit HEIC → `-depth 8` → 8-bit PNG; 12 MP: 3.6 s CPU).
+- Netpbm extensions pick their family: `.pbm` bilevel, `.pgm`
+  grayscale, `.ppm` colour (no alpha); `.pam` keeps any layout.
+
 - `route` module — pure routing layer. `route::decide(&ConvertPlan)
   -> Result<Route, Error>` classifies a plan into its execution path
   (`Help` / `Ping` / `Probe` / `PdfSideChannel` / `Mesh3dToMesh3d` /
@@ -90,6 +108,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   codec params; the `opts` payload carrying every documented field.
 
 ### Fixed
+
+- YUV sources → `.ppm` / `.pgm` / `.pam` no longer come out as a 1-bit
+  thresholded bitmap: the pipeline's default picked the Netpbm
+  encoder's first accepted layout (`MonoBlack`) for any source it did
+  not accept as-is.
+- `.jpg` / `.jpeg` outputs resolve to the `mjpeg` codec (the `jpeg`
+  container's codec id) instead of failing with "codec not found:
+  jpeg".
 
 - f32 op values no longer widen to f64 bit-patterns in the emitted
   job JSON: `-light 10,20,0.9` used to serialise as

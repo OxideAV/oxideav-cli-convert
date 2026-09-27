@@ -34,6 +34,8 @@ pub mod args;
 #[cfg(feature = "ico")]
 #[doc(hidden)]
 pub mod ico_runner;
+#[doc(hidden)]
+pub mod image_sink;
 #[cfg(feature = "mesh3d")]
 #[doc(hidden)]
 pub mod mesh3d_render;
@@ -132,7 +134,10 @@ pub fn run(args: &[String], ctx: &RuntimeContext) -> Result<(), Error> {
         Route::IcoOutput => ico_runner::run(&plan),
 
         Route::Pipeline => {
-            let job = plan_to_job::plan_to_job(&plan, ctx)?;
+            let (job, notes) = plan_to_job::plan_to_job_with_notes(&plan, ctx)?;
+            for note in notes {
+                eprintln!("{note}");
+            }
             let stats = oxideav_pipeline::Executor::new(&job, ctx).run()?;
             eprintln!(
                 "convert: {} packet(s) read, {} frame(s) decoded, {} frame(s) written",
