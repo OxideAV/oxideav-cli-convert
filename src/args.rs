@@ -79,6 +79,7 @@ const KNOWN_FLAG_NAMES: &[&str] = &[
     "stl-format",
     "strip",
     "thumbnail",
+    "threads",
     "threshold",
     "trim",
     "unsharp",
@@ -315,6 +316,17 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                     key: key.to_string(),
                     value: value.to_string(),
                 });
+                i += 2;
+            }
+            // `-threads N` — pipeline-route thread budget (0 = auto).
+            "-threads" => {
+                let v = val(i + 1)?;
+                let n: usize = v.parse().map_err(|_| {
+                    Error::invalid(format!(
+                        "convert: -threads: '{v}' is not a non-negative integer (0 = auto)"
+                    ))
+                })?;
+                ops.push(Op::Threads(n));
                 i += 2;
             }
             "-quality" => {
@@ -3778,6 +3790,8 @@ mod tests {
             vec!["in.png", "--opt", "==", "out.png"],
             vec!["in.png", "--opt"],
             vec!["in.png", "-depth", "", "out.png"],
+            vec!["in.png", "-threads", "-1", "out.png"],
+            vec!["in.png", "-threads", "99999999999999999999", "out.png"],
             vec!["in.png", "-depth", "99999999999", "out.png"],
             vec!["日本語.png", "出力.jpg"],
             vec!["in.png", "-résize", "8x8", "out.png"],
@@ -3934,6 +3948,16 @@ mod tests {
     }
 
     #[test]
+    fn threads_parses_a_count_and_zero_for_auto() {
+        let p = parse(&to_vec(&["a.png", "-threads", "4", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Threads(4)]);
+        let p = parse(&to_vec(&["a.png", "-threads", "0", "b.png"])).unwrap();
+        assert_eq!(p.ops, vec![Op::Threads(0)]);
+        let err = parse(&to_vec(&["a.png", "-threads", "many", "b.png"])).unwrap_err();
+        assert!(format!("{err}").contains("-threads"), "{err}");
+    }
+
+    #[test]
     fn depth_accepts_the_two_storage_depths() {
         let p = parse(&to_vec(&["a.heic", "-depth", "8", "b.png"])).unwrap();
         assert_eq!(p.ops, vec![Op::Depth(8)]);
@@ -4000,6 +4024,7 @@ mod tests {
             ("-stl-format", &["binary"]),
             ("-strip", &[]),
             ("-thumbnail", &["64x64"]),
+            ("-threads", &["2"]),
             ("-threshold", &["50%"]),
             ("-trim", &[]),
             ("-unsharp", &["1x1"]),

@@ -29,6 +29,7 @@ use oxideav_core::Error;
 /// One cell of the routing matrix — the execution path [`crate::run`]
 /// dispatches to for a given plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Route {
     /// `--help` / `-help`: print the usage synopsis, nothing else.
     Help,

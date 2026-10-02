@@ -20,6 +20,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(convert)* extract pure routing layer with matrix-pinned dispatch
 - *(convert)* plan_to_render3d_job() for 3D→raster auto-route (Phase C-3b)
 
+### Changed
+
+- `oxideav-png` requirement is `>=0.1.8, <0.3`: PNG records are built
+  through the 0.2.0 constructors (`PngImage::new(width, height,
+  pixel_format, stride, data)`); the range also admits the 0.1.8 tree
+  that carries them so the umbrella's path build resolves before 0.2.0
+  is published. Tighten to `"0.2"` at the next touch after the release.
+- **API shape: every public record and enum is `#[non_exhaustive]`**
+  (`ConvertPlan`, `Op`, `Route`, `PrintfTemplate`, `PageSelector`,
+  `PageAtom`, `Dither`, `AlphaOp`, `ResizeMode`, `Mesh3DOptions`,
+  `Mesh3DRenderMode`, `ProjectionMode`, `LightSpec`, `CameraSpec`,
+  `StlFormatChoice`, `GltfFormatChoice`), so new ops / routes / fields
+  never force a major bump again. Fields stay public for reading;
+  construction moves to constructors: `ConvertPlan::new(input, output)`
+  + `with_ops` / `with_input_pages` / `with_output_template` /
+  `with_help` / `with_ping` / `with_probe` / `with_probe_json` /
+  `with_probe_watch` / `with_mesh3d_options`; `PrintfTemplate::new(
+  prefix, width, suffix)`; `LightSpec::new(azimuth, elevation,
+  intensity)`; `CameraSpec::new(elevation, azimuth, distance)`;
+  `Mesh3DOptions::default()` + `with_<field>` for each option.
+  Exhaustive `match`es on the enums need a `_` arm.
+
 ### Fixed
 
 - *(convert)* -thumbnail seeds the 3D render canvas + %d template rejected on non-fanout routes
@@ -68,6 +90,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     video. Filter ops compose; the frame geometry after them is read
     off the frames.
   Same encoder settings produce byte-identical files on both paths.
+- `-threads N` — thread budget for the pipeline route (the job's
+  `threads` key; `0` = auto). The frame-tap encoder is granted the same
+  resolved budget the executor grants its codecs (`-threads`, else the
+  host's parallelism) through `Encoder::set_execution_context`; it used
+  to encode serially, so every `--opt` PNG write ran one-threaded.
 - `OXIDEAV_CONVERT_TIMING=1` — per-stage wall-clock spans on stderr
   for the pipeline route (plan incl. header probe, executor; on the
   frame-tap path first-frame arrival, encode, mux + write).

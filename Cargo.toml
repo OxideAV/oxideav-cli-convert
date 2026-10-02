@@ -56,7 +56,12 @@ oxideav-generator = { version = "0.1", optional = true }
 oxideav-pdf = "0.2"
 oxideav-scene = "0.1"
 oxideav-raster = "0.1"
-oxideav-png = "0.1"
+# PNG records are constructed through the 0.2.0 constructors
+# (`PngImage::new`, …). The requirement spans the unreleased 0.2.0 and
+# the 0.1.8 tree that already carries those constructors, so the umbrella
+# (path patch, package version still 0.1.8 until release-plz bumps it)
+# resolves; tighten to "0.2" once 0.2.0 is on crates.io.
+oxideav-png = ">=0.1.8, <0.3"
 oxideav-pixfmt = "0.1"
 # Per-page raster encoders for the fan-out path. Lossless paths only
 # (BMP raw RGBA, JPEG via YUV420, WebP-VP8L lossless); animated /

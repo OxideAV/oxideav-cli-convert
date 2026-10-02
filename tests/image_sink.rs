@@ -69,14 +69,7 @@ fn pattern(w: u32, h: u32, channels: usize) -> Vec<u8> {
 }
 
 fn write_png(path: &PathBuf, fmt: PngPixelFormat, w: u32, h: u32, data: Vec<u8>) {
-    let img = PngImage {
-        width: w,
-        height: h,
-        pixel_format: fmt,
-        stride: w as usize * fmt.bytes_per_pixel(),
-        data,
-        palette: Vec::new(),
-    };
+    let img = PngImage::new(w, h, fmt, w as usize * fmt.bytes_per_pixel(), data);
     fs::write(path, encode_png_image(&img).expect("png encode")).expect("write png");
 }
 
@@ -421,14 +414,7 @@ fn write_apng3(path: &PathBuf, w: u32, h: u32) -> Vec<Vec<u8>> {
         .collect();
     let imgs: Vec<PngImage> = frames
         .iter()
-        .map(|px| PngImage {
-            width: w,
-            height: h,
-            pixel_format: PngPixelFormat::Rgb24,
-            stride: w as usize * 3,
-            data: px.clone(),
-            palette: Vec::new(),
-        })
+        .map(|px| PngImage::new(w, h, PngPixelFormat::Rgb24, w as usize * 3, px.clone()))
         .collect();
     let bytes = oxideav_png::encode_apng(&imgs, 10, 0).expect("apng encode");
     fs::write(path, bytes).expect("write apng");
@@ -483,5 +469,98 @@ fn template_with_a_geometry_op_uses_the_filtered_size() {
     for i in 0..3 {
         let got = read_png(&dir.join(format!("c{i}.png")));
         assert_eq!((got.width, got.height), (10, 6), "frame {i}");
+    }
+}
+
+/// A noisy RGB image big enough to span several of the PNG encoder's
+/// ~1 MiB deflate segments (LCG noise, so deflate has real work).
+fn write_noise_png(path: &PathBuf, w: u32, h: u32) {
+    let mut x: u32 = 0x9e37_79b9;
+    let data: Vec<u8> = (0..(w * h * 3) as usize)
+        .map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x >> 24) as u8
+        })
+        .collect();
+    write_png(path, PngPixelFormat::Rgb24, w, h, data);
+}
+
+fn timed_convert(args: &[&str]) -> std::time::Duration {
+    let t = std::time::Instant::now();
+    convert(args);
+    t.elapsed()
+}
+
+/// `--opt level=<default>` through the frame tap equals the plain
+/// pipeline path byte for byte; `level=6` is a different (smaller or
+/// equal) stream with the same samples.
+#[test]
+fn opt_level_matches_the_plain_path_at_the_default_level() {
+    let dir = temp_dir("optlevel");
+    let src = dir.join("in.png");
+    write_noise_png(&src, 256, 128);
+    let plain = dir.join("plain.png");
+    let same = dir.join("same.png");
+    let six = dir.join("six.png");
+    convert(&[src.to_str().unwrap(), plain.to_str().unwrap()]);
+    let default_level = format!("level={}", oxideav_png::DEFAULT_COMPRESSION_LEVEL);
+    convert(&[
+        src.to_str().unwrap(),
+        "--opt",
+        &default_level,
+        same.to_str().unwrap(),
+    ]);
+    convert(&[
+        src.to_str().unwrap(),
+        "--opt",
+        "level=6",
+        six.to_str().unwrap(),
+    ]);
+    let (a, b, c) = (
+        fs::read(&plain).unwrap(),
+        fs::read(&same).unwrap(),
+        fs::read(&six).unwrap(),
+    );
+    assert_eq!(a, b, "default level through --opt == plain path");
+    assert!(c.len() <= a.len(), "level 6 is no larger than the default");
+    assert_eq!(read_png(&six).data, read_png(&plain).data);
+}
+
+/// The frame-tap encoder is granted the resolved thread budget (the
+/// job's `threads` key, else the host's parallelism) exactly like the
+/// executor's own codecs: the bytes do not depend on the budget, and
+/// on a multi-core host the parallel encode is faster than `-threads 1`.
+#[test]
+fn opt_encoder_receives_the_thread_budget() {
+    let dir = temp_dir("optthreads");
+    let src = dir.join("in.png");
+    write_noise_png(&src, 1536, 1024);
+    let serial = dir.join("serial.png");
+    let auto = dir.join("auto.png");
+    let t_serial = timed_convert(&[
+        src.to_str().unwrap(),
+        "--opt",
+        "level=6",
+        "-threads",
+        "1",
+        serial.to_str().unwrap(),
+    ]);
+    let t_auto = timed_convert(&[
+        src.to_str().unwrap(),
+        "--opt",
+        "level=6",
+        auto.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        fs::read(&serial).unwrap(),
+        fs::read(&auto).unwrap(),
+        "the segment grid does not depend on the thread budget"
+    );
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if cores >= 2 {
+        assert!(
+            t_auto < t_serial,
+            "parallel encode ({t_auto:?}) should beat -threads 1 ({t_serial:?}) on {cores} cores"
+        );
     }
 }

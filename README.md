@@ -23,6 +23,7 @@ the rest of the workspace already knows how to do.
 | `-format FMT` | bypass extension-based codec/container detection |
 | `-quality N` | `0..=100`; forwarded to the sink codec when supported (JPG, WebP, …); out-of-range values reject at parse time |
 | `-depth 8\|16` | output bit depth per channel for still-image outputs (a 10-bit HEIC → `-depth 8` → 8-bit PNG); without it the source's own depth is kept when the encoder can carry it |
+| `-threads N` | thread budget for the pipeline route and the `--opt` encoder (`0` = auto, the default) |
 | `--opt KEY=VALUE` | encoder option for still-image outputs, repeatable; validated against the target encoder's declared options (`oxideav info <codec>`), unknown keys / ill-typed values are typed errors |
 | `-strip` | drop metadata on write |
 | `-density N` | DPI for vector→raster (default 72; PDF / SVG inputs only) |

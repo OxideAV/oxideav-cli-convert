@@ -31,6 +31,7 @@ use crate::op::{AlphaOp, Op};
 /// formats are wired (e.g. `.tiff` → Raster once oxideav-tiff has an
 /// encoder).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OutputClass {
     /// Format consumes a whole [`oxideav_scene::Scene`] (`.pdf` today;
     /// multi-page SVG would land here if we ever support it).
@@ -44,6 +45,7 @@ pub enum OutputClass {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RasterFormat {
     Png,
     Jpeg,
@@ -203,14 +205,7 @@ fn encode_png(img: &RgbaImage) -> Result<Vec<u8>> {
     } else {
         PngPixelFormat::Rgba
     };
-    let png = PngImage {
-        width: img.width,
-        height: img.height,
-        pixel_format: pf,
-        stride: img.stride,
-        data: img.pixels.clone(),
-        palette: Vec::new(),
-    };
+    let png = PngImage::new(img.width, img.height, pf, img.stride, img.pixels.clone());
     encode_png_image(&png).map_err(|e| Error::invalid(format!("convert: PNG encode failed: {e:?}")))
 }
 

@@ -27,8 +27,8 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
 use oxideav_core::{
-    CodecId, CodecOptions, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Result,
-    RuntimeContext, StreamInfo,
+    CodecId, CodecOptions, CodecParameters, Error, ExecutionContext, Frame, MediaType, Packet,
+    PixelFormat, Result, RuntimeContext, StreamInfo,
 };
 use oxideav_pipeline::executor::JobSink;
 use oxideav_pipeline::{Executor, Job};
@@ -44,6 +44,7 @@ const WRITER_STOPPED: &str = "frame writer stopped";
 
 /// Everything the writer needs, resolved at plan time.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct TapSpec {
     /// Encoder codec id (`png`, `heif`, …).
     pub codec: String,
@@ -64,10 +65,16 @@ pub struct TapSpec {
     pub output: String,
     /// … or a `%d` template: one file per frame.
     pub template: Option<PrintfTemplate>,
+    /// Thread budget granted to the encoder
+    /// ([`Encoder::set_execution_context`](oxideav_core::Encoder::set_execution_context)):
+    /// the job's `threads` key, else the host's parallelism — the same
+    /// resolution the pipeline executor applies to its own codecs.
+    pub threads: usize,
 }
 
 /// What the tap wrote.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct TapStats {
     /// Frames received from the executor.
     pub frames: u64,
@@ -240,8 +247,9 @@ impl OpenFile {
         }
         params.options = options;
         let t = Instant::now();
-        let encoder = oxideav_pipeline::selection::make_encoder(&ctx.codecs, &params)
+        let mut encoder = oxideav_pipeline::selection::make_encoder(&ctx.codecs, &params)
             .map_err(|e| Error::invalid(format!("convert: {} encoder: {e}", spec.codec)))?;
+        encoder.set_execution_context(&ExecutionContext::with_threads(spec.threads));
         stats.encode += t.elapsed();
 
         let mut stream = spec.stream.clone();

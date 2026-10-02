@@ -5,6 +5,7 @@
 
 /// Dither strategy used when `-colors N` forces a paletted output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Dither {
     None,
     Bayer,
@@ -32,6 +33,7 @@ impl Dither {
 /// `-alpha SUBCOMMAND`. ImageMagick exposes a small grammar of alpha-channel
 /// edits — we cover the ones with deterministic semantics on RGBA buffers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AlphaOp {
     /// `on` / `activate` — enable alpha (no-op when output is already RGBA).
     On,
@@ -76,6 +78,7 @@ impl AlphaOp {
 /// can't be eagerly resolved at parse time because we don't yet know
 /// the source dims.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResizeMode {
     /// No suffix — preserve aspect ratio and FIT inside the `WxH` box
     /// (the larger of the two scale factors wins, so neither output
@@ -209,6 +212,7 @@ impl ResizeMode {
 /// Operations apply in source order — same as `imagemagick convert`,
 /// even though we don't yet support IM's stack-reset semantics.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Op {
     /// `-resize WxH[!^<>%@]`. The trailing modifier selects the
     /// scaling policy via [`ResizeMode`]; absence of any modifier is
@@ -265,6 +269,10 @@ pub enum Op {
     /// encoder `convert` builds for the output. Repeatable; a later
     /// value for the same key wins.
     EncoderOpt { key: String, value: String },
+    /// `-threads N` — thread budget for the pipeline route (the job's
+    /// `threads` key: codec-internal fan-out and the frame-tap
+    /// encoder). `0` means auto (the host's parallelism, the default).
+    Threads(usize),
     /// `-density N` — DPI for vector→raster conversion. PDF / SVG
     /// pages are measured in PostScript points (1/72 inch); a page at
     /// 300 DPI rasterises to `points × (300 / 72)` pixels per axis.
@@ -427,6 +435,7 @@ pub enum Op {
 ///   `out%d.jpg`     → prefix=`out`, width=0, suffix=`.jpg` →
 ///   `out0.jpg`, `out1.jpg`, …
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PrintfTemplate {
     pub prefix: String,
     pub width: u8,
@@ -434,6 +443,16 @@ pub struct PrintfTemplate {
 }
 
 impl PrintfTemplate {
+    /// `prefix` + zero-padded index of `width` digits (`0` = unpadded)
+    /// + `suffix` — the parsed form of `prefix%0<width>dsuffix`.
+    pub fn new(prefix: impl Into<String>, width: u8, suffix: impl Into<String>) -> Self {
+        Self {
+            prefix: prefix.into(),
+            width,
+            suffix: suffix.into(),
+        }
+    }
+
     /// Render the template at the given index.
     pub fn expand(&self, n: usize) -> String {
         if self.width == 0 {
@@ -457,6 +476,7 @@ impl PrintfTemplate {
 /// `-2` = second-to-last, … can ride through unchanged. Resolution
 /// against an actual page count is `PageAtom::resolve`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PageAtom {
     /// Single page index. Negative values count from the end:
     /// `-1` = last page, `-2` = second-to-last, ….
@@ -529,6 +549,7 @@ fn resolve_signed_index(n: isize, total_pages: usize) -> Result<usize, String> {
 /// only care about the one-atom case — but every comma-separated
 /// invocation lands as a [`List`](Self::List).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PageSelector {
     /// Single page index. Negative values count from the end
     /// (`-1` = last page).
@@ -570,6 +591,7 @@ impl PageSelector {
 /// emits. Default is [`Binary`](Self::Binary), matching the registry
 /// factory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StlFormatChoice {
     /// 80-byte header + `uint32` triangle count + `N × 50`-byte triangle
     /// records. Compact and binary-stable.
@@ -602,6 +624,7 @@ impl StlFormatChoice {
 /// token now and the encoder will reject it cleanly until the
 /// upstream variant lands. See gltf-rN follow-up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GltfFormatChoice {
     /// `.glb` self-contained binary container.
     Glb,
@@ -645,6 +668,7 @@ impl GltfFormatChoice {
 /// entirely — useful when normals look wrong, a Z-fighting glitch
 /// shows up, or the camera framing seems off.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Mesh3DRenderMode {
     /// Flat-shaded triangles, one colour per primitive (no per-pixel
     /// lighting). Cheapest mode and the default.
@@ -703,6 +727,7 @@ impl Mesh3DRenderMode {
 /// [`Perspective`](Self::Perspective) — the IM convention for vector
 /// rasterisation matches what most 3D viewers ship.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProjectionMode {
     /// Perspective projection — objects shrink with distance.
     #[default]
@@ -734,6 +759,7 @@ impl ProjectionMode {
 /// renderer always also applies a small constant ambient term so
 /// back-faces stay visible.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct LightSpec {
     pub azimuth_deg: f32,
     pub elevation_deg: f32,
@@ -741,6 +767,16 @@ pub struct LightSpec {
 }
 
 impl LightSpec {
+    /// A directional light from `azimuth_deg` / `elevation_deg` at
+    /// `intensity` (clamped to `>= 0.0`).
+    pub fn new(azimuth_deg: f32, elevation_deg: f32, intensity: f32) -> Self {
+        Self {
+            azimuth_deg,
+            elevation_deg,
+            intensity: intensity.max(0.0),
+        }
+    }
+
     /// Default directional light: from the upper-right-front quadrant
     /// at unit intensity. Matches the renderer baseline so explicit
     /// `-light` is never required.
@@ -793,6 +829,7 @@ impl LightSpec {
 /// multiplier of the scene bounding-sphere radius (`1.0` ≈ scene
 /// touches the framebuffer edge; the auto-framing default is `~1.2`).
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct CameraSpec {
     pub elevation_deg: f32,
     pub azimuth_deg: f32,
@@ -800,6 +837,17 @@ pub struct CameraSpec {
 }
 
 impl CameraSpec {
+    /// A camera at `elevation_deg` / `azimuth_deg`, `distance` away
+    /// from the scene's bounding-box centre (callers validate `> 0`;
+    /// [`parse`](Self::parse) does).
+    pub fn new(elevation_deg: f32, azimuth_deg: f32, distance: f32) -> Self {
+        Self {
+            elevation_deg,
+            azimuth_deg,
+            distance,
+        }
+    }
+
     /// Parse `ELEVATION,AZIMUTH,DISTANCE`. All three components are
     /// required; distance must be `> 0`.
     pub fn parse(s: &str) -> Result<CameraSpec, String> {
@@ -840,6 +888,7 @@ impl CameraSpec {
 /// registry default" — i.e. the existing convert behaviour is
 /// unchanged when no `-foo-format` flag is supplied.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Mesh3DOptions {
     /// `-stl-format ascii|binary`. `None` → registry default (binary).
     pub stl_format: Option<StlFormatChoice>,
@@ -882,8 +931,57 @@ pub struct Mesh3DOptions {
     pub aa: Option<u32>,
 }
 
+impl Mesh3DOptions {
+    /// `-stl-format`.
+    pub fn with_stl_format(mut self, v: impl Into<Option<StlFormatChoice>>) -> Self {
+        self.stl_format = v.into();
+        self
+    }
+    /// `-gltf-format`.
+    pub fn with_gltf_format(mut self, v: impl Into<Option<GltfFormatChoice>>) -> Self {
+        self.gltf_format = v.into();
+        self
+    }
+    /// `-render`.
+    pub fn with_render_mode(mut self, v: impl Into<Option<Mesh3DRenderMode>>) -> Self {
+        self.render_mode = v.into();
+        self
+    }
+    /// `-light`.
+    pub fn with_light(mut self, v: impl Into<Option<LightSpec>>) -> Self {
+        self.light = v.into();
+        self
+    }
+    /// `-camera`.
+    pub fn with_camera(mut self, v: impl Into<Option<CameraSpec>>) -> Self {
+        self.camera = v.into();
+        self
+    }
+    /// `-projection`.
+    pub fn with_projection(mut self, v: impl Into<Option<ProjectionMode>>) -> Self {
+        self.projection = v.into();
+        self
+    }
+    /// `-fov DEGREES`.
+    pub fn with_fov_deg(mut self, v: impl Into<Option<f32>>) -> Self {
+        self.fov_deg = v.into();
+        self
+    }
+    /// `-bg COLOR` (RGBA).
+    pub fn with_bg(mut self, v: impl Into<Option<[u8; 4]>>) -> Self {
+        self.bg = v.into();
+        self
+    }
+    /// `-aa N`.
+    pub fn with_aa(mut self, v: impl Into<Option<u32>>) -> Self {
+        self.aa = v.into();
+        self
+    }
+}
+
 /// The parsed result of one `oxideav convert` invocation.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ConvertPlan {
     /// Input URI WITH any `[N]`/`[N-M]` page selector stripped.
     /// Currently exactly one — IM's multi-input stack is a documented
@@ -939,4 +1037,73 @@ pub struct ConvertPlan {
     /// registry's default factory for each format" so callers who
     /// don't pass any of these flags see no behaviour change.
     pub mesh3d_options: Mesh3DOptions,
+}
+
+impl ConvertPlan {
+    /// A plain conversion of `input` to `output`: no ops, no page
+    /// selector or output template, no mode switch, default 3D options.
+    /// The arg parser produces the same shape through
+    /// [`args::parse`](crate::args::parse); use the `with_*` setters
+    /// for the rest.
+    pub fn new(input: impl Into<String>, output: impl Into<String>) -> Self {
+        Self {
+            input: input.into(),
+            input_pages: None,
+            ops: Vec::new(),
+            output: output.into(),
+            output_template: None,
+            help: false,
+            ping: false,
+            probe: false,
+            probe_json: false,
+            probe_watch: false,
+            mesh3d_options: Mesh3DOptions::default(),
+        }
+    }
+    /// Operation chain in source order.
+    pub fn with_ops(mut self, ops: Vec<Op>) -> Self {
+        self.ops = ops;
+        self
+    }
+    /// `[N]` / `[N-M]` / `[A,B,…]` page selector on the input.
+    pub fn with_input_pages(mut self, v: impl Into<Option<PageSelector>>) -> Self {
+        self.input_pages = v.into();
+        self
+    }
+    /// Parsed `%d` template of `output` (the caller keeps the two in
+    /// sync, as [`args::parse`](crate::args::parse) does).
+    pub fn with_output_template(mut self, v: impl Into<Option<PrintfTemplate>>) -> Self {
+        self.output_template = v.into();
+        self
+    }
+    /// `--help` mode.
+    pub fn with_help(mut self, v: bool) -> Self {
+        self.help = v;
+        self
+    }
+    /// `-ping` mode.
+    pub fn with_ping(mut self, v: bool) -> Self {
+        self.ping = v;
+        self
+    }
+    /// `--probe` mode.
+    pub fn with_probe(mut self, v: bool) -> Self {
+        self.probe = v;
+        self
+    }
+    /// `--json` (with `--probe`).
+    pub fn with_probe_json(mut self, v: bool) -> Self {
+        self.probe_json = v;
+        self
+    }
+    /// `--watch` (with `--probe`).
+    pub fn with_probe_watch(mut self, v: bool) -> Self {
+        self.probe_watch = v;
+        self
+    }
+    /// 3D side-channel options.
+    pub fn with_mesh3d_options(mut self, v: Mesh3DOptions) -> Self {
+        self.mesh3d_options = v;
+        self
+    }
 }

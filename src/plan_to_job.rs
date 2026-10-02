@@ -276,6 +276,8 @@ struct SinkSide {
     depth: Option<u8>,
     /// `--opt KEY=VALUE` pairs, in command-line order.
     encoder_opts: Vec<(String, String)>,
+    /// `-threads N` → the job's `threads` key (`0` / unset = auto).
+    threads: Option<usize>,
 }
 
 impl Default for SinkSide {
@@ -286,6 +288,7 @@ impl Default for SinkSide {
             format_override: None,
             depth: None,
             encoder_opts: Vec::new(),
+            threads: None,
         }
     }
 }
@@ -446,6 +449,10 @@ fn lower_op(chain: TrackInput, op: &Op, sink: &mut SinkSide, absorb_canvas: bool
         }
         Op::EncoderOpt { key, value } => {
             sink.encoder_opts.push((key.clone(), value.clone()));
+            chain
+        }
+        Op::Threads(n) => {
+            sink.threads = (*n >= 1).then_some(*n);
             chain
         }
         // Vector-input ops; dropped on both paths. Raster inputs have
@@ -747,20 +754,20 @@ fn finish_job(
                 subtitle: vec![],
                 all: vec![track],
             };
-            (single_output_job(&plan.output, out)?, None)
+            (single_output_job(&plan.output, out, sink.threads)?, None)
         }
     };
     Ok(Planned { job, notes, tap })
 }
 
 /// Wrap one output spec into a validated [`Job`].
-fn single_output_job(key: &str, out: OutputSpec) -> Result<Job, Error> {
+fn single_output_job(key: &str, out: OutputSpec, threads: Option<usize>) -> Result<Job, Error> {
     let mut outputs = IndexMap::new();
     outputs.insert(key.to_string(), out);
     let job = Job {
         outputs,
         aliases: IndexMap::new(),
-        threads: None,
+        threads,
     };
     // Guarantee: every job this planner emits satisfies the pipeline
     // schema's own invariants (non-empty source, non-blank codec ids,
@@ -871,6 +878,7 @@ fn still_job(
             subtitle: vec![],
             all: vec![],
         },
+        sink.threads,
     )
 }
 
@@ -951,7 +959,13 @@ fn tap_job(
             subtitle: vec![],
             all: vec![],
         },
+        sink.threads,
     )?;
+    // The encoder's thread budget resolves exactly as the executor's:
+    // the job's `threads` key, else the host's parallelism.
+    let threads = sink
+        .threads
+        .unwrap_or_else(|| oxideav_core::ExecutionContext::auto().threads);
     let tap = TapSpec {
         codec,
         container,
@@ -961,6 +975,7 @@ fn tap_job(
         stream,
         output: plan.output.clone(),
         template: plan.output_template.clone(),
+        threads,
     };
     Ok((job, tap))
 }

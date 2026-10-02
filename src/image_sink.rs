@@ -38,6 +38,7 @@ use oxideav_pixfmt::FormatInfo;
 /// the extension (`.pbm` bitmap, `.pgm` graymap, `.ppm` pixmap);
 /// every other extension leaves the choice to [`pick_sink_format`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LayoutHint {
     /// No constraint from the extension.
     Any,
