@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.6...v0.0.7) - 2026-10-02
+
+### Other
+
+- *(convert)* png 0.2 constructors + >=0.1.8,<0.3 range; frame-tap encoder gets the executor's thread budget; -threads N; #[non_exhaustive] public records with constructors
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.5...v0.0.6) - 2026-09-27
 
 ### Added
