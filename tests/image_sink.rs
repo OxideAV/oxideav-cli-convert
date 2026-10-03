@@ -23,7 +23,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use oxideav_core::{PixelFormat, RuntimeContext, VideoFrame, VideoPlane};
-use oxideav_png::{decode_png, encode_png_image, PngImage, PngPixelFormat};
+use oxideav_png::{decode, encode, EncodeOptions, PngImage, PngPixelFormat};
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -69,8 +69,12 @@ fn pattern(w: u32, h: u32, channels: usize) -> Vec<u8> {
 }
 
 fn write_png(path: &PathBuf, fmt: PngPixelFormat, w: u32, h: u32, data: Vec<u8>) {
-    let img = PngImage::new(w, h, fmt, w as usize * fmt.bytes_per_pixel(), data);
-    fs::write(path, encode_png_image(&img).expect("png encode")).expect("write png");
+    let img = PngImage::packed(w, h, fmt, w as usize * fmt.bytes_per_pixel(), data);
+    fs::write(
+        path,
+        encode(&img, &EncodeOptions::default()).expect("png encode"),
+    )
+    .expect("write png");
 }
 
 /// A 4:4:4 JPEG (the mjpeg encoder's own RGB → YUV path is bypassed:
@@ -107,8 +111,22 @@ fn write_jpeg444(path: &PathBuf, w: u32, h: u32) {
     fs::write(path, bytes).expect("write jpeg");
 }
 
-fn read_png(path: &PathBuf) -> PngImage {
-    decode_png(&fs::read(path).expect("output written")).expect("output decodes")
+/// A decoded PNG flattened to its layout, geometry and raw plane.
+struct Decoded {
+    format: PngPixelFormat,
+    width: u32,
+    height: u32,
+    data: Vec<u8>,
+}
+
+fn read_png(path: &PathBuf) -> Decoded {
+    let img = decode(&fs::read(path).expect("output written")).expect("output decodes");
+    Decoded {
+        format: img.format(),
+        width: img.width,
+        height: img.height,
+        data: img.into_raw(),
+    }
 }
 
 #[test]
@@ -119,7 +137,7 @@ fn rgb24_png_passes_through_unchanged() {
     write_png(&src, PngPixelFormat::Rgb24, 24, 16, px.clone());
     convert(&[src.to_str().unwrap(), out.to_str().unwrap()]);
     let got = read_png(&out);
-    assert_eq!(got.pixel_format, PngPixelFormat::Rgb24);
+    assert_eq!(got.format, PngPixelFormat::Rgb24);
     assert_eq!((got.width, got.height), (24, 16));
     assert_eq!(got.data, px, "rgb24 → png must be sample-exact");
 }
@@ -132,7 +150,7 @@ fn rgba_png_passes_through_unchanged() {
     write_png(&src, PngPixelFormat::Rgba, 24, 16, px.clone());
     convert(&[src.to_str().unwrap(), out.to_str().unwrap()]);
     let got = read_png(&out);
-    assert_eq!(got.pixel_format, PngPixelFormat::Rgba);
+    assert_eq!(got.format, PngPixelFormat::Rgba);
     assert_eq!(got.data, px, "rgba → png must be sample-exact");
 }
 
@@ -144,7 +162,7 @@ fn gray8_png_passes_through_unchanged() {
     write_png(&src, PngPixelFormat::Gray8, 24, 16, px.clone());
     convert(&[src.to_str().unwrap(), out.to_str().unwrap()]);
     let got = read_png(&out);
-    assert_eq!(got.pixel_format, PngPixelFormat::Gray8);
+    assert_eq!(got.format, PngPixelFormat::Gray8);
     assert_eq!(got.data, px, "gray8 → png must be sample-exact");
 }
 
@@ -156,7 +174,7 @@ fn rgb48_png_keeps_sixteen_bits() {
     write_png(&src, PngPixelFormat::Rgb48Le, 24, 16, px.clone());
     convert(&[src.to_str().unwrap(), out.to_str().unwrap()]);
     let got = read_png(&out);
-    assert_eq!(got.pixel_format, PngPixelFormat::Rgb48Le);
+    assert_eq!(got.format, PngPixelFormat::Rgb48Le);
     assert_eq!(got.data, px, "rgb48 → png must be sample-exact");
 }
 
@@ -222,7 +240,7 @@ fn yuv444_jpeg_to_png_is_rgb_with_the_reference_samples() {
     convert(&[src.to_str().unwrap(), out.to_str().unwrap()]);
     let got = read_png(&out);
     assert_eq!((got.width, got.height), (24, 16));
-    assert_eq!(got.pixel_format, PngPixelFormat::Rgb24);
+    assert_eq!(got.format, PngPixelFormat::Rgb24);
     assert_eq!(got.data, reference_rgb(&src), "RGB samples changed");
 }
 
@@ -235,7 +253,7 @@ fn depth_16_widens_a_yuv_source() {
     write_jpeg444(&src, 24, 16);
     convert(&[src.to_str().unwrap(), "-depth", "16", out.to_str().unwrap()]);
     let got = read_png(&out);
-    assert_eq!(got.pixel_format, PngPixelFormat::Rgb48Le);
+    assert_eq!(got.format, PngPixelFormat::Rgb48Le);
     assert_eq!(got.data, reference(&src, PixelFormat::Rgb48Le));
 }
 
@@ -248,7 +266,7 @@ fn depth_8_narrows_a_sixteen_bit_png() {
     write_png(&src, PngPixelFormat::Rgb48Le, 24, 16, px.clone());
     convert(&[src.to_str().unwrap(), "-depth", "8", out.to_str().unwrap()]);
     let got = read_png(&out);
-    assert_eq!(got.pixel_format, PngPixelFormat::Rgb24);
+    assert_eq!(got.format, PngPixelFormat::Rgb24);
     let high: Vec<u8> = px.chunks_exact(2).map(|w| w[1]).collect();
     assert_eq!(got.data, high, "16 → 8 keeps the high byte");
 }
@@ -414,7 +432,7 @@ fn write_apng3(path: &PathBuf, w: u32, h: u32) -> Vec<Vec<u8>> {
         .collect();
     let imgs: Vec<PngImage> = frames
         .iter()
-        .map(|px| PngImage::new(w, h, PngPixelFormat::Rgb24, w as usize * 3, px.clone()))
+        .map(|px| PngImage::packed(w, h, PngPixelFormat::Rgb24, w as usize * 3, px.clone()))
         .collect();
     let bytes = oxideav_png::encode_apng(&imgs, 10, 0).expect("apng encode");
     fs::write(path, bytes).expect("write apng");
@@ -432,7 +450,7 @@ fn template_fans_out_every_frame() {
     for (i, px) in frames.iter().enumerate() {
         let f = dir.join(format!("frame-{i:02}.png"));
         let got = read_png(&f);
-        assert_eq!(got.pixel_format, PngPixelFormat::Rgb24);
+        assert_eq!(got.format, PngPixelFormat::Rgb24);
         assert_eq!(&got.data, px, "frame {i}");
     }
     assert!(!dir.join("frame-03.png").exists());

@@ -818,7 +818,7 @@ fn sharpen_through_pdf_side_channel_matches_image_filter_standalone() {
     // the plain render.
     use oxideav_core::{PixelFormat, VideoFrame, VideoPlane};
     use oxideav_image_filter::{ImageFilter, Sharpen, VideoStreamParams};
-    use oxideav_png::decode_png;
+    use oxideav_png::decode;
 
     let dir = temp_dir("sharpen-side-channel");
     let pdf_path = dir.join("in.pdf");
@@ -853,15 +853,18 @@ fn sharpen_through_pdf_side_channel_matches_image_filter_standalone() {
     .expect("sharpen render");
 
     // Decode both PNGs and run Sharpen standalone on the plain pixels.
-    let plain_png = decode_png(&fs::read(&plain).unwrap()).expect("decode plain PNG");
-    let sharp_png = decode_png(&fs::read(&sharpened).unwrap()).expect("decode sharpened PNG");
+    let plain_png = decode(&fs::read(&plain).unwrap()).expect("decode plain PNG");
+    let sharp_png = decode(&fs::read(&sharpened).unwrap()).expect("decode sharpened PNG");
     assert_eq!(plain_png.width, sharp_png.width);
     assert_eq!(plain_png.height, sharp_png.height);
+    let plain_stride = plain_png.stride();
+    let (plain_w, plain_h) = (plain_png.width, plain_png.height);
+    let plain_data = plain_png.into_raw();
 
     // PNG decode emits Rgba (4 bpp) for our test fixture's alpha-bearing
     // render; if it happened to land on Rgb24 the stride-vs-width math
     // would still hold but the filter would need a different format tag.
-    let bpp = plain_png.stride / plain_png.width as usize;
+    let bpp = plain_stride / plain_w as usize;
     let format = match bpp {
         4 => PixelFormat::Rgba,
         3 => PixelFormat::Rgb24,
@@ -870,8 +873,8 @@ fn sharpen_through_pdf_side_channel_matches_image_filter_standalone() {
     let plain_frame = VideoFrame {
         pts: None,
         planes: vec![VideoPlane {
-            stride: plain_png.stride,
-            data: plain_png.data.clone(),
+            stride: plain_stride,
+            data: plain_data,
         }],
     };
     let reference = Sharpen::new(1, 0.5)
@@ -879,13 +882,14 @@ fn sharpen_through_pdf_side_channel_matches_image_filter_standalone() {
             &plain_frame,
             VideoStreamParams {
                 format,
-                width: plain_png.width,
-                height: plain_png.height,
+                width: plain_w,
+                height: plain_h,
             },
         )
         .expect("standalone Sharpen apply");
     assert_eq!(
-        sharp_png.data, reference.planes[0].data,
+        sharp_png.into_raw(),
+        reference.planes[0].data,
         "PDF side-channel sharpen output must match standalone Sharpen byte-for-byte"
     );
 }

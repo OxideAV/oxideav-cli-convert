@@ -29,8 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `oxideav-png` requirement is `>=0.1.8, <0.3`: PNG records are built
-  through the 0.2.0 constructors (`PngImage::new(width, height,
-  pixel_format, stride, data)`); the range also admits the 0.1.8 tree
+  through the 0.2.0 image-crate contract (`PngImage::packed(width,
+  height, format, stride, data)`, `oxideav_png::encode(&image,
+  &EncodeOptions)`, `decode` / `decode_rgba8`); the range also admits the 0.1.8 tree
   that carries them so the umbrella's path build resolves before 0.2.0
   is published. Tighten to `"0.2"` at the next touch after the release.
 - **API shape: every public record and enum is `#[non_exhaustive]`**

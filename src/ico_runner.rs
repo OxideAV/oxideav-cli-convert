@@ -100,7 +100,7 @@ fn read_source_to_rgba(input: &str) -> Result<RgbaImage> {
 }
 
 fn decode_png(bytes: &[u8]) -> Result<RgbaImage> {
-    let bmp = oxideav_png::decode_png_to_rgba(bytes)
+    let bmp = oxideav_png::decode_rgba8(bytes)
         .map_err(|e| Error::invalid(format!("convert: PNG decode failed: {e:?}")))?;
     let stride = (bmp.width as usize) * 4;
     Ok(RgbaImage {

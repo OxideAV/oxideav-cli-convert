@@ -199,14 +199,15 @@ fn set_alpha(img: &mut RgbaImage, value: u8) {
 }
 
 fn encode_png(img: &RgbaImage) -> Result<Vec<u8>> {
-    use oxideav_png::{encode_png_image, PngImage, PngPixelFormat};
+    use oxideav_png::{encode, EncodeOptions, PngImage, PngPixelFormat};
     let pf = if img.is_rgb() {
         PngPixelFormat::Rgb24
     } else {
         PngPixelFormat::Rgba
     };
-    let png = PngImage::new(img.width, img.height, pf, img.stride, img.pixels.clone());
-    encode_png_image(&png).map_err(|e| Error::invalid(format!("convert: PNG encode failed: {e:?}")))
+    let png = PngImage::packed(img.width, img.height, pf, img.stride, img.pixels.clone());
+    encode(&png, &EncodeOptions::default())
+        .map_err(|e| Error::invalid(format!("convert: PNG encode failed: {e:?}")))
 }
 
 fn encode_bmp(img: &RgbaImage) -> Result<Vec<u8>> {
