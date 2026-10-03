@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.7...v0.0.8) - 2026-10-03
+
+### Other
+
+- *(convert)* follow the oxideav-bmp image-crate contract — BmpImage::packed, encode(&img, &EncodeOptions), decode_rgba8; bmp requirement >=0.1.6, <0.3
+- *(convert)* follow the oxideav-png image-crate contract — PngImage::packed, encode(&img, &EncodeOptions), decode / decode_rgba8
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.6...v0.0.7) - 2026-10-02
 
 ### Other
