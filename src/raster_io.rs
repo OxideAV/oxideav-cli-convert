@@ -211,25 +211,15 @@ fn encode_png(img: &RgbaImage) -> Result<Vec<u8>> {
 }
 
 fn encode_bmp(img: &RgbaImage) -> Result<Vec<u8>> {
-    use oxideav_bmp::{encode_bmp as bmp_encode, BmpImage, BmpPixelFormat, BmpPlane};
+    use oxideav_bmp::{encode, BmpImage, BmpPixelFormat, EncodeOptions};
     let pf = if img.is_rgb() {
         BmpPixelFormat::Rgb24
     } else {
         BmpPixelFormat::Rgba
     };
-    let bmp = BmpImage {
-        width: img.width,
-        height: img.height,
-        pixel_format: pf,
-        planes: vec![BmpPlane {
-            stride: img.stride,
-            data: img.pixels.clone(),
-        }],
-        palette: None,
-        pts: None,
-    };
-    bmp_encode(&bmp)
-        .map(|(bytes, _format)| bytes)
+    let bmp = BmpImage::packed(img.width, img.height, pf, img.stride, img.pixels.clone())
+        .map_err(|e| Error::invalid(format!("convert: BMP encode failed: {e:?}")))?;
+    encode(&bmp, &EncodeOptions::default())
         .map_err(|e| Error::invalid(format!("convert: BMP encode failed: {e:?}")))
 }
 

@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   &EncodeOptions)`, `decode` / `decode_rgba8`); the range also admits the 0.1.8 tree
   that carries them so the umbrella's path build resolves before 0.2.0
   is published. Tighten to `"0.2"` at the next touch after the release.
+- `oxideav-bmp` requirement is `>=0.1.6, <0.3` for the same reason:
+  BMP records go through the contract (`BmpImage::packed`,
+  `oxideav_bmp::encode(&img, &EncodeOptions)`, `decode_rgba8`).
 - **API shape: every public record and enum is `#[non_exhaustive]`**
   (`ConvertPlan`, `Op`, `Route`, `PrintfTemplate`, `PageSelector`,
   `PageAtom`, `Dither`, `AlphaOp`, `ResizeMode`, `Mesh3DOptions`,

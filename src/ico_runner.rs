@@ -112,41 +112,16 @@ fn decode_png(bytes: &[u8]) -> Result<RgbaImage> {
 }
 
 fn decode_bmp(bytes: &[u8]) -> Result<RgbaImage> {
-    use oxideav_bmp::{decode_bmp as bmp_decode, BmpPixelFormat};
-    let img = bmp_decode(bytes)
+    // `decode_rgba8` widens every native BMP layout (Pal8, 16-bit,
+    // Bgr24, Bgra) to tightly packed RGBA, so the runner keeps its one
+    // packed layout without a per-format match.
+    let img = oxideav_bmp::decode_rgba8(bytes)
         .map_err(|e| Error::invalid(format!("convert: BMP decode failed: {e:?}")))?;
-    let plane = img
-        .planes
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::invalid("convert: BMP decoded to zero planes"))?;
-    let (pixels, stride) = match img.pixel_format {
-        BmpPixelFormat::Rgba => (plane.data, plane.stride),
-        BmpPixelFormat::Rgb24 => {
-            // Promote Rgb24 → Rgba so the rest of the runner only has
-            // one packed layout to think about.
-            let w = img.width as usize;
-            let h = img.height as usize;
-            let mut out = Vec::with_capacity(w * h * 4);
-            for row in 0..h {
-                let r0 = row * plane.stride;
-                for px in plane.data[r0..r0 + w * 3].chunks_exact(3) {
-                    out.extend_from_slice(&[px[0], px[1], px[2], 255]);
-                }
-            }
-            (out, w * 4)
-        }
-        other => {
-            return Err(Error::unsupported(format!(
-                "convert: BMP decoded to {other:?}, only Rgb24/Rgba supported on ICO path"
-            )));
-        }
-    };
     Ok(RgbaImage {
         width: img.width,
         height: img.height,
-        pixels,
-        stride,
+        stride: img.width as usize * 4,
+        pixels: img.data,
     })
 }
 

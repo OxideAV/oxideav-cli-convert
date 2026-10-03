@@ -66,7 +66,10 @@ oxideav-pixfmt = "0.1"
 # Per-page raster encoders for the fan-out path. Lossless paths only
 # (BMP raw RGBA, JPEG via YUV420, WebP-VP8L lossless); animated /
 # palette-quantised / multi-image formats (GIF, TIFF) are deferred.
-oxideav-bmp = "0.1"
+# Same transition as oxideav-png: the 0.2.0 image-crate contract
+# (`BmpImage::packed`, `encode`, `decode_rgba8`) is also in the 0.1.6 tree
+# the umbrella patches in; tighten to "0.2" once bmp 0.2.0 is on crates.io.
+oxideav-bmp = ">=0.1.6, <0.3"
 oxideav-mjpeg = "0.1"
 oxideav-webp = "0.2"
 # SVG writer for the per-page vector output path (PDF→SVG, no raster).
