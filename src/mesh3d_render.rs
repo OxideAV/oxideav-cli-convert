@@ -132,6 +132,7 @@ pub fn run(input_path: &str, output_path: &str, ops: &[Op], options: &Mesh3DOpti
 /// framework-wide [`RenderOptions`] consumed by
 /// [`oxideav_render::make_renderer`]. `None` fields fall back to the
 /// renderer's documented defaults.
+#[allow(clippy::needless_update)]
 fn to_render_options(
     options: &Mesh3DOptions,
     width: u32,
@@ -161,6 +162,11 @@ fn to_render_options(
         distance: c.distance,
     });
     let aa = options.aa.unwrap_or(1).clamp(1, 8);
+    // Functional update keeps this constructor source-compatible as
+    // oxideav-render grows options (tone mapping, animation time, scene
+    // camera/lights, shadows, …); against a renderer release whose
+    // fields are all listed above the update is a no-op (hence the
+    // `needless_update` allow on this fn).
     RenderOptions {
         width,
         height,
@@ -171,6 +177,7 @@ fn to_render_options(
         light,
         camera,
         aa,
+        ..RenderOptions::default()
     }
 }
 
