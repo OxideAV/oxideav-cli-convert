@@ -1,7 +1,7 @@
 //! Per-container default codecs for multi-codec outputs.
 //!
 //! An output extension that names a container rather than a codec
-//! (`.webm`, `.mkv`, `.y4m`, `.ogg`) leaves the codec choice to the
+//! (`.webm`, `.mkv`, `.mp4`, `.wav`, `.y4m`, `.ogg`) leaves the codec choice to the
 //! planner. Streams whose codec the container can store are
 //! stream-copied (the historical behaviour); a stream it cannot store
 //! (raw video into WebM, PCM into Ogg, H.264 into WebM, …) is
@@ -59,6 +59,27 @@ const DEFAULTS: &[(&str, MediaType, Storable, &str)] = &[
         MediaType::Audio,
         Storable::Only(&["vorbis", "opus", "flac", "speex"]),
         "vorbis",
+    ),
+    // WAV (this framework's muxer) stores integer / float PCM only.
+    (
+        "wav",
+        MediaType::Audio,
+        Storable::Only(&[
+            "pcm_u8",
+            "pcm_s16le",
+            "pcm_s24le",
+            "pcm_s32le",
+            "pcm_f32le",
+            "pcm_f64le",
+        ]),
+        "pcm_s16le",
+    ),
+    // MP4: raw pictures get H.264.
+    (
+        "mp4",
+        MediaType::Video,
+        Storable::AllBut(&["rawvideo"]),
+        "h264",
     ),
     // YUV4MPEG2 stores raw pictures only.
     (
@@ -192,7 +213,7 @@ mod tests {
             None
         );
         let ctx = ctx_with_encoders(&["vp9"]);
-        assert_eq!(track_codec(&ctx, "mp4", MediaType::Video, "rawvideo"), None);
+        assert_eq!(track_codec(&ctx, "avi", MediaType::Video, "rawvideo"), None);
         assert_eq!(
             track_codec(&ctx, "webm", MediaType::Video, "vp9"),
             Some(None)
