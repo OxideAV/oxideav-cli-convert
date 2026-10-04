@@ -41,7 +41,8 @@ fn write_solid_red_png(path: &PathBuf, dims: u32) {
     for _ in 0..n {
         data.extend_from_slice(&[255, 0, 0, 255]);
     }
-    let img = PngImage::packed(dims, dims, PngPixelFormat::Rgba, (dims as usize) * 4, data);
+    let img =
+        PngImage::packed(dims, dims, PngPixelFormat::Rgba, (dims as usize) * 4, data).unwrap();
     let bytes = encode(&img, &EncodeOptions::default()).expect("encode source PNG");
     fs::write(path, bytes).unwrap();
 }

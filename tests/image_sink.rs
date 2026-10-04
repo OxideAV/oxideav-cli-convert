@@ -69,7 +69,7 @@ fn pattern(w: u32, h: u32, channels: usize) -> Vec<u8> {
 }
 
 fn write_png(path: &PathBuf, fmt: PngPixelFormat, w: u32, h: u32, data: Vec<u8>) {
-    let img = PngImage::packed(w, h, fmt, w as usize * fmt.bytes_per_pixel(), data);
+    let img = PngImage::packed(w, h, fmt, w as usize * fmt.bytes_per_pixel(), data).unwrap();
     fs::write(
         path,
         encode(&img, &EncodeOptions::default()).expect("png encode"),
@@ -432,7 +432,9 @@ fn write_apng3(path: &PathBuf, w: u32, h: u32) -> Vec<Vec<u8>> {
         .collect();
     let imgs: Vec<PngImage> = frames
         .iter()
-        .map(|px| PngImage::packed(w, h, PngPixelFormat::Rgb24, w as usize * 3, px.clone()))
+        .map(|px| {
+            PngImage::packed(w, h, PngPixelFormat::Rgb24, w as usize * 3, px.clone()).unwrap()
+        })
         .collect();
     let bytes = oxideav_png::encode_apng(&imgs, 10, 0).expect("apng encode");
     fs::write(path, bytes).expect("write apng");

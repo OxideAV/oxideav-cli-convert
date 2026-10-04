@@ -205,7 +205,8 @@ fn encode_png(img: &RgbaImage) -> Result<Vec<u8>> {
     } else {
         PngPixelFormat::Rgba
     };
-    let png = PngImage::packed(img.width, img.height, pf, img.stride, img.pixels.clone());
+    let png = PngImage::packed(img.width, img.height, pf, img.stride, img.pixels.clone())
+        .map_err(|e| Error::invalid(format!("convert: PNG encode failed: {e:?}")))?;
     encode(&png, &EncodeOptions::default())
         .map_err(|e| Error::invalid(format!("convert: PNG encode failed: {e:?}")))
 }
