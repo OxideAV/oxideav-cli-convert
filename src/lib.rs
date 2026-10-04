@@ -87,6 +87,7 @@ pub use op::{AlphaOp, ConvertPlan, Dither, Op, PrintfTemplate, ResizeMode};
 pub use route::Route;
 
 use oxideav_core::{Error, RuntimeContext};
+use oxideav_pipeline::CodecPreferences;
 
 /// Run convert with a caller-supplied [`RuntimeContext`].
 ///
@@ -94,6 +95,17 @@ use oxideav_core::{Error, RuntimeContext};
 /// it uses for `remux` / `transcode` / `run`; third-party embedders can
 /// pass a narrower set.
 pub fn run(args: &[String], ctx: &RuntimeContext) -> Result<(), Error> {
+    run_with_preferences(args, ctx, &CodecPreferences::default())
+}
+
+/// [`run`] with every decoder / encoder of the pipeline route resolved
+/// under `prefs` — the CLI forwards `--no-hwaccel` here
+/// (`CodecPreferences { no_hardware: true, .. }`).
+pub fn run_with_preferences(
+    args: &[String],
+    ctx: &RuntimeContext,
+    prefs: &CodecPreferences,
+) -> Result<(), Error> {
     let plan = args::parse(args)?;
 
     // All routing decisions live in `route::decide` (pure, matrix-
@@ -169,7 +181,9 @@ pub fn run(args: &[String], ctx: &RuntimeContext) -> Result<(), Error> {
             match planned.tap {
                 None => {
                     let t1 = std::time::Instant::now();
-                    let stats = oxideav_pipeline::Executor::new(&planned.job, ctx).run()?;
+                    let stats = oxideav_pipeline::Executor::new(&planned.job, ctx)
+                        .with_codec_preferences(prefs.clone())
+                        .run()?;
                     eprintln!(
                         "convert: {} packet(s) read, {} frame(s) decoded, {} frame(s) written",
                         stats.packets_read, stats.frames_decoded, stats.frames_written
@@ -184,7 +198,7 @@ pub fn run(args: &[String], ctx: &RuntimeContext) -> Result<(), Error> {
                 }
                 Some(tap) => {
                     let t1 = std::time::Instant::now();
-                    let (stats, written) = frame_tap::run(&planned.job, ctx, &tap)?;
+                    let (stats, written) = frame_tap::run(&planned.job, ctx, &tap, prefs)?;
                     eprintln!(
                         "convert: {} packet(s) read, {} frame(s) decoded, {} file(s) written",
                         stats.packets_read, stats.frames_decoded, written.files

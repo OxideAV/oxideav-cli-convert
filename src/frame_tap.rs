@@ -94,6 +94,7 @@ pub fn run(
     job: &Job,
     ctx: &RuntimeContext,
     spec: &TapSpec,
+    prefs: &oxideav_pipeline::CodecPreferences,
 ) -> Result<(oxideav_pipeline::executor::ExecutorStats, TapStats)> {
     let (tx, rx) = sync_channel::<Frame>(2);
     let start = Instant::now();
@@ -101,6 +102,7 @@ pub fn run(
         let writer = s.spawn(move || write_frames(rx, ctx, spec, start));
         let sink = ChannelSink { tx: Some(tx) };
         let exec = Executor::new(job, ctx)
+            .with_codec_preferences(prefs.clone())
             .with_sink_override(TAP_SINK, Box::new(sink))
             .run();
         let written = writer
