@@ -27,6 +27,12 @@
 //! input we surface a clear "input not supported on the ICO writer
 //! path yet" error instead of silently bailing.
 
+// `oxideav_ico::{write_ico, IconImage, WriteOptions}` is deprecated in the unreleased image-crate API
+// contract, but the published release this crate builds against
+// standalone only has the old names. Keep them until the contract
+// API ships, then migrate.
+#![allow(deprecated)]
+
 use std::fs;
 
 use oxideav_core::{Error, PixelFormat, Result, VideoFrame, VideoPlane};

@@ -29,6 +29,12 @@
 //! wire PDF as a `Demuxer` because pages don't fit the `Frame::Video`
 //! shape, and the routing rule is convert-specific.
 
+// `oxideav_svg::write_svg` is deprecated in the unreleased image-crate API
+// contract, but the published release this crate builds against
+// standalone only has the old names. Keep them until the contract
+// API ships, then migrate.
+#![allow(deprecated)]
+
 use std::fs;
 
 use oxideav_core::{Error, Result, Rgba};

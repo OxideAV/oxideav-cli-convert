@@ -28,6 +28,12 @@
 //! resource walker) the probe leaves it `null` in JSON / `unknown` in
 //! pretty form rather than guessing.
 
+// `oxideav_svg::parse_svg` is deprecated in the unreleased image-crate API
+// contract, but the published release this crate builds against
+// standalone only has the old names. Keep them until the contract
+// API ships, then migrate.
+#![allow(deprecated)]
+
 use std::fmt::Write as _;
 use std::fs;
 
