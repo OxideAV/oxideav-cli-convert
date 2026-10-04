@@ -104,6 +104,38 @@ pub fn track_codec(
         .then(|| Some((*default).to_string()))
 }
 
+/// The codec a `kind` stream of `source_codec` is written with when the
+/// user names none, by the same rule `convert` applies per stream:
+///
+/// * `output_codec` — the encoder the output extension itself names
+///   (`.flac`, `.mp3`; see
+///   [`crate::image_sink::resolve_output_codec`]) — when it encodes
+///   this media type;
+/// * otherwise the container's default codec for a source it cannot
+///   store ([`track_codec`]).
+///
+/// `Some(codec)` = re-encode with `codec`, `None` = stream-copy (the
+/// container stores the source as-is, or has no table entry).
+pub fn stream_codec(
+    ctx: &RuntimeContext,
+    container: &str,
+    output_codec: Option<&str>,
+    kind: MediaType,
+    source_codec: &str,
+) -> Option<String> {
+    if let Some(codec) = output_codec {
+        let encodes_kind = ctx
+            .codecs
+            .implementations(&CodecId::new(codec))
+            .iter()
+            .any(|i| i.make_encoder.is_some() && i.caps.media_type == kind);
+        if encodes_kind {
+            return Some(codec.to_string());
+        }
+    }
+    track_codec(ctx, container, kind, source_codec).flatten()
+}
+
 /// Per-stream codec plan for `streams` written to `container`, or
 /// `None` when every stream is stored as-is (or the container has no
 /// table entry) — the caller then keeps its stream-copy job.
@@ -195,6 +227,53 @@ mod tests {
         assert_eq!(
             plan_tracks(&ctx, "matroska", &streams),
             Some(vec![(MediaType::Video, 0, Some("vp9".to_string()))])
+        );
+    }
+
+    fn ctx_with_audio_encoders(ids: &[&str]) -> RuntimeContext {
+        let mut ctx = RuntimeContext::new();
+        for id in ids {
+            ctx.codecs.register(
+                CodecInfo::new(CodecId::new(*id))
+                    .capabilities(CodecCapabilities::audio(*id).with_encode())
+                    .encoder(|_| Err(oxideav_core::Error::unsupported("stub"))),
+            );
+        }
+        ctx
+    }
+
+    #[test]
+    fn stream_codec_prefers_the_extension_codec_then_the_table() {
+        let ctx = ctx_with_audio_encoders(&["flac", "vorbis", "pcm_s16le"]);
+        // `.flac`: the extension names an audio encoder.
+        assert_eq!(
+            stream_codec(&ctx, "flac", Some("flac"), MediaType::Audio, "aac"),
+            Some("flac".to_string())
+        );
+        // …which does not apply to a video stream (no table entry
+        // either: copy).
+        assert_eq!(
+            stream_codec(&ctx, "flac", Some("flac"), MediaType::Video, "h264"),
+            None
+        );
+        // `.ogg`: AAC has no Ogg mapping → Vorbis; Opus is stored.
+        assert_eq!(
+            stream_codec(&ctx, "ogg", None, MediaType::Audio, "aac"),
+            Some("vorbis".to_string())
+        );
+        assert_eq!(
+            stream_codec(&ctx, "ogg", None, MediaType::Audio, "opus"),
+            None
+        );
+        // `.wav`: PCM default for compressed audio.
+        assert_eq!(
+            stream_codec(&ctx, "wav", None, MediaType::Audio, "flac"),
+            Some("pcm_s16le".to_string())
+        );
+        // No table entry: copy.
+        assert_eq!(
+            stream_codec(&ctx, "matroska", None, MediaType::Audio, "aac"),
+            None
         );
     }
 
