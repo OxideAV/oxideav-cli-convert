@@ -206,10 +206,11 @@ pub fn pick_sink_format(
 /// The container registered for the extension names the codec for
 /// image formats whose container and codec share a name (`png`,
 /// `pbm`, `heif`, …). When that name has no encoder the extension
-/// itself, then a known container → codec alias, is tried; if none
-/// of them has an encoder the container name is returned unchanged
-/// (the historical behaviour — the pipeline then reports what it
-/// cannot build).
+/// itself, then a known container → codec alias, is tried. If none
+/// of them has an encoder, a container with a registered muxer
+/// (`webm`, `matroska`, `wav`, …) yields `None` — the codec is chosen
+/// per stream — and anything else returns the container name
+/// unchanged (the pipeline then reports what it cannot build).
 pub fn resolve_output_codec(
     format_override: Option<&str>,
     output: &str,
@@ -233,6 +234,13 @@ pub fn resolve_output_codec(
         if has_enc(codec) {
             return Some(codec.to_string());
         }
+    }
+    // A container that is not itself a codec (`.webm`, `.mkv`, `.wav`,
+    // …): no single output codec — the planner picks per stream
+    // (stream copy, or the container's default encoder; see
+    // `crate::container_defaults`).
+    if ctx.containers.muxer_names().any(|m| m == container) {
+        return None;
     }
     Some(container)
 }
@@ -360,6 +368,17 @@ pub fn fanout_stream(streams: &[StreamInfo]) -> usize {
 /// packet sources, unknown formats, missing files) — callers then
 /// keep the pipeline's defaults.
 pub fn probe_video_streams(input: &str, ctx: &RuntimeContext) -> Option<Vec<StreamInfo>> {
+    Some(
+        probe_streams(input, ctx)?
+            .into_iter()
+            .filter(|s| s.params.media_type == MediaType::Video)
+            .collect(),
+    )
+}
+
+/// Every stream of `input` as its container header declares it, or
+/// `None` under the same conditions as [`probe_video_streams`].
+pub fn probe_streams(input: &str, ctx: &RuntimeContext) -> Option<Vec<StreamInfo>> {
     let raw = match ctx.sources.open(input).ok()? {
         SourceOutput::Bytes(b) => b,
         _ => return None,
@@ -374,14 +393,7 @@ pub fn probe_video_streams(input: &str, ctx: &RuntimeContext) -> Option<Vec<Stre
         .containers
         .open_demuxer(&format, handle, &ctx.codecs)
         .ok()?;
-    Some(
-        demuxer
-            .streams()
-            .iter()
-            .filter(|s| s.params.media_type == MediaType::Video)
-            .cloned()
-            .collect(),
-    )
+    Some(demuxer.streams().to_vec())
 }
 
 fn ext_of(path: &str) -> Option<&str> {

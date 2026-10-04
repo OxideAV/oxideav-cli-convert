@@ -742,6 +742,16 @@ fn finish_job(
                         .to_string(),
                 );
             }
+            if codec.is_none() && probe_input {
+                if let Some(out) = container_default_output(plan, ctx, &chain, &sink) {
+                    let job = single_output_job(&plan.output, out, sink.threads)?;
+                    return Ok(Planned {
+                        job,
+                        notes,
+                        tap: None,
+                    });
+                }
+            }
             let track = TrackSpec {
                 input: chain,
                 codec,
@@ -758,6 +768,55 @@ fn finish_job(
         }
     };
     Ok(Planned { job, notes, tap })
+}
+
+/// Per-stream tracks for a container output whose extension names no
+/// codec (`.webm`, `.mkv`, …) when at least one input stream needs
+/// re-encoding to fit the container (see [`crate::container_defaults`]):
+/// one track per audio / video stream, pinned by kind ordinal, carrying
+/// the container's default codec or stream-copying. `None` keeps the
+/// stream-copy `all` track.
+fn container_default_output(
+    plan: &ConvertPlan,
+    ctx: &RuntimeContext,
+    chain: &TrackInput,
+    sink: &SinkSide,
+) -> Option<OutputSpec> {
+    let ext = sink
+        .format_override
+        .clone()
+        .or_else(|| ext_of(&plan.output).map(str::to_string))?
+        .to_ascii_lowercase();
+    let container = ctx.containers.container_for_extension(&ext)?.to_string();
+    let streams = image_sink::probe_streams(&plan.input, ctx)?;
+    let tracks = crate::container_defaults::plan_tracks(ctx, &container, &streams)?;
+    let mut out = OutputSpec {
+        audio: vec![],
+        video: vec![],
+        subtitle: vec![],
+        all: vec![],
+    };
+    for (kind, ordinal, codec) in tracks {
+        let params = if codec.is_some() {
+            sink.codec_params.clone()
+        } else {
+            json!({})
+        };
+        let track = TrackSpec {
+            input: chain.clone(),
+            codec,
+            params,
+            stream_selector: Some(StreamSelector {
+                kind: Some(kind),
+                index: Some(ordinal),
+            }),
+        };
+        match kind {
+            MediaType::Video => out.video.push(track),
+            _ => out.audio.push(track),
+        }
+    }
+    Some(out)
 }
 
 /// Wrap one output spec into a validated [`Job`].

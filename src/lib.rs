@@ -32,6 +32,8 @@
 
 pub mod args;
 #[doc(hidden)]
+pub mod container_defaults;
+#[doc(hidden)]
 pub mod frame_tap;
 #[cfg(feature = "ico")]
 #[doc(hidden)]
