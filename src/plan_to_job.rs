@@ -15,6 +15,7 @@ use crate::op::{ConvertPlan, Dither, Mesh3DOptions, Mesh3DRenderMode, Op, Projec
 use indexmap::IndexMap;
 use oxideav_core::{Error, MediaType, PixelFormat, RuntimeContext, StreamInfo};
 use oxideav_pipeline::schema::{ConvertNode, StreamSelector};
+use oxideav_pipeline::{select_streams, OutputKind};
 use oxideav_pipeline::{
     FilterNode, Job, OutputSpec, Render3DNode, SourceRef, TrackInput, TrackSpec,
 };
@@ -742,8 +743,10 @@ fn finish_job(
                         .to_string(),
                 );
             }
-            if codec.is_none() && probe_input {
-                if let Some(out) = container_default_output(plan, ctx, &chain, &sink) {
+            if probe_input {
+                if let Some(out) =
+                    container_default_output(plan, ctx, &chain, &sink, codec.as_deref(), &mut notes)
+                {
                     let job = single_output_job(&plan.output, out, sink.threads)?;
                     return Ok(Planned {
                         job,
@@ -770,17 +773,29 @@ fn finish_job(
     Ok(Planned { job, notes, tap })
 }
 
-/// Per-stream tracks for a container output whose extension names no
-/// codec (`.webm`, `.mkv`, …) when at least one input stream needs
-/// re-encoding to fit the container (see [`crate::container_defaults`]):
-/// one track per audio / video stream, pinned by kind ordinal, carrying
-/// the container's default codec or stream-copying. `None` keeps the
-/// stream-copy `all` track.
+/// Per-stream tracks for an output that cannot take the input as a
+/// whole:
+///
+/// * streams the output cannot hold are left out
+///   ([`oxideav_pipeline::select_streams`]: a video + audio input
+///   written to `.wav` / `.flac` keeps its best audio stream, to `.y4m`
+///   its video), each with a `convert: note:` line;
+/// * for a container whose extension names no codec (`.webm`, `.mkv`,
+///   …), streams it cannot store as-is get the container's default
+///   codec (see [`crate::container_defaults`]); the rest are
+///   stream-copied. A single-codec output (`.flac`) encodes every kept
+///   stream with that codec.
+///
+/// One track per kept audio / video stream, pinned by its kind ordinal
+/// in the input. `None` keeps the single `all` track (nothing dropped,
+/// nothing to re-encode, or the input could not be probed).
 fn container_default_output(
     plan: &ConvertPlan,
     ctx: &RuntimeContext,
     chain: &TrackInput,
     sink: &SinkSide,
+    codec: Option<&str>,
+    notes: &mut Vec<String>,
 ) -> Option<OutputSpec> {
     let ext = sink
         .format_override
@@ -789,7 +804,53 @@ fn container_default_output(
         .to_ascii_lowercase();
     let container = ctx.containers.container_for_extension(&ext)?.to_string();
     let streams = image_sink::probe_streams(&plan.input, ctx)?;
-    let tracks = crate::container_defaults::plan_tracks(ctx, &container, &streams)?;
+    let output = match codec {
+        Some(c) => OutputKind::SingleCodec(c),
+        None => OutputKind::Container(&container),
+    };
+    let selection = select_streams(&ctx.containers, &ctx.codecs, output, &streams);
+    // Nothing fits: keep the historical job so the muxer / encoder
+    // reports why.
+    if selection.keep.is_empty() {
+        return None;
+    }
+    // (kind, ordinal among the input's streams of that kind, codec).
+    let tracks: Vec<(MediaType, u32, Option<String>)> = match codec {
+        Some(c) => kind_ordinals(&streams)
+            .into_iter()
+            .map(|(idx, kind, ordinal)| (idx, kind, ordinal, Some(c.to_string())))
+            .filter(|(idx, ..)| selection.keeps(*idx))
+            .map(|(_, kind, ordinal, codec)| (kind, ordinal, codec))
+            .collect(),
+        None => {
+            let planned = crate::container_defaults::plan_tracks(ctx, &container, &streams);
+            if planned.is_none() && selection.dropped.is_empty() {
+                return None;
+            }
+            let ordinals = kind_ordinals(&streams);
+            ordinals
+                .into_iter()
+                .filter(|(idx, ..)| selection.keeps(*idx))
+                .map(|(_, kind, ordinal)| {
+                    let codec = planned.as_ref().and_then(|p| {
+                        p.iter()
+                            .find(|(k, o, _)| *k == kind && *o == ordinal)
+                            .and_then(|(_, _, c)| c.clone())
+                    });
+                    (kind, ordinal, codec)
+                })
+                .collect()
+        }
+    };
+    if selection.dropped.is_empty() && codec.is_some() {
+        return None;
+    }
+    notes.extend(
+        selection
+            .notes
+            .iter()
+            .map(|n| format!("convert: {n} ('{}')", plan.input)),
+    );
     let mut out = OutputSpec {
         audio: vec![],
         video: vec![],
@@ -817,6 +878,26 @@ fn container_default_output(
         }
     }
     Some(out)
+}
+
+/// `(input stream index, kind, ordinal among that kind)` for every
+/// audio / video stream — the shape a track's kind-relative stream
+/// selector addresses.
+fn kind_ordinals(streams: &[StreamInfo]) -> Vec<(u32, MediaType, u32)> {
+    let (mut video, mut audio) = (0u32, 0u32);
+    streams
+        .iter()
+        .filter_map(|s| {
+            let counter = match s.params.media_type {
+                MediaType::Video => &mut video,
+                MediaType::Audio => &mut audio,
+                _ => return None,
+            };
+            let ordinal = *counter;
+            *counter += 1;
+            Some((s.index, s.params.media_type, ordinal))
+        })
+        .collect()
 }
 
 /// Wrap one output spec into a validated [`Job`].
@@ -1080,6 +1161,32 @@ fn codec_for_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kind_ordinals_count_per_media_type_in_input_order() {
+        use oxideav_core::{CodecId, CodecParameters, TimeBase};
+        let mk = |index: u32, params: CodecParameters| StreamInfo {
+            index,
+            time_base: TimeBase::new(1, 25),
+            duration: None,
+            start_time: Some(0),
+            params,
+        };
+        let streams = [
+            mk(0, CodecParameters::video(CodecId::new("h264"))),
+            mk(1, CodecParameters::audio(CodecId::new("aac"))),
+            mk(2, CodecParameters::subtitle(CodecId::new("srt"))),
+            mk(3, CodecParameters::audio(CodecId::new("flac"))),
+        ];
+        assert_eq!(
+            kind_ordinals(&streams),
+            vec![
+                (0, MediaType::Video, 0),
+                (1, MediaType::Audio, 0),
+                (3, MediaType::Audio, 1),
+            ]
+        );
+    }
     use crate::op::ResizeMode;
 
     fn plan_with(ops: Vec<Op>) -> ConvertPlan {
