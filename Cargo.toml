@@ -71,7 +71,7 @@ oxideav-pixfmt = "0.1"
 # the umbrella patches in; tighten to "0.2" once bmp 0.2.0 is on crates.io.
 oxideav-bmp = ">=0.1.6, <0.3"
 oxideav-mjpeg = "0.1"
-oxideav-webp = "0.2"
+oxideav-webp = "0.3"
 # SVG writer for the per-page vector output path (PDF→SVG, no raster).
 oxideav-svg = "0.1"
 # 3D-asset side-channel — typed Scene3D model + the helper that fills
