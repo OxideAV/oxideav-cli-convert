@@ -24,7 +24,7 @@
 //! classification outranks output classification.
 
 use crate::op::ConvertPlan;
-use oxideav_core::Error;
+use oxideav_core::{Error, RuntimeContext};
 
 /// One cell of the routing matrix — the execution path [`crate::run`]
 /// dispatches to for a given plan.
@@ -85,7 +85,19 @@ impl Route {
 /// the file's magic bytes when the extension isn't `.pdf`, so an
 /// extensionless path that exists on disk may be classified by
 /// content. Paths that don't exist are classified by extension alone.
+///
+/// Without a registry the raster output set of the 3D→raster pairing
+/// is the four registry-free families (png / jpg / bmp / webp);
+/// [`decide_with`] widens it to every still-image extension the
+/// caller's `RuntimeContext` can encode.
 pub fn decide(plan: &ConvertPlan) -> Result<Route, Error> {
+    decide_with(plan, None)
+}
+
+/// [`decide`] with the caller's registries: a 3D input paired with any
+/// extension `ctx` has a still-image encoder for (tiff, gif, qoi, …)
+/// routes to [`Route::Mesh3dToRaster`] instead of the pairing error.
+pub fn decide_with(plan: &ConvertPlan, ctx: Option<&RuntimeContext>) -> Result<Route, Error> {
     // `--help` outranks everything — the user asked for the synopsis.
     if plan.help {
         return Ok(Route::Help);
@@ -117,7 +129,7 @@ pub fn decide(plan: &ConvertPlan) -> Result<Route, Error> {
             return Ok(Route::Mesh3dToMesh3d);
         }
         if matches!(
-            crate::raster_io::classify_output(&plan.output),
+            crate::raster_io::classify_output_with(ctx, &plan.output),
             Ok(crate::raster_io::OutputClass::Raster(_))
         ) {
             return Ok(Route::Mesh3dToRaster);
@@ -128,7 +140,7 @@ pub fn decide(plan: &ConvertPlan) -> Result<Route, Error> {
         let hint =
             crate::suggest::format_hint(out_ext, &["stl", "obj", "gltf", "glb", "mtl", "usdz"]);
         return Err(Error::invalid(format!(
-            "convert: 3D input '{}' must pair with a 3D output (.stl/.obj/.gltf/.glb/.mtl/.usdz) OR a raster output (.png/.jpg/.bmp/.webp); got '{}'{hint}",
+            "convert: 3D input '{}' must pair with a 3D output (.stl/.obj/.gltf/.glb/.mtl/.usdz) OR a raster output (.png/.jpg/.bmp/.webp, or any registered still-image format); got '{}'{hint}",
             plan.input, plan.output
         )));
     }

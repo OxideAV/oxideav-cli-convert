@@ -20,12 +20,14 @@
 //! the routing (`Op::Define` key parsing → per-size resize → multi-
 //! entry write) is convert-specific.
 //!
-//! Input decode covers PNG and BMP today via the standalone decoders
-//! on those crates (`oxideav_png::decode_png_to_rgba`,
-//! `oxideav_bmp::decode_bmp`). The pipeline path handles every other
-//! input; if the user pairs `.ico` output with a non-PNG / non-BMP
-//! input we surface a clear "input not supported on the ICO writer
-//! path yet" error instead of silently bailing.
+//! The input is decoded through the `oxideav-image` gateway
+//! ([`crate::raster_io::read_image_to_rgba`]): every still-image format
+//! registered in the caller's `RuntimeContext` is a valid icon source
+//! (PNG, BMP, JPEG, GIF, TIFF, WebP, HEIC, …), primary picture only.
+//!
+//! The write side stays on `oxideav-ico` directly: an icon holds
+//! sub-images of *different* sizes, which the gateway's
+//! `encode_frames` (one geometry per sequence) cannot express.
 
 // `oxideav_ico::{write_ico, IconImage, WriteOptions}` is deprecated in the unreleased image-crate API
 // contract, but the published release this crate builds against
@@ -35,12 +37,12 @@
 
 use std::fs;
 
-use oxideav_core::{Error, PixelFormat, Result, VideoFrame, VideoPlane};
+use oxideav_core::{Error, PixelFormat, Result, RuntimeContext, VideoFrame, VideoPlane};
 use oxideav_ico::{write_ico, IconImage, IconType, WriteOptions};
 use oxideav_image_filter::{ImageFilter, Resize, VideoStreamParams};
 
 use crate::op::{ConvertPlan, Op};
-use crate::raster_io::RgbaImage;
+use crate::raster_io::{read_image_to_rgba, RgbaImage};
 
 /// Returns true when the plan's output extension is `.ico`.
 ///
@@ -53,9 +55,10 @@ pub fn is_ico_output(output: &str) -> bool {
 }
 
 /// Run the ICO-output convert flow. Side-effect-only: writes a
-/// single `.ico` file at `plan.output`.
-pub fn run(plan: &ConvertPlan) -> Result<()> {
-    let src = read_source_to_rgba(&plan.input)?;
+/// single `.ico` file at `plan.output`. The input is any still-image
+/// format `ctx` can open.
+pub fn run(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<()> {
+    let src = read_image_to_rgba(ctx, &plan.input)?;
 
     let sizes = parse_auto_resize_define(&plan.ops)?;
 
@@ -85,50 +88,6 @@ pub fn run(plan: &ConvertPlan) -> Result<()> {
     fs::write(&plan.output, bytes)
         .map_err(|e| Error::invalid(format!("convert: failed to write {}: {e}", plan.output)))?;
     Ok(())
-}
-
-/// Decode the input file into an `RgbaImage`. PNG and BMP are wired
-/// today (covering the round-1 smoke commands). Anything else gets a
-/// clear "not supported on the ICO writer path" error pointing the
-/// user at the workaround (`convert in.X tmp.png && convert tmp.png
-/// out.ico`).
-fn read_source_to_rgba(input: &str) -> Result<RgbaImage> {
-    let bytes = fs::read(input)
-        .map_err(|e| Error::invalid(format!("convert: failed to read {input}: {e}")))?;
-    let ext = input.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    match ext.as_str() {
-        "png" | "apng" => decode_png(&bytes),
-        "bmp" | "dib" => decode_bmp(&bytes),
-        other => Err(Error::unsupported(format!(
-            "convert: ICO writer: input extension '.{other}' not yet supported (today png/bmp); convert to png first"
-        ))),
-    }
-}
-
-fn decode_png(bytes: &[u8]) -> Result<RgbaImage> {
-    let bmp = oxideav_png::decode_rgba8(bytes)
-        .map_err(|e| Error::invalid(format!("convert: PNG decode failed: {e:?}")))?;
-    let stride = (bmp.width as usize) * 4;
-    Ok(RgbaImage {
-        width: bmp.width,
-        height: bmp.height,
-        pixels: bmp.data,
-        stride,
-    })
-}
-
-fn decode_bmp(bytes: &[u8]) -> Result<RgbaImage> {
-    // `decode_rgba8` widens every native BMP layout (Pal8, 16-bit,
-    // Bgr24, Bgra) to tightly packed RGBA, so the runner keeps its one
-    // packed layout without a per-format match.
-    let img = oxideav_bmp::decode_rgba8(bytes)
-        .map_err(|e| Error::invalid(format!("convert: BMP decode failed: {e:?}")))?;
-    Ok(RgbaImage {
-        width: img.width,
-        height: img.height,
-        stride: img.width as usize * 4,
-        pixels: img.data,
-    })
 }
 
 /// Ensure the image is packed RGBA (4 bpp). Rgb24 inputs get promoted

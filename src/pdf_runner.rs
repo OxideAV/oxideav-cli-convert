@@ -11,7 +11,7 @@
 //! |------------|----------------|---------------------------------------------|
 //! | Scene      | `.pdf`         | writer consumes the whole `Scene`           |
 //! | Vector     | `.svg`         | one VectorFrame per page, no rasterisation  |
-//! | Raster     | `.png` `.jpg` `.bmp` `.webp` | render each page, encode |
+//! | Raster     | `.png` `.jpg` `.bmp` `.webp`, any registered still-image extension | render each page, encode through `oxideav-image` |
 //!
 //! ## Routing
 //!
@@ -37,7 +37,7 @@
 
 use std::fs;
 
-use oxideav_core::{Error, Result, Rgba};
+use oxideav_core::{Error, Result, Rgba, RuntimeContext};
 use oxideav_pdf::{read_pdf_to_scene, write_pdf_from_scene};
 use oxideav_raster::Renderer;
 use oxideav_scene::{Page, Scene};
@@ -46,7 +46,7 @@ use oxideav_svg::write_svg;
 use crate::op::{ConvertPlan, Op};
 use crate::pixel_xform::apply_pixel_transform_chain;
 use crate::raster_io::{
-    apply_alpha_ops, classify_output, encode_raster_to_path, OutputClass, RgbaImage,
+    apply_alpha_ops, classify_output_with, encode_raster_to_path, OutputClass, RgbaImage,
 };
 
 /// Returns true when the input path's extension is `.pdf` or its
@@ -66,8 +66,10 @@ pub fn is_pdf_input(input: &str) -> bool {
 }
 
 /// Run the PDF-input convert flow. Side-effect-only: writes one or
-/// more files to disk.
-pub fn run(plan: &ConvertPlan) -> Result<()> {
+/// more files to disk. Raster outputs are encoded through the
+/// `oxideav-image` gateway over `ctx`'s registries, so every
+/// still-image format registered there is a valid output.
+pub fn run(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<()> {
     let bytes = fs::read(&plan.input)
         .map_err(|e| Error::invalid(format!("convert: failed to read {}: {e}", plan.input)))?;
     let scene = read_pdf_to_scene(&bytes)
@@ -91,7 +93,7 @@ pub fn run(plan: &ConvertPlan) -> Result<()> {
     };
     let selected: Vec<&Page> = indices.iter().map(|i| &all_pages[*i]).collect();
 
-    let class = classify_output(&plan.output)?;
+    let class = classify_output_with(Some(ctx), &plan.output)?;
     let has_template = plan.output_template.is_some();
 
     match (class, has_template, selected.len()) {
@@ -154,20 +156,20 @@ pub fn run(plan: &ConvertPlan) -> Result<()> {
         }
 
         // Raster → with printf template (per-page raster fan-out).
-        (OutputClass::Raster(fmt), true, _) => {
+        (OutputClass::Raster(_), true, _) => {
             let tmpl = plan.output_template.as_ref().expect("checked above");
             for (out_idx, page) in selected.iter().enumerate() {
                 let img = render_page_to_rgba(page, &plan.ops)?;
                 let path = tmpl.expand(out_idx);
-                encode_raster_to_path(&img, fmt, &path, &plan.ops)?;
+                encode_raster_to_path(ctx, &img, &path, &plan.ops)?;
             }
             Ok(())
         }
         // Raster → single literal file. Single page only.
-        (OutputClass::Raster(fmt), false, _) => {
+        (OutputClass::Raster(_), false, _) => {
             if selected.len() == 1 {
                 let img = render_page_to_rgba(selected[0], &plan.ops)?;
-                encode_raster_to_path(&img, fmt, &plan.output, &plan.ops)
+                encode_raster_to_path(ctx, &img, &plan.output, &plan.ops)
             } else {
                 Err(Error::invalid(format!(
                     "convert: {} selected pages but output '{}' is a single file with no `%d` template; use e.g. `page-%03d.png` OR a `[N]` selector to pick one page",

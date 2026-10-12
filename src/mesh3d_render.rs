@@ -39,7 +39,7 @@
 
 use std::fs;
 
-use oxideav_core::{Error, Result};
+use oxideav_core::{Error, Result, RuntimeContext};
 use oxideav_mesh3d::Mesh3DRegistry;
 use oxideav_render::{
     make_renderer, BackgroundColor, CameraSpec as RCameraSpec, LightSpec as RLightSpec, Projection,
@@ -49,7 +49,7 @@ use oxideav_render::{
 use crate::op::{Mesh3DOptions, Mesh3DRenderMode, Op, ProjectionMode};
 use crate::pixel_xform::apply_pixel_transform_chain;
 use crate::raster_io::{
-    apply_alpha_ops, classify_output, encode_raster_to_path, OutputClass, RgbaImage,
+    apply_alpha_ops, classify_output_with, encode_raster_to_path, OutputClass, RgbaImage,
 };
 
 /// Default raster output dimensions when neither `-resize` nor any
@@ -67,19 +67,27 @@ const DEFAULT_BG: [u8; 4] = [0, 0, 0, 0];
 const DEFAULT_FOV_DEG: f32 = 60.0;
 
 /// Run the 3D→raster convert flow. Side-effect-only: writes one file
-/// to disk.
+/// to disk. The render is encoded through the `oxideav-image` gateway
+/// over `ctx`'s registries.
 ///
 /// Caller has already established that:
 ///
 /// * `input_path`'s extension is in [`crate::mesh3d_runner::is_mesh3d_input`].
-/// * `output_path`'s extension is a raster format ([`OutputClass::Raster`]).
+/// * `output_path`'s extension is a raster format ([`OutputClass::Raster`]
+///   under [`classify_output_with`] over the same `ctx`).
 ///
 /// `ops` is the full operation chain off `ConvertPlan::ops`; we pluck
 /// out `-resize`, `-background`, and the alpha grammar; the rest of
 /// the geometry/tonal ops are then applied through
 /// [`apply_pixel_transform_chain`] post-rasterisation, mirroring the
 /// PDF runner's flow.
-pub fn run(input_path: &str, output_path: &str, ops: &[Op], options: &Mesh3DOptions) -> Result<()> {
+pub fn run(
+    ctx: &RuntimeContext,
+    input_path: &str,
+    output_path: &str,
+    ops: &[Op],
+    options: &Mesh3DOptions,
+) -> Result<()> {
     let in_ext = ext_of(input_path)
         .ok_or_else(|| {
             Error::invalid(format!(
@@ -88,15 +96,14 @@ pub fn run(input_path: &str, output_path: &str, ops: &[Op], options: &Mesh3DOpti
         })?
         .to_ascii_lowercase();
 
-    let class = classify_output(output_path)?;
-    let fmt = match class {
-        OutputClass::Raster(f) => f,
-        _ => {
-            return Err(Error::invalid(format!(
-                "convert: 3D→raster runner invoked with non-raster output '{output_path}'"
-            )));
-        }
-    };
+    if !matches!(
+        classify_output_with(Some(ctx), output_path)?,
+        OutputClass::Raster(_)
+    ) {
+        return Err(Error::invalid(format!(
+            "convert: 3D→raster runner invoked with non-raster output '{output_path}'"
+        )));
+    }
 
     let mut registry = Mesh3DRegistry::new();
     crate::mesh3d_runner::populate_registry(&mut registry);
@@ -125,7 +132,7 @@ pub fn run(input_path: &str, output_path: &str, ops: &[Op], options: &Mesh3DOpti
         .map_err(|e| Error::invalid(format!("convert: 3D-render: {e}")))?;
     apply_alpha_ops(&mut img, ops, bg);
 
-    encode_raster_to_path(&img, fmt, output_path, ops)
+    encode_raster_to_path(ctx, &img, output_path, ops)
 }
 
 /// Translate the cli-convert option struct + framing inputs into the

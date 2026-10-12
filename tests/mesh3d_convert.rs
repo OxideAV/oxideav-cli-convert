@@ -15,7 +15,18 @@ use oxideav_core::RuntimeContext;
 use oxideav_mesh3d::{Mesh, Mesh3DRegistry, Node, Primitive, Scene3D, Topology, Transform};
 
 fn ctx() -> RuntimeContext {
-    RuntimeContext::new()
+    // 3D→raster renders encode through the `oxideav-image` gateway, so
+    // the raster formats come from the registry.
+    let mut ctx = RuntimeContext::new();
+    oxideav_png::register(&mut ctx);
+    oxideav_bmp::register(&mut ctx);
+    oxideav_mjpeg::register(&mut ctx);
+    oxideav_webp::register(&mut ctx);
+    oxideav_gif::register(&mut ctx);
+    oxideav_tiff::register(&mut ctx);
+    oxideav_qoi::register(&mut ctx);
+    oxideav_ico::register(&mut ctx);
+    ctx
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -471,4 +482,47 @@ fn convert_3d_input_with_printf_template_errors() {
         msg.contains("`%d` template"),
         "expected template-rejection error, got: {msg}"
     );
+}
+
+/// 3D→raster reaches every still-image format the registry encodes,
+/// not only the four registry-free families: the same render as TIFF,
+/// GIF, QOI and WebP decodes back to the PNG's samples.
+#[test]
+fn convert_3d_input_to_registry_raster_formats() {
+    let dir = temp_dir("stl-to-registry-formats");
+    let stl_path = dir.join("input.stl");
+    let scene = make_one_triangle_scene();
+    write_stl_fixture(&stl_path, &scene);
+    let c = ctx();
+    let render = |ext: &str| {
+        let out = dir.join(format!("output.{ext}"));
+        convert_run(
+            &[
+                stl_path.to_string_lossy().into_owned(),
+                "-resize".into(),
+                "64x48".into(),
+                "-alpha".into(),
+                "remove".into(),
+                "-alpha".into(),
+                "off".into(),
+                out.to_string_lossy().into_owned(),
+            ],
+            &c,
+        )
+        .unwrap_or_else(|e| panic!("stl → {ext}: {e}"));
+        oxideav_image::open(&c, &out)
+            .unwrap_or_else(|e| panic!("{ext} decodes: {e}"))
+            .into_primary()
+    };
+    let png = render("png");
+    assert_eq!((png.width(), png.height()), (64, 48));
+    let reference = png.to_rgb8().unwrap();
+    for ext in ["tif", "qoi", "webp", "bmp"] {
+        let img = render(ext);
+        assert_eq!((img.width(), img.height()), (64, 48), "{ext}");
+        assert_eq!(img.to_rgb8().unwrap(), reference, "{ext} samples");
+    }
+    // GIF quantises to a palette; the flat-shaded triangle on a
+    // background is a handful of colours, so it stays exact too.
+    assert_eq!(render("gif").to_rgb8().unwrap(), reference, "gif samples");
 }

@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Side-channel still images ride the `oxideav-image` gateway.** The
+  PDF page renderer, the 3D→raster renderer and the icon writer's
+  input no longer call `oxideav-png` / `oxideav-bmp` / `oxideav-mjpeg`
+  / `oxideav-webp` directly: a render goes to `oxideav_image::encode`
+  (encoder + muxer resolved from the output extension through the
+  caller's `RuntimeContext`) and an icon source comes from
+  `oxideav_image::open`. Every still-image format registered in the
+  context is now a raster output of `convert x.pdf out.X` /
+  `convert scene.stl out.X` (tiff, gif, qoi, tga, heic, …) and an
+  icon source (`convert photo.jpg -define icon:auto-resize=… out.ico`),
+  with no per-format code here. WebP output works again (lossless VP8L
+  by default, lossy VP8 with `-quality`).
+- `-quality`, `-depth` and `--opt KEY=VALUE` reach the side-channel
+  encoders: quality through the gateway's schema-gated option, `--opt`
+  validated against the encoder schema like the pipeline route, the
+  encoder input layout chosen by the pipeline route's
+  `pick_sink_format` (an encoder declaring no accepted layouts — JPEG
+  — is probed in ImageMagick's order: own non-RGB layout, 4:2:0,
+  4:2:2, 4:4:4, RGB, gray).
+- **Output delta:** PDF / 3D → JPEG without `-quality` is written at
+  the encoder's declared default (75) instead of the former hard-coded
+  85; `-quality 85` reproduces the former samples exactly (same
+  quantisation tables). PNG / BMP / ICO / SVG / PDF outputs are
+  byte-identical to before.
+- `raster_io::classify_output_with(Option<&RuntimeContext>, path)` and
+  `route::decide_with(plan, Option<&RuntimeContext>)` are the
+  registry-aware classifications; `classify_output` / `decide` keep
+  the registry-free four-family raster set. `RasterFormat::Registry`
+  names an extension the registry can encode. `run` routes with the
+  caller's context.
+- `pdf_runner::run`, `mesh3d_render::run` and `ico_runner::run`
+  (`#[doc(hidden)]` modules) take the `RuntimeContext`.
+- Dependencies: `oxideav-image = "0.0"` added; `oxideav-png`,
+  `oxideav-bmp`, `oxideav-mjpeg`, `oxideav-webp` removed. `oxideav-ico`
+  stays (multi-size icons are outside the gateway's one-geometry
+  `encode_frames`). Dev-dependencies register the formats the tests
+  exercise directly (the published `oxideav-meta` aggregator registers
+  nothing outside the umbrella).
+
+### Added
+
+- `raster_io::{read_image_to_rgba, encode_raster, gateway_error,
+  RgbaImage::{from_image, to_image, pixel_format}}`.
+- Tests: gateway round trips through png / jpg / bmp / webp / gif /
+  tiff / qoi on the PDF and 3D side-channels, icon input from every
+  registered format, `-quality` / `--opt` / `-depth` on the
+  side-channel, typed errors for unregistered extensions and unknown
+  inputs (519 → 533).
+
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.6...v0.0.7) - 2026-10-02
 
 ### Other

@@ -1,14 +1,15 @@
-//! End-to-end: generate a PNG source via `oxideav-png`'s encoder, then
-//! run `convert` to ICO with and without `-define icon:auto-resize`.
-//! Verifies the ICO directory structure (magic, count, per-entry width
-//! / height / size / offset) so we don't have to shell out to `file(1)`.
+//! End-to-end: generate a source picture through the `oxideav-image`
+//! gateway, then run `convert` to ICO with and without `-define
+//! icon:auto-resize`. Verifies the ICO directory structure (magic,
+//! count, per-entry width / height / size / offset) so we don't have
+//! to shell out to `file(1)`.
 
 #![cfg(feature = "ico")]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use oxideav_png::{encode, EncodeOptions, PngImage, PngPixelFormat};
+use oxideav_image::{Image, SaveOptions};
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -28,23 +29,33 @@ fn temp_dir(name: &str) -> PathBuf {
 fn ctx() -> oxideav_core::RuntimeContext {
     let mut ctx = oxideav_core::RuntimeContext::new();
     oxideav_source::register(&mut ctx);
+    oxideav_png::register(&mut ctx);
+    oxideav_bmp::register(&mut ctx);
+    oxideav_mjpeg::register(&mut ctx);
+    oxideav_webp::register(&mut ctx);
+    oxideav_gif::register(&mut ctx);
+    oxideav_tiff::register(&mut ctx);
+    oxideav_qoi::register(&mut ctx);
+    oxideav_ico::register(&mut ctx);
     ctx
 }
 
-/// Write a solid-red PNG at `dims × dims` into `path`. Matches what
-/// `oxideav convert "xc:red" -resize 256x256 src.png` would produce
-/// (modulo a different filter chain), avoiding the round-trip
-/// dependency on the generator.
-fn write_solid_red_png(path: &PathBuf, dims: u32) {
+/// Write a solid-red picture at `dims × dims` into `path`, encoded in
+/// whatever format the path's extension names (through the gateway).
+/// Matches what `oxideav convert "xc:red" -resize 256x256 src.png`
+/// would produce, avoiding the round-trip dependency on the generator.
+fn write_solid_red(path: &Path, dims: u32) {
     let n = (dims * dims) as usize;
     let mut data = Vec::with_capacity(n * 4);
     for _ in 0..n {
         data.extend_from_slice(&[255, 0, 0, 255]);
     }
-    let img =
-        PngImage::packed(dims, dims, PngPixelFormat::Rgba, (dims as usize) * 4, data).unwrap();
-    let bytes = encode(&img, &EncodeOptions::default()).expect("encode source PNG");
-    fs::write(path, bytes).unwrap();
+    let img = Image::from_rgba8(dims, dims, data).unwrap();
+    oxideav_image::save(&ctx(), &img, path, &SaveOptions::default()).expect("encode source");
+}
+
+fn write_solid_red_png(path: &Path, dims: u32) {
+    write_solid_red(path, dims);
 }
 
 /// One decoded ICO directory entry from `parse_ico_dir`.
@@ -250,4 +261,65 @@ fn ico_dedup_and_sort() {
     let (_ty, dirs) = parse_ico_dir(&bytes);
     let got_dims: Vec<(u32, u32)> = dirs.iter().map(|d| (d.w, d.h)).collect();
     assert_eq!(got_dims, vec![(16, 16), (32, 32), (64, 64)]);
+}
+
+/// The icon writer's input is whatever the registry opens: the same
+/// 32×32 red square written as BMP, JPEG, GIF, TIFF, WebP and QOI all
+/// produce the same icon directory, and the BMP-payload entry carries
+/// the source colour (JPEG within its quantisation error).
+#[test]
+fn ico_input_is_any_registered_still_image_format() {
+    let dir = temp_dir("ico-any-input");
+    for ext in ["bmp", "jpg", "gif", "tif", "webp", "qoi", "png"] {
+        let src = dir.join(format!("src.{ext}"));
+        write_solid_red(&src, 32);
+        let out = dir.join(format!("from-{ext}.ico"));
+        oxideav_cli_convert::run(
+            &[
+                src.to_string_lossy().into_owned(),
+                "-define".into(),
+                "icon:auto-resize=16,32".into(),
+                out.to_string_lossy().into_owned(),
+            ],
+            &ctx(),
+        )
+        .unwrap_or_else(|e| panic!("convert {ext} → ico: {e}"));
+        let bytes = fs::read(&out).expect("ico file");
+        let (ty, dirs) = parse_ico_dir(&bytes);
+        assert_eq!(ty, 1, "{ext}");
+        let got_dims: Vec<(u32, u32)> = dirs.iter().map(|d| (d.w, d.h)).collect();
+        assert_eq!(got_dims, vec![(16, 16), (32, 32)], "{ext}");
+        // Entry 1 (32×32) is a BMP payload: BITMAPINFOHEADER (40 bytes)
+        // then bottom-up BGRA rows. Its first pixel must be red.
+        let base = 6 + 16;
+        let offset = u32::from_le_bytes(bytes[base + 12..base + 16].try_into().unwrap()) as usize;
+        assert!(!dirs[1].is_png, "{ext}: 32px entry stays BMP");
+        let px = &bytes[offset + 40..offset + 44];
+        let (b, g, r, a) = (px[0] as i32, px[1] as i32, px[2] as i32, px[3]);
+        assert!(
+            (r - 255).abs() <= 4 && g <= 4 && b <= 4 && a == 255,
+            "{ext}: first pixel BGRA = {px:?}"
+        );
+    }
+}
+
+/// An input nothing in the registry opens is a typed error naming the
+/// file, not a panic or a silent empty icon.
+#[test]
+fn ico_input_in_an_unknown_format_is_a_typed_error() {
+    let dir = temp_dir("ico-unknown-input");
+    let src = dir.join("src.xyz");
+    fs::write(&src, b"definitely not an image").unwrap();
+    let out = dir.join("out.ico");
+    let err = oxideav_cli_convert::run(
+        &[
+            src.to_string_lossy().into_owned(),
+            out.to_string_lossy().into_owned(),
+        ],
+        &ctx(),
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("src.xyz"), "names the input: {msg}");
+    assert!(!out.exists(), "nothing written");
 }

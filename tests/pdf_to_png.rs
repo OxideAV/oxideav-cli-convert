@@ -31,6 +31,16 @@ fn temp_dir(name: &str) -> PathBuf {
 fn ctx() -> oxideav_core::RuntimeContext {
     let mut ctx = oxideav_core::RuntimeContext::new();
     oxideav_source::register(&mut ctx);
+    // The side-channel encodes through the `oxideav-image` gateway over
+    // these registries; without them every raster output is refused.
+    oxideav_png::register(&mut ctx);
+    oxideav_bmp::register(&mut ctx);
+    oxideav_mjpeg::register(&mut ctx);
+    oxideav_webp::register(&mut ctx);
+    oxideav_gif::register(&mut ctx);
+    oxideav_tiff::register(&mut ctx);
+    oxideav_qoi::register(&mut ctx);
+    oxideav_ico::register(&mut ctx);
     ctx
 }
 
@@ -442,17 +452,88 @@ fn pdf_to_bmp_single_page() {
 }
 
 #[test]
-fn pdf_to_webp_reports_unavailable_until_vp8l_encoder_lands() {
-    // WebP encode is gated off until the post-2026-05-20 clean-room
-    // orphan rebuild of `oxideav-webp` lands a VP8L encoder; the
-    // `encode_webp` path currently surfaces an error. Verify that
-    // convert refuses the request cleanly rather than producing
-    // garbage output. Re-enable the round-trip assertion once the
-    // VP8L encoder is available again.
+fn pdf_to_webp_single_page_round_trips_losslessly() {
+    // WebP goes through the gateway like every other raster output:
+    // the registry's `webp` family resolves to the lossless VP8L
+    // encoder when no quality is asked for, so the page decodes back
+    // to exactly the PNG render's samples.
     let dir = temp_dir("webp");
     let pdf_path = dir.join("in.pdf");
     fs::write(&pdf_path, make_two_page_pdf()).unwrap();
     let out = dir.join("page0.webp");
+    let png = dir.join("page0.png");
+    for o in [&out, &png] {
+        oxideav_cli_convert::run(
+            &[
+                format!("{}[0]", pdf_path.to_string_lossy()),
+                o.to_string_lossy().into_owned(),
+            ],
+            &ctx(),
+        )
+        .expect("convert pdf[0]");
+    }
+    let bytes = fs::read(&out).unwrap();
+    assert_eq!(&bytes[..4], b"RIFF");
+    assert_eq!(&bytes[8..12], b"WEBP");
+    let c = ctx();
+    let webp = oxideav_image::open(&c, &out).expect("webp decodes");
+    let png = oxideav_image::open(&c, &png).expect("png decodes");
+    assert_eq!(
+        webp.primary().to_rgba8().unwrap(),
+        png.primary().to_rgba8().unwrap(),
+        "lossless WebP must carry the PNG render's samples"
+    );
+}
+
+/// Formats outside the historical four work through the registry too:
+/// the same page as TIFF, GIF and QOI decodes back to the PNG render
+/// (GIF is 8-bit palette; a two-colour page fits a palette exactly).
+#[test]
+fn pdf_to_registry_formats_round_trip() {
+    let dir = temp_dir("registry-formats");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let c = ctx();
+    let render = |ext: &str| {
+        let out = dir.join(format!("page0.{ext}"));
+        oxideav_cli_convert::run(
+            &[
+                format!("{}[0]", pdf_path.to_string_lossy()),
+                "-alpha".into(),
+                "remove".into(),
+                "-alpha".into(),
+                "off".into(),
+                out.to_string_lossy().into_owned(),
+            ],
+            &c,
+        )
+        .unwrap_or_else(|e| panic!("pdf[0] → {ext}: {e}"));
+        oxideav_image::open(&c, &out)
+            .unwrap_or_else(|e| panic!("{ext} decodes: {e}"))
+            .into_primary()
+    };
+    let png = render("png");
+    assert_eq!(png.format(), oxideav_core::PixelFormat::Rgb24);
+    let reference = png.to_rgb8().unwrap();
+    for ext in ["tif", "gif", "qoi", "bmp"] {
+        let img = render(ext);
+        assert_eq!(
+            (img.width(), img.height()),
+            (png.width(), png.height()),
+            "{ext}"
+        );
+        assert_eq!(img.to_rgb8().unwrap(), reference, "{ext} samples");
+    }
+}
+
+/// An extension no registered crate encodes is refused with a typed
+/// error that names the extension, before anything is rendered.
+#[test]
+fn pdf_to_unregistered_extension_is_a_typed_error() {
+    let dir = temp_dir("unregistered");
+    let pdf_path = dir.join("in.pdf");
+    fs::write(&pdf_path, make_two_page_pdf()).unwrap();
+    let out = dir.join("page0.nosuchformat");
     let err = oxideav_cli_convert::run(
         &[
             format!("{}[0]", pdf_path.to_string_lossy()),
@@ -460,12 +541,10 @@ fn pdf_to_webp_reports_unavailable_until_vp8l_encoder_lands() {
         ],
         &ctx(),
     )
-    .expect_err("WebP encode should fail until the VP8L encoder lands");
+    .expect_err("unknown extension");
     let msg = format!("{err}");
-    assert!(
-        msg.contains("WebP encode pending"),
-        "unexpected error: {msg}"
-    );
+    assert!(msg.contains("nosuchformat"), "{msg}");
+    assert!(!out.exists());
 }
 
 #[test]
@@ -818,7 +897,6 @@ fn sharpen_through_pdf_side_channel_matches_image_filter_standalone() {
     // the plain render.
     use oxideav_core::{PixelFormat, VideoFrame, VideoPlane};
     use oxideav_image_filter::{ImageFilter, Sharpen, VideoStreamParams};
-    use oxideav_png::decode;
 
     let dir = temp_dir("sharpen-side-channel");
     let pdf_path = dir.join("in.pdf");
@@ -853,23 +931,26 @@ fn sharpen_through_pdf_side_channel_matches_image_filter_standalone() {
     .expect("sharpen render");
 
     // Decode both PNGs and run Sharpen standalone on the plain pixels.
-    let plain_png = decode(&fs::read(&plain).unwrap()).expect("decode plain PNG");
-    let sharp_png = decode(&fs::read(&sharpened).unwrap()).expect("decode sharpened PNG");
-    assert_eq!(plain_png.width, sharp_png.width);
-    assert_eq!(plain_png.height, sharp_png.height);
-    let plain_stride = plain_png.stride();
-    let (plain_w, plain_h) = (plain_png.width, plain_png.height);
-    let plain_data = plain_png.into_raw();
+    let c = ctx();
+    let plain_png = oxideav_image::open(&c, &plain)
+        .expect("decode plain PNG")
+        .into_primary();
+    let sharp_png = oxideav_image::open(&c, &sharpened)
+        .expect("decode sharpened PNG")
+        .into_primary();
+    assert_eq!(plain_png.width(), sharp_png.width());
+    assert_eq!(plain_png.height(), sharp_png.height());
+    let (plain_w, plain_h) = (plain_png.width(), plain_png.height());
 
-    // PNG decode emits Rgba (4 bpp) for our test fixture's alpha-bearing
-    // render; if it happened to land on Rgb24 the stride-vs-width math
-    // would still hold but the filter would need a different format tag.
-    let bpp = plain_stride / plain_w as usize;
-    let format = match bpp {
-        4 => PixelFormat::Rgba,
-        3 => PixelFormat::Rgb24,
-        other => panic!("unexpected bpp {other} from decoded PNG"),
-    };
+    // The render carries alpha, so the PNG is Rgba (4 bpp); were it to
+    // land on Rgb24 the filter would need that format tag instead.
+    let format = plain_png.format();
+    assert!(
+        matches!(format, PixelFormat::Rgba | PixelFormat::Rgb24),
+        "unexpected layout {format:?} from decoded PNG"
+    );
+    let plain_stride = plain_w as usize * if format == PixelFormat::Rgba { 4 } else { 3 };
+    let plain_data = plain_png.to_packed(format).unwrap();
     let plain_frame = VideoFrame {
         pts: None,
         planes: vec![VideoPlane {
@@ -888,7 +969,7 @@ fn sharpen_through_pdf_side_channel_matches_image_filter_standalone() {
         )
         .expect("standalone Sharpen apply");
     assert_eq!(
-        sharp_png.into_raw(),
+        sharp_png.to_packed(format).unwrap(),
         reference.planes[0].data,
         "PDF side-channel sharpen output must match standalone Sharpen byte-for-byte"
     );

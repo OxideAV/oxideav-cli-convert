@@ -112,7 +112,7 @@ pub fn run_with_preferences(
     // tested); this function only performs the dispatched work. See
     // the `route` module docs for the precedence order and why input
     // classification outranks output classification.
-    match route::decide(&plan)? {
+    match route::decide_with(&plan, Some(ctx))? {
         // `--help`: print the usage synopsis (generated from the
         // parser's own flag table) and do nothing else.
         Route::Help => {
@@ -138,7 +138,7 @@ pub fn run_with_preferences(
         // routing rule (encoder accepts Scene → pass through;
         // otherwise fan out per page when the filename has a `%d`
         // template) is specific to `convert`. See `pdf_runner`.
-        Route::PdfSideChannel => pdf_runner::run(&plan),
+        Route::PdfSideChannel => pdf_runner::run(&plan, ctx),
 
         // 3D-asset same-class round-trip: decode → re-encode through
         // the `Mesh3DRegistry`. 3D scenes don't fit any of the
@@ -158,9 +158,13 @@ pub fn run_with_preferences(
         // the scene to RGBA, then apply raster ops and encode. See
         // `mesh3d_render` module docs.
         #[cfg(feature = "mesh3d")]
-        Route::Mesh3dToRaster => {
-            mesh3d_render::run(&plan.input, &plan.output, &plan.ops, &plan.mesh3d_options)
-        }
+        Route::Mesh3dToRaster => mesh3d_render::run(
+            ctx,
+            &plan.input,
+            &plan.output,
+            &plan.ops,
+            &plan.mesh3d_options,
+        ),
 
         // `.ico` output: the ICO container carries one OR more
         // sub-images at different resolutions, driven on the IM CLI
@@ -168,7 +172,7 @@ pub fn run_with_preferences(
         // path's "one Frame::Video per track" shape doesn't fit that
         // multi-image fan-out. See `ico_runner` module docs.
         #[cfg(feature = "ico")]
-        Route::IcoOutput => ico_runner::run(&plan),
+        Route::IcoOutput => ico_runner::run(&plan, ctx),
 
         Route::Pipeline => {
             let timing = timing::enabled();

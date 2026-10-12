@@ -41,9 +41,10 @@ mesh3d = [
     "dep:oxideav-render",
 ]
 # Wires `.ico` output: an ImageMagick-style multi-resolution Windows
-# icon writer driven by `-define icon:auto-resize=W,W,…`. Decoder side
-# stays on the regular PNG / BMP path. Off → `.ico` falls through to
-# the regular pipeline and errors out as an unknown sink extension.
+# icon writer driven by `-define icon:auto-resize=W,W,…`. The input is
+# any still-image format the caller's registry opens (through
+# `oxideav-image`). Off → `.ico` falls through to the regular pipeline
+# and errors out as an unknown sink extension.
 ico = ["dep:oxideav-ico"]
 
 [dependencies]
@@ -56,22 +57,14 @@ oxideav-generator = { version = "0.1", optional = true }
 oxideav-pdf = "0.2"
 oxideav-scene = "0.1"
 oxideav-raster = "0.1"
-# PNG records are constructed through the 0.2.0 constructors
-# (`PngImage::new`, …). The requirement spans the unreleased 0.2.0 and
-# the 0.1.8 tree that already carries those constructors, so the umbrella
-# (path patch, package version still 0.1.8 until release-plz bumps it)
-# resolves; tighten to "0.2" once 0.2.0 is on crates.io.
-oxideav-png = ">=0.1.8, <0.3"
 oxideav-pixfmt = "0.1"
-# Per-page raster encoders for the fan-out path. Lossless paths only
-# (BMP raw RGBA, JPEG via YUV420, WebP-VP8L lossless); animated /
-# palette-quantised / multi-image formats (GIF, TIFF) are deferred.
-# Same transition as oxideav-png: the 0.2.0 image-crate contract
-# (`BmpImage::packed`, `encode`, `decode_rgba8`) is also in the 0.1.6 tree
-# the umbrella patches in; tighten to "0.2" once bmp 0.2.0 is on crates.io.
-oxideav-bmp = ">=0.1.6, <0.3"
-oxideav-mjpeg = "0.1"
-oxideav-webp = "0.3"
+# Still-image read / write for the side-channels (PDF page renders,
+# 3D renders, the icon writer's input): the Layer-2 image gateway.
+# It resolves demuxer / decoder / encoder / muxer from the caller's
+# `RuntimeContext`, so every image crate registered there (png, bmp,
+# jpeg, webp, gif, tiff, qoi, heif, …) is readable and writable here
+# without a per-format dependency. No format crate is pulled directly.
+oxideav-image = "0.0"
 # SVG writer for the per-page vector output path (PDF→SVG, no raster).
 oxideav-svg = "0.1"
 # 3D-asset side-channel — typed Scene3D model + the helper that fills
@@ -106,7 +99,25 @@ oxideav-fbx = { version = "0.0", optional = true }
 # `mesh3d_render::run`.
 oxideav-render = { version = "0.0", optional = true }
 # Pure-Rust ICO (Windows icon) writer. Optional + default-on; gated on
-# the `ico` feature so slim builds drop it cleanly.
+# the `ico` feature so slim builds drop it cleanly. Stays a direct
+# dependency: an icon bundles sub-images of different sizes, which the
+# gateway's one-geometry-per-sequence `encode_frames` cannot write.
 oxideav-ico = { version = "0.0", optional = true }
 indexmap = "2"
 serde_json = "1"
+
+[dev-dependencies]
+# The integration tests build their own `RuntimeContext` and register
+# the formats the gateway resolves at test time directly (each crate's
+# `register(&mut ctx)`), the way the oxideav CLI's own context is
+# built. `oxideav-meta::register_all` would be the one-liner, but the
+# published aggregator registers nothing outside the umbrella (its
+# build script reads the normalized manifest), so the tests name the
+# crates they exercise. Dev-only: nothing here reaches a consumer.
+oxideav-png = "0.1"
+oxideav-bmp = "0.1"
+oxideav-mjpeg = "0.1"
+oxideav-webp = "0.3"
+oxideav-gif = "0.0"
+oxideav-tiff = "0.0"
+oxideav-qoi = "0.1"
