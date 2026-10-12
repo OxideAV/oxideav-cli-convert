@@ -129,7 +129,7 @@ routing:
 |---|---|---|
 | **Scene** | `.pdf` | writer consumes the whole `Scene` (vector preserved, multi-page) |
 | **Vector** | `.svg` | one `VectorFrame` per file (no rasterisation) |
-| **Raster** | `.png` `.jpg` `.bmp` `.webp`, plus any other extension a registered container claims (`qoi`, `dds`, …) | render each page to RGBA, encode |
+| **Raster** | `.png` `.jpg` `.bmp` `.webp`, plus every extension the caller's registry has a still-image encoder for (`tif`, `gif`, `qoi`, `tga`, `heic`, …) | render each page to RGBA, encode through `oxideav-image` |
 
 Codec lookup goes through the caller's `RuntimeContext` —
 `ContainerRegistry::container_for_extension` is the single source of
@@ -141,6 +141,51 @@ claims both `jpg` and `jpeg`). Extensions nobody registered
 resolve to no codec: the pipeline then infers per-track (the right
 answer for video containers like MP4/MKV that don't pin a single
 codec) or prompts for an explicit `-format CODEC`.
+
+### Side-channel stills ride `oxideav-image`
+
+The PDF runner, the 3D renderer and the icon writer do not carry
+format code of their own. A rendered page or scene is handed to the
+[`oxideav-image`](https://github.com/OxideAV/oxideav-image) gateway
+(`oxideav_image::encode` — encoder + muxer resolved from the output
+extension through the caller's registries); the icon writer's input
+is `oxideav_image::open` (any registered still-image format, primary
+picture). What this crate adds on top:
+
+- `-quality N` → the gateway's schema-gated `quality` (forwarded only
+  to encoders that declare it: JPEG, lossy WebP, TIFF-JPEG, …; silently
+  nothing for PNG / BMP / lossless encoders). Without `-quality` the
+  encoder's own declared default applies — JPEG writes at 75, where the
+  pre-gateway side-channel hard-coded 85. `-quality 85` reproduces the
+  former pictures sample for sample (same quantisation tables; the
+  header segment order differs because the registry encoder writes it
+  differently from the crate's direct API).
+- `--opt KEY=VALUE` is validated against the encoder's schema and
+  forwarded, exactly as on the pipeline route (`.avif` implies
+  `codec=av1` here too).
+- The encoder input layout is the pipeline route's pick
+  (`image_sink::pick_sink_format`, honouring `-depth`): RGB rather than
+  RGBA after `-alpha off`, 16-bit with `-depth 16`. An encoder that
+  declares no accepted layouts (JPEG) is probed in ImageMagick's order
+  — the render's own non-RGB layout, then 4:2:0 YCbCr, 4:2:2, 4:4:4,
+  RGB, gray — so an RGB render is a 4:2:0 JPEG as before and never a
+  grayscale one. PNG / BMP / ICO / SVG / PDF outputs are byte-identical
+  to the pre-gateway side-channel.
+- `.ico` is never a raster frame: it stays the icon side-channel's.
+
+The direct `oxideav-png` / `oxideav-bmp` / `oxideav-mjpeg` /
+`oxideav-webp` dependencies are gone; `oxideav-ico` stays because an
+icon bundles sub-images of *different* sizes, which the gateway's
+one-geometry-per-sequence `encode_frames` cannot express.
+
+### Icons (`.ico` output)
+
+`convert src.X -define icon:auto-resize=16,32,48,256 out.ico` writes a
+multi-resolution Windows icon (one entry per listed size, bilinear
+downscale, entries from 64 px up as PNG payloads); without the
+`-define` a single entry at the source size (1..=256 per axis). The
+source is any still-image format the registry opens — PNG, BMP, JPEG,
+GIF, TIFF, WebP, QOI, HEIC, … (primary picture of a multi-image file).
 
 ### Printf templates
 
@@ -245,8 +290,8 @@ disappears and 3D inputs fall through to the regular pipeline path.
 | Input | Output | Action |
 |---|---|---|
 | 3D format | matching 3D format (`.stl`/`.obj`/`.gltf`/`.glb`/`.mtl`/`.usdz`) | decode → re-encode through `Mesh3DRegistry` |
-| 3D format | raster (`.png`/`.jpg`/`.bmp`/`.webp`) | software-render the scene to RGBA, encode |
-| 3D format | other extension (`.svg`, `.mp4`, …) | error with did-you-mean hint |
+| 3D format | raster (`.png`/`.jpg`/`.bmp`/`.webp`, or any extension the registry has a still-image encoder for) | software-render the scene to RGBA, encode through `oxideav-image` |
+| 3D format | other extension (`.svg`, `.mp4`, `.ico`, …) | error with did-you-mean hint |
 | 3D format | output with `%d` template | error — 3D scenes are single-document |
 
 USDZ now round-trips both ways (encoder ships in `oxideav-usdz` 0.0.1).
@@ -291,7 +336,7 @@ flag is paired with an extension it doesn't apply to (e.g.
 | PDF (1 page) | `.svg` | no | write that page's VectorFrame |
 | PDF (N pages) | `.svg` | no | error — suggest `%d` template OR `[N]` selector |
 | PDF (any pages) | `.svg` | yes | one SVG per page |
-| PDF (1 page) | `.png` / `.jpg` / `.bmp` / `.webp` | no | render + encode |
+| PDF (1 page) | `.png` / `.jpg` / `.bmp` / `.webp` / any registered still-image extension | no | render + encode |
 | PDF (N pages) | raster | no | error — suggest `%d` or `[N]` |
 | PDF (any pages) | raster | yes | render + encode per page |
 
@@ -444,8 +489,6 @@ carries test-pinned guarantees:
 ## Known follow-ups
 
 - Multi-input (`convert in1.pdf in2.pdf out.gif`).
-- GIF + TIFF raster outputs (need palette quantisation / multi-image
-  TIFF encoder respectively; both are crate-side work).
 - `-density` applied to raster inputs (silently dropped today).
 - `-quality` / `-define` on the pipeline route land in the job's
   `codec_params`, which the pipeline does not forward to encoders;
