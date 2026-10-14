@@ -814,23 +814,46 @@ fn container_default_output(
     if selection.keep.is_empty() {
         return None;
     }
+    // A timed output takes the image-sequence tracks, not the cover
+    // still: when a kept video stream is timed, the kept stills (one
+    // tick of a 1/1 time base — how HEIF exposes its image items) are
+    // skipped. Stream order is not relied on.
+    let timed_video_kept = streams.iter().any(|s| {
+        s.params.media_type == MediaType::Video
+            && selection.keeps(s.index)
+            && !image_sink::is_still(s)
+    });
+    let skipped_stills: Vec<u32> = if timed_video_kept {
+        streams
+            .iter()
+            .filter(|s| {
+                s.params.media_type == MediaType::Video
+                    && selection.keeps(s.index)
+                    && image_sink::is_still(s)
+            })
+            .map(|s| s.index)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let kept = |idx: u32| selection.keeps(idx) && !skipped_stills.contains(&idx);
     // (kind, ordinal among the input's streams of that kind, codec).
     let tracks: Vec<(MediaType, u32, Option<String>)> = match codec {
         Some(c) => kind_ordinals(&streams)
             .into_iter()
             .map(|(idx, kind, ordinal)| (idx, kind, ordinal, Some(c.to_string())))
-            .filter(|(idx, ..)| selection.keeps(*idx))
+            .filter(|(idx, ..)| kept(*idx))
             .map(|(_, kind, ordinal, codec)| (kind, ordinal, codec))
             .collect(),
         None => {
             let planned = crate::container_defaults::plan_tracks(ctx, &container, &streams);
-            if planned.is_none() && selection.dropped.is_empty() {
+            if planned.is_none() && selection.dropped.is_empty() && skipped_stills.is_empty() {
                 return None;
             }
             let ordinals = kind_ordinals(&streams);
             ordinals
                 .into_iter()
-                .filter(|(idx, ..)| selection.keeps(*idx))
+                .filter(|(idx, ..)| kept(*idx))
                 .map(|(_, kind, ordinal)| {
                     let codec = planned.as_ref().and_then(|p| {
                         p.iter()
@@ -842,8 +865,14 @@ fn container_default_output(
                 .collect()
         }
     };
-    if selection.dropped.is_empty() && codec.is_some() {
+    if selection.dropped.is_empty() && skipped_stills.is_empty() && codec.is_some() {
         return None;
+    }
+    for idx in &skipped_stills {
+        notes.push(format!(
+            "convert: skipping still-image stream #{idx} of '{}' (the cover image); a timed output takes the image-sequence track",
+            plan.input
+        ));
     }
     notes.extend(
         selection

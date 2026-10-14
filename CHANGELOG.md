@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tracks ahead of the cover still on sequence-brand files since
   oxideav-heif r475, which made stream 0 the raw track
   (`image_sink::still_stream`).
+- **A timed output skips the cover still.** `convert in.heics out.mp4`
+  (or `.gif`, `.mkv`, …) remuxes / re-encodes the image-sequence track
+  and skips the still-image streams the selection kept (noted per
+  stream); before, the cover still became the only video track.
 - **Side-channel still images ride the `oxideav-image` gateway.** The
   PDF page renderer, the 3D→raster renderer and the icon writer's
   input no longer call `oxideav-png` / `oxideav-bmp` / `oxideav-mjpeg`

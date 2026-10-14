@@ -352,7 +352,7 @@ fn check_option_value(field: &OptionField, raw: &str) -> Result<(), String> {
 /// A still is a stream whose timeline is one tick of a 1/1 time base —
 /// how the HEIF demuxer exposes its image items (a 1/1 time base means
 /// "not timed", never "one second").
-fn is_still(s: &StreamInfo) -> bool {
+pub(crate) fn is_still(s: &StreamInfo) -> bool {
     s.time_base == TimeBase::new(1, 1) && s.duration == Some(1)
 }
 
