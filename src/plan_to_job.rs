@@ -936,7 +936,7 @@ fn still_input(
     let ordinal = if fanout {
         image_sink::fanout_stream(&streams)
     } else {
-        0
+        image_sink::still_stream(&streams)
     };
     if streams.len() > 1 {
         notes.push(if fanout {
@@ -947,7 +947,7 @@ fn still_input(
             )
         } else {
             format!(
-                "convert: note: '{}' has {} video streams; writing video stream #0 (the primary still image); use a `%d` output template for the image-sequence frames",
+                "convert: note: '{}' has {} video streams; writing video stream #{ordinal} (the primary still image); use a `%d` output template for the image-sequence frames",
                 plan.input,
                 streams.len()
             )

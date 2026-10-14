@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A single still output picks the still stream by shape, not by
+  index.** `convert in.heics out.png` writes the first stream whose
+  timeline is one tick of a 1/1 time base (the composed primary image);
+  `%d` fan-outs keep taking the first timed stream. HEIF lists its
+  tracks ahead of the cover still on sequence-brand files since
+  oxideav-heif r475, which made stream 0 the raw track
+  (`image_sink::still_stream`).
 - **Side-channel still images ride the `oxideav-image` gateway.** The
   PDF page renderer, the 3D→raster renderer and the icon writer's
   input no longer call `oxideav-png` / `oxideav-bmp` / `oxideav-mjpeg`

@@ -349,17 +349,32 @@ fn check_option_value(field: &OptionField, raw: &str) -> Result<(), String> {
     })
 }
 
+/// A still is a stream whose timeline is one tick of a 1/1 time base —
+/// how the HEIF demuxer exposes its image items (a 1/1 time base means
+/// "not timed", never "one second").
+fn is_still(s: &StreamInfo) -> bool {
+    s.time_base == TimeBase::new(1, 1) && s.duration == Some(1)
+}
+
 /// Video-stream ordinal a `%d` fan-out writes: the first stream that
-/// is not a single still image (HEIF / AVIF put the primary still at
-/// stream 0 and the image-sequence tracks after it), else stream 0. A
-/// still is a stream whose timeline is one tick of a 1/1 time base —
-/// how the HEIF demuxer exposes its image items.
+/// is not a single still image (an image-sequence track), else stream
+/// 0. Container order is not relied on: HEIF lists its tracks ahead of
+/// the cover still on sequence-brand files and the still first on
+/// image-brand ones.
 pub fn fanout_stream(streams: &[StreamInfo]) -> usize {
-    let is_still = |s: &StreamInfo| s.time_base == TimeBase::new(1, 1) && s.duration == Some(1);
     if streams.len() < 2 {
         return 0;
     }
     streams.iter().position(|s| !is_still(s)).unwrap_or(0)
+}
+
+/// Video-stream ordinal a single still output writes: the first still
+/// stream (the composed primary image), else stream 0.
+pub fn still_stream(streams: &[StreamInfo]) -> usize {
+    if streams.len() < 2 {
+        return 0;
+    }
+    streams.iter().position(is_still).unwrap_or(0)
 }
 
 /// The input's video streams in container order, read from the
