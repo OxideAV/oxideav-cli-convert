@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.7...v0.0.8) - 2026-10-14
+
+### Other
+
+- a timed output skips the cover still — the image-sequence track is the video
+- a single still output picks the still stream by shape (1/1 time base, one tick), not by index
+- gateway format suite + README for the side-channel stills
+- side-channel stills ride the oxideav-image gateway
+- oxideav-webp 0.3
+- stream_codec() — the per-stream default codec rule
+- PngImage::packed is fallible from png's fleet-sweep release onward
+- drop the streams an output cannot hold instead of failing
+- run_with_preferences forwards CodecPreferences to the executor
+- drop the MP4 raw-video default for now
+- WAV container default (PCM) for non-PCM audio
+- per-stream codecs for container outputs (.webm / .mkv / .y4m / .ogg)
+- silence deprecations of not-yet-released image-crate API renames (ico/svg) so the crate is warning-clean
+- mesh3d render: build RenderOptions with functional update so new renderer options default
+- *(convert)* follow the oxideav-bmp image-crate contract — BmpImage::packed, encode(&img, &EncodeOptions), decode_rgba8; bmp requirement >=0.1.6, <0.3
+- *(convert)* follow the oxideav-png image-crate contract — PngImage::packed, encode(&img, &EncodeOptions), decode / decode_rgba8
+
 ### Changed
 
 - **A single still output picks the still stream by shape, not by
