@@ -332,8 +332,14 @@ impl OpenFile {
             stream.params.blobs = Vec::new();
         }
         let t = Instant::now();
-        let file = File::create(path)
-            .map_err(|e| Error::invalid(format!("convert: failed to create {path}: {e}")))?;
+        // The I/O class survives (permission denied, missing directory):
+        // the CLI maps `Error::Io` kinds to its typed exit codes.
+        let file = File::create(path).map_err(|e| {
+            Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("convert: failed to create {path}: {e}"),
+            ))
+        })?;
         let muxer = ctx
             .containers
             .open_muxer(&spec.container, Box::new(file), &[stream]);
