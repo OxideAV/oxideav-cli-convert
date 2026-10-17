@@ -26,6 +26,8 @@ use std::path::PathBuf;
 use oxideav_core::{PixelFormat, RuntimeContext, VideoFrame, VideoPlane};
 use oxideav_image::{Image, SaveOptions};
 
+mod common;
+
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -53,6 +55,7 @@ fn ctx() -> RuntimeContext {
     oxideav_qoi::register(&mut ctx);
     oxideav_ico::register(&mut ctx);
     oxideav_image_filter::register(&mut ctx);
+    common::register(&mut ctx);
     ctx
 }
 
@@ -529,12 +532,6 @@ fn png_default_level() -> u32 {
     }
 }
 
-fn timed_convert(args: &[&str]) -> std::time::Duration {
-    let t = std::time::Instant::now();
-    convert(args);
-    t.elapsed()
-}
-
 /// `--opt level=<default>` through the frame tap equals the plain
 /// pipeline path byte for byte; `level=6` is a different (smaller or
 /// equal) stream with the same samples.
@@ -572,39 +569,80 @@ fn opt_level_matches_the_plain_path_at_the_default_level() {
 
 /// The frame-tap encoder is granted the resolved thread budget (the
 /// job's `threads` key, else the host's parallelism) exactly like the
-/// executor's own codecs: the bytes do not depend on the budget, and
-/// on a multi-core host the parallel encode is faster than `-threads 1`.
+/// executor's own codecs. Pinned through the `tprobe` encoder, which
+/// reports the budget it received instead of timing a race.
 #[test]
 fn opt_encoder_receives_the_thread_budget() {
     let dir = temp_dir("optthreads");
     let src = dir.join("in.png");
-    write_noise_png(&src, 1536, 1024);
-    let serial = dir.join("serial.png");
-    let auto = dir.join("auto.png");
-    let t_serial = timed_convert(&[
+    write_png(&src, PixelFormat::Rgb24, 8, 4, pattern(8, 4, 3));
+    let three = dir.join("three.tprobe");
+    let auto = dir.join("auto.tprobe");
+    convert(&[
         src.to_str().unwrap(),
         "--opt",
-        "level=6",
+        "tag=x",
         "-threads",
-        "1",
-        serial.to_str().unwrap(),
+        "3",
+        three.to_str().unwrap(),
     ]);
-    let t_auto = timed_convert(&[
+    convert(&[
         src.to_str().unwrap(),
         "--opt",
-        "level=6",
+        "tag=x",
         auto.to_str().unwrap(),
     ]);
-    assert_eq!(
-        fs::read(&serial).unwrap(),
-        fs::read(&auto).unwrap(),
-        "the segment grid does not depend on the thread budget"
-    );
+    assert_eq!(common::Report::read(&three).threads(), 3);
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    if cores >= 2 {
-        assert!(
-            t_auto < t_serial,
-            "parallel encode ({t_auto:?}) should beat -threads 1 ({t_serial:?}) on {cores} cores"
-        );
-    }
+    assert_eq!(common::Report::read(&auto).threads(), cores);
+}
+
+/// A packed-RGB PNG becomes a 4:2:0 YCbCr JPEG (4:4:4 from `-quality
+/// 90`): the `convert` convention, even though the JPEG encoder also
+/// accepts RGB-coded input and would keep the layout on its own.
+#[test]
+fn rgb_png_to_jpeg_is_coded_as_subsampled_ycbcr() {
+    let dir = temp_dir("jpegchroma");
+    let src = dir.join("in.png");
+    write_png(&src, PixelFormat::Rgb24, 32, 16, pattern(32, 16, 3));
+    let plain = dir.join("plain.jpg");
+    let hi = dir.join("hi.jpg");
+    let chosen = dir.join("chosen.jpg");
+    convert(&[src.to_str().unwrap(), plain.to_str().unwrap()]);
+    convert(&[
+        src.to_str().unwrap(),
+        "-quality",
+        "95",
+        hi.to_str().unwrap(),
+    ]);
+    convert(&[
+        src.to_str().unwrap(),
+        "--opt",
+        "chroma=yuv422",
+        chosen.to_str().unwrap(),
+    ]);
+    let layout = |p: &PathBuf| {
+        oxideav_image::open(&ctx(), p)
+            .expect("jpeg decodes")
+            .primary()
+            .format()
+    };
+    assert!(
+        matches!(layout(&plain), PixelFormat::YuvJ420P | PixelFormat::Yuv420P),
+        "{:?}",
+        layout(&plain)
+    );
+    assert!(
+        matches!(layout(&hi), PixelFormat::YuvJ444P | PixelFormat::Yuv444P),
+        "{:?}",
+        layout(&hi)
+    );
+    assert!(
+        matches!(
+            layout(&chosen),
+            PixelFormat::YuvJ422P | PixelFormat::Yuv422P
+        ),
+        "{:?}",
+        layout(&chosen)
+    );
 }

@@ -305,7 +305,15 @@ fn save_options(
     } else {
         let hint = LayoutHint::for_output(path);
         Some(
-            image_sink::pick_sink_format(src, &accepted, hint, last_depth(ops)).unwrap_or({
+            image_sink::chroma_subsampled_default(
+                &codec,
+                src,
+                &accepted,
+                opts.quality,
+                &opts.options,
+            )
+            .or_else(|| image_sink::pick_sink_format(src, &accepted, hint, last_depth(ops)))
+            .unwrap_or({
                 if accepted.contains(&src) {
                     src
                 } else {

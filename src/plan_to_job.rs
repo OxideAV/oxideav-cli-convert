@@ -275,6 +275,9 @@ struct SinkSide {
     format_override: Option<String>,
     /// `-depth N` — consumed by the still-image target selection.
     depth: Option<u8>,
+    /// `-quality N` (the last one), for the still-image writer: the
+    /// encoder's `quality` option when its schema declares one.
+    quality: Option<u8>,
     /// `--opt KEY=VALUE` pairs, in command-line order.
     encoder_opts: Vec<(String, String)>,
     /// `-threads N` → the job's `threads` key (`0` / unset = auto).
@@ -288,6 +291,7 @@ impl Default for SinkSide {
             strip_metadata: false,
             format_override: None,
             depth: None,
+            quality: None,
             encoder_opts: Vec::new(),
             threads: None,
         }
@@ -438,6 +442,7 @@ fn lower_op(chain: TrackInput, op: &Op, sink: &mut SinkSide, absorb_canvas: bool
             // unsupported.  Use `quality` for JPEG/WebP, `crf`
             // could be added by a later pass for h264/h265.
             sink.codec_params["quality"] = json!(q);
+            sink.quality = Some((*q).min(100) as u8);
             chain
         }
         Op::Strip => {
@@ -1020,11 +1025,16 @@ fn still_job(
     // ops may change it, and the pipeline tracks it no better.
     if matches!(chain, TrackInput::Source(_)) {
         let hint = LayoutHint::for_output(&plan.output);
-        if let Some(target) = si.streams[si.ordinal]
-            .params
-            .pixel_format
-            .and_then(|src| image_sink::pick_sink_format(src, &si.accepted, hint, sink.depth))
-        {
+        if let Some(target) = si.streams[si.ordinal].params.pixel_format.and_then(|src| {
+            image_sink::chroma_subsampled_default(
+                codec.as_deref().unwrap_or(""),
+                src,
+                &si.accepted,
+                sink.quality,
+                &[],
+            )
+            .or_else(|| image_sink::pick_sink_format(src, &si.accepted, hint, sink.depth))
+        }) {
             chain = wrap_convert(chain, target);
         }
     } else if sink.depth.is_some() {
@@ -1075,13 +1085,15 @@ fn tap_job(
     // else what the pipeline itself would pick (the source when the
     // encoder takes it, otherwise the encoder's first choice).
     let target =
-        image_sink::pick_sink_format(src, &si.accepted, hint, sink.depth).unwrap_or_else(|| {
-            if si.accepted.is_empty() || si.accepted.contains(&src) {
-                src
-            } else {
-                si.accepted[0]
-            }
-        });
+        image_sink::chroma_subsampled_default(&codec, src, &si.accepted, sink.quality, &options)
+            .or_else(|| image_sink::pick_sink_format(src, &si.accepted, hint, sink.depth))
+            .unwrap_or_else(|| {
+                if si.accepted.is_empty() || si.accepted.contains(&src) {
+                    src
+                } else {
+                    si.accepted[0]
+                }
+            });
     let bare = matches!(chain, TrackInput::Source(_));
     let chain = if target != src {
         let wrapped = wrap_convert(chain, target);

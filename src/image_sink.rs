@@ -201,6 +201,59 @@ pub fn pick_sink_format(
     }
 }
 
+/// Codec ids that code pictures as YCbCr with subsampled chroma by
+/// convention — the JPEG family — for which a packed-RGB source is
+/// coded as 4:2:0 YCbCr (the `convert` default below quality 90, and
+/// what every JPEG consumer expects) rather than as the RGB-coded
+/// JPEG the encoder also accepts.
+const CHROMA_SUBSAMPLED_CODECS: &[&str] = &["mjpeg"];
+
+/// 8-bit packed RGB layouts (with or without alpha).
+fn is_packed_rgb8(f: PixelFormat) -> bool {
+    matches!(
+        f,
+        PixelFormat::Rgb24
+            | PixelFormat::Bgr24
+            | PixelFormat::Rgba
+            | PixelFormat::Bgra
+            | PixelFormat::Argb
+            | PixelFormat::Abgr
+    )
+}
+
+/// The YCbCr layout a JPEG-family encoder (`codec`) codes an 8-bit
+/// packed-RGB `src` as: 4:2:0 (`YuvJ420P`) below quality 90, 4:4:4
+/// (`YuvJ444P`) from 90 up — the `convert` convention, which the
+/// encoder's own default (keep the input layout: an RGB-coded JPEG)
+/// does not follow. `None` when `codec` is not in the family, the
+/// source is not packed 8-bit RGB, the user chose the chroma layout
+/// (`chroma` / `sampling` options), or the encoder does not accept
+/// the layout.
+pub fn chroma_subsampled_default(
+    codec: &str,
+    src: PixelFormat,
+    accepted: &[PixelFormat],
+    quality: Option<u8>,
+    options: &[(String, String)],
+) -> Option<PixelFormat> {
+    if !CHROMA_SUBSAMPLED_CODECS.contains(&codec) || !is_packed_rgb8(src) {
+        return None;
+    }
+    if options
+        .iter()
+        .any(|(k, _)| k == "chroma" || k == "sampling")
+    {
+        return None;
+    }
+    let target = if quality.is_some_and(|q| q >= 90) {
+        PixelFormat::YuvJ444P
+    } else {
+        PixelFormat::YuvJ420P
+    };
+    let takes = accepted.is_empty() || accepted.contains(&target);
+    (takes && oxideav_pixfmt::supports(src, target)).then_some(target)
+}
+
 /// Resolve the output codec for `output` (or the `-format` override).
 ///
 /// The container registered for the extension names the codec for
@@ -498,6 +551,41 @@ mod tests {
     fn unreachable_candidates_are_skipped() {
         // Nothing reachable → leave it to the pipeline.
         assert_eq!(pick(Yuv420P, &[Pal8]), None);
+    }
+
+    #[test]
+    fn jpeg_codes_packed_rgb_as_subsampled_ycbcr() {
+        const JPEG: &[PixelFormat] = &[YuvJ444P, YuvJ422P, YuvJ420P, Gray8, Rgb24];
+        let d = |src, q, opts: &[(String, String)]| {
+            chroma_subsampled_default("mjpeg", src, JPEG, q, opts)
+        };
+        assert_eq!(d(Rgb24, None, &[]), Some(YuvJ420P));
+        assert_eq!(d(Rgba, Some(75), &[]), Some(YuvJ420P));
+        assert_eq!(d(Bgr24, Some(89), &[]), Some(YuvJ420P));
+        assert_eq!(d(Rgb24, Some(90), &[]), Some(YuvJ444P));
+        assert_eq!(d(Rgb24, Some(100), &[]), Some(YuvJ444P));
+        // Not the family, not packed RGB, or the user chose the chroma.
+        assert_eq!(
+            chroma_subsampled_default("png", Rgb24, &[Rgb24, Rgba], None, &[]),
+            None
+        );
+        assert_eq!(d(Gray8, None, &[]), None);
+        assert_eq!(d(Yuv420P, None, &[]), None);
+        assert_eq!(d(Rgb48Le, None, &[]), None);
+        let chroma = [("chroma".to_string(), "yuv444".to_string())];
+        assert_eq!(d(Rgb24, None, &chroma), None);
+        let sampling = [("sampling".to_string(), "1x1".to_string())];
+        assert_eq!(d(Rgb24, None, &sampling), None);
+        // An encoder without the layout keeps the generic pick.
+        assert_eq!(
+            chroma_subsampled_default("mjpeg", Rgb24, &[Rgb24, Gray8], None, &[]),
+            None
+        );
+        // No declared layouts: the family default still applies.
+        assert_eq!(
+            chroma_subsampled_default("mjpeg", Rgb24, &[], None, &[]),
+            Some(YuvJ420P)
+        );
     }
 
     #[test]

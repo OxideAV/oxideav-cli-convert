@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- JPEG outputs from a packed-RGB source are coded as 4:2:0 YCbCr again
+  (4:4:4 from `-quality 90`), on both the pipeline route and the
+  side-channel stills: a JPEG encoder that declares its accepted layouts
+  (`oxideav-mjpeg` 0.1.12) would otherwise keep the RGB layout and write an
+  RGB-coded JPEG. `--opt chroma=` / `--opt sampling=` still choose.
+- The frame-tap thread-budget test no longer races two wall clocks (red on
+  the two-core Windows runner): a test-only `tprobe` format reports the
+  budget, options, layout and records the encoder received.
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.7...v0.0.8) - 2026-10-14
 
 ### Other
