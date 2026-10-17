@@ -37,31 +37,51 @@ use serde_json::{json, Value};
 pub const NAME: &str = "tprobe";
 const MAGIC: &[u8] = b"TPRB\n";
 
+/// A second target, `.tprgb`: the same encoder declaring `Rgb24`
+/// only (no alpha, no palette) — what a JPEG-like sink looks like to
+/// the planner.
+pub const NAME_RGB: &str = "tprgb";
+/// A third, `.tprgba`: `Rgba` only.
+pub const NAME_RGBA: &str = "tprgba";
+
 /// Register the container (demuxer, muxer, probe, extension) and the
-/// codec (decoder, encoder with a `quality` / `tag` schema).
+/// codec (decoder, encoder with a `quality` / `tag` schema) for the
+/// three targets.
 pub fn register(ctx: &mut RuntimeContext) {
-    ctx.containers.register_demuxer(NAME, open_demuxer);
-    ctx.containers.register_muxer(NAME, open_muxer);
-    ctx.containers.register_probe(NAME, probe);
-    ctx.containers.register_extension(NAME, NAME);
-    let caps = CodecCapabilities::video("tprobe_test")
+    register_one(ctx, NAME, ACCEPTED, make_encoder);
+    register_one(ctx, NAME_RGB, &[PixelFormat::Rgb24], make_encoder_rgb);
+    register_one(ctx, NAME_RGBA, &[PixelFormat::Rgba], make_encoder_rgba);
+}
+
+fn register_one(
+    ctx: &mut RuntimeContext,
+    name: &str,
+    accepted: &[PixelFormat],
+    encoder: oxideav_core::EncoderFactory,
+) {
+    ctx.containers.register_demuxer(name, open_demuxer);
+    ctx.containers.register_muxer(name, open_muxer);
+    ctx.containers.register_probe(name, probe);
+    ctx.containers.register_extension(name, name);
+    let caps = CodecCapabilities::video(format!("{name}_test"))
         .with_decode()
         .with_encode()
         .with_lossy(true)
         .with_lossless(true)
         .with_intra_only(true)
-        .with_pixel_formats(ACCEPTED.to_vec());
+        .with_pixel_formats(accepted.to_vec());
     ctx.codecs.register(
-        CodecInfo::new(CodecId::new(NAME))
+        CodecInfo::new(CodecId::new(name))
             .capabilities(caps)
             .decoder(make_decoder)
-            .encoder(make_encoder)
+            .encoder(encoder)
             .encoder_options::<ProbeOptions>(),
     );
 }
 
-/// The encoder's declared input layouts (the planner's pick is among
-/// these): packed RGB first, then the palette and grey layouts.
+/// The `tprobe` encoder's declared input layouts (the planner's pick
+/// is among these): packed RGB first, then the palette and grey
+/// layouts.
 pub const ACCEPTED: &[PixelFormat] = &[
     PixelFormat::Rgb24,
     PixelFormat::Rgba,
@@ -467,22 +487,38 @@ struct ProbeEncoder {
 }
 
 fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    make_encoder_for(params, NAME, ACCEPTED)
+}
+
+fn make_encoder_rgb(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    make_encoder_for(params, NAME_RGB, &[PixelFormat::Rgb24])
+}
+
+fn make_encoder_rgba(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    make_encoder_for(params, NAME_RGBA, &[PixelFormat::Rgba])
+}
+
+fn make_encoder_for(
+    params: &CodecParameters,
+    name: &str,
+    accepted: &[PixelFormat],
+) -> Result<Box<dyn Encoder>> {
     let options: ProbeOptions = oxideav_core::parse_options(&params.options)?;
     let fmt = params
         .pixel_format
         .ok_or_else(|| Error::invalid("tprobe: encoder needs a pixel format"))?;
-    if !ACCEPTED.contains(&fmt) {
+    if !accepted.contains(&fmt) {
         return Err(Error::unsupported(format!(
-            "tprobe: encoder does not take {fmt:?}"
+            "{name}: encoder does not take {fmt:?}"
         )));
     }
     // The output parameters carry no blobs of their own: what the
     // muxer sees at the stream level is what `convert` attached.
     let mut out_params = params.clone();
-    out_params.codec_id = CodecId::new(NAME);
+    out_params.codec_id = CodecId::new(name);
     out_params.blobs = Vec::new();
     Ok(Box::new(ProbeEncoder {
-        id: CodecId::new(NAME),
+        id: CodecId::new(name),
         params: params.clone(),
         out_params,
         options,

@@ -282,3 +282,75 @@ fn filter_ops_on_a_palette_source_run_in_rgba_and_keep_the_pick() {
         None
     );
 }
+
+/// A `Pal8` source with a transparent entry.
+fn palette_source(dir: &Path) -> PathBuf {
+    let p = dir.join("pal.tprobe");
+    // Columns: 0 = opaque red, 1 = transparent blue, 2 = half green.
+    Source::packed(3, 2, PixelFormat::Pal8, |x, _| vec![x as u8])
+        .with_palette(vec![[255, 0, 0, 255], [0, 0, 255, 0], [0, 255, 0, 128]])
+        .with_stream_blobs(vec![icc()])
+        .write(&p);
+    p
+}
+
+#[test]
+fn palette_alpha_rides_to_a_palette_target() {
+    let dir = temp_dir("pal-keep");
+    let src = palette_source(&dir);
+    let out = dir.join("out.tprobe");
+    convert(&[s(&src), s(&out)]).unwrap();
+    let r = Report::read(&out);
+    assert_eq!(r.format(), "Pal8", "the encoder takes Pal8: no expansion");
+    assert_eq!(r.palette_len(), Some(3));
+    assert_eq!(
+        r.palette_alpha(),
+        Some(vec![255, 0, 128]),
+        "the record is on the frame"
+    );
+    assert_eq!(r.first_bytes()[..3], [0, 1, 2]);
+    assert_eq!(r.stream_blob_kinds(), ["icc"]);
+}
+
+#[test]
+fn palette_alpha_expands_to_an_alpha_target() {
+    let dir = temp_dir("pal-rgba");
+    let src = palette_source(&dir);
+    let out = dir.join("out.tprgba");
+    convert(&[s(&src), s(&out)]).unwrap();
+    let r = Report::read(&out);
+    assert_eq!(r.format(), "Rgba");
+    let px = r.first_bytes();
+    assert_eq!(&px[..4], &[255, 0, 0, 255]);
+    assert_eq!(&px[4..8], &[0, 0, 255, 0], "transparent entry → alpha 0");
+    assert_eq!(
+        r.stream_blob_kinds(),
+        ["icc"],
+        "blobs survive the expansion"
+    );
+}
+
+#[test]
+fn palette_alpha_is_composited_for_a_target_without_alpha() {
+    let dir = temp_dir("pal-rgb");
+    let src = palette_source(&dir);
+    let white = dir.join("white.tprgb");
+    let red = dir.join("red.tprgb");
+    convert(&[s(&src), s(&white)]).unwrap();
+    convert(&[s(&src), "-background", "red", s(&red)]).unwrap();
+    let w = Report::read(&white);
+    assert_eq!(w.format(), "Rgb24");
+    let px = w.first_bytes();
+    assert_eq!(&px[..3], &[255, 0, 0], "opaque entry as is");
+    assert_eq!(&px[3..6], &[255, 255, 255], "transparent entry = white");
+    assert_eq!(&px[6..8], &[127, 255], "half green over white");
+    let r = Report::read(&red);
+    let px = r.first_bytes();
+    assert_eq!(
+        &px[3..6],
+        &[255, 0, 0],
+        "transparent entry = the -background colour"
+    );
+    assert_eq!(&px[6..8], &[127, 128], "half green over red");
+    assert_eq!(r.muxer_blob_kinds(), ["icc"]);
+}

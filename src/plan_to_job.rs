@@ -1227,7 +1227,12 @@ fn tap_job(
                 }
             });
     let bare = matches!(chain, TrackInput::Source(_));
-    let chain = if target != src {
+    // A palette source the encoder does not take is expanded by the
+    // writer itself (the gateway's palette-alpha rules, compositing
+    // on a target without alpha) rather than by a convert node, which
+    // would drop the palette's transparency.
+    let expand_palette = bare && src == PixelFormat::Pal8 && target != PixelFormat::Pal8;
+    let chain = if target != src && !expand_palette {
         let wrapped = wrap_convert(chain, target);
         if !wrapped.is_convert() {
             return Err(Error::unsupported(format!(
@@ -1289,8 +1294,22 @@ fn tap_job(
         threads,
         quality: sink.quality,
         strip_metadata: sink.strip_metadata,
+        expand_palette,
+        background: last_background(&plan.ops),
     };
     Ok((job, tap))
+}
+
+/// The last `-background` colour, else opaque white (the canvas
+/// default every `convert` compositing step uses).
+fn last_background(ops: &[Op]) -> [u8; 4] {
+    ops.iter()
+        .rev()
+        .find_map(|o| match o {
+            Op::Background(c) => Some(*c),
+            _ => None,
+        })
+        .unwrap_or([255, 255, 255, 255])
 }
 
 /// Canonical short name the job schema parses back into `fmt`

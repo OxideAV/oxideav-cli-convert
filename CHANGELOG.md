@@ -40,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   palette → `Rgba`, else `Rgb24`, with a `convert: note:`), so
   `convert in.heic -resize 50% out.png` works instead of failing on the
   filter's layout check.
+- Palette alpha (core 0.1.40 palette-alpha record): a `Pal8` source
+  reaches a palette-accepting encoder (png, gif) with its palette and
+  alpha records untouched; an encoder without `Pal8` gets the picture
+  expanded by the writer through the gateway's palette rules — alpha `0`
+  for transparent entries on an alpha target, and compositing over
+  `-background` (opaque white by default) on a target without alpha,
+  where the gateway's own views would drop the transparency.
 - The output codec is resolved through the gateway's `resolve_target`:
   the requested format name picks the codec on a multi-brand container
   (`.avif` is the `avif` encoder, `.heic` the `heif` one).

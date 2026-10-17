@@ -85,6 +85,16 @@ pub struct TapSpec {
     pub quality: Option<u8>,
     /// `-strip`: write no metadata blobs (stream level or per frame).
     pub strip_metadata: bool,
+    /// The frames arrive as `Pal8` (the source layout, left unconverted
+    /// by the planner) and the writer expands them to
+    /// [`frame_format`](Self::frame_format) itself through the
+    /// gateway's palette rules: transparent entries become alpha `0`
+    /// on an alpha target, and are composited over
+    /// [`background`](Self::background) on a target without alpha.
+    pub expand_palette: bool,
+    /// `-background` (opaque white by default): what palette
+    /// transparency is composited over on a target without alpha.
+    pub background: [u8; 4],
 }
 
 /// What the tap wrote.
@@ -184,6 +194,11 @@ fn write_frames(
             stats.first_frame.get_or_insert_with(|| start.elapsed());
             let frame = if spec.strip_metadata {
                 strip_frame(frame)
+            } else {
+                frame
+            };
+            let frame = if spec.expand_palette {
+                expand_palette(frame, spec)?
             } else {
                 frame
             };
@@ -407,6 +422,69 @@ pub fn file_blobs(
     out
 }
 
+/// A `Pal8` frame expanded to `spec.frame_format` through the
+/// gateway's palette rules ([`oxideav_image::Image::to_format`]): the
+/// palette-alpha record yields alpha on an alpha target; on a target
+/// without alpha, transparent entries are composited over
+/// `spec.background` first (the gateway itself drops the alpha — a
+/// written picture should not). Blobs and the colour record ride
+/// along; a frame that is not `Pal8` is returned unchanged.
+fn expand_palette(frame: Frame, spec: &TapSpec) -> Result<Frame> {
+    use oxideav_image::Image;
+    let Frame::Video(vf) = frame else {
+        return Ok(frame);
+    };
+    if vf.palette().is_none() {
+        return Ok(Frame::Video(vf));
+    }
+    let Some((w, h)) = spec.dims.or_else(|| frame_dims(&vf, PixelFormat::Pal8)) else {
+        return Err(Error::unsupported(
+            "convert: cannot size the palette frame to expand it",
+        ));
+    };
+    let mut params = CodecParameters::video(CodecId::new(spec.stream.params.codec_id.as_str()));
+    params.width = Some(w);
+    params.height = Some(h);
+    params.pixel_format = Some(PixelFormat::Pal8);
+    let img = Image::from_video_frame(vf, &params)
+        .map_err(|e| Error::invalid(format!("convert: palette frame: {e}")))?;
+    let target = spec.frame_format;
+    let blobs = img.frame_blobs().to_vec();
+    let has_alpha = FormatInfo::of(target).has_alpha;
+    let out = if img.has_palette_alpha() && !has_alpha {
+        let mut rgba = img
+            .to_rgba8()
+            .map_err(|e| Error::invalid(format!("convert: palette expansion: {e}")))?;
+        composite_over(&mut rgba, spec.background);
+        let flat = Image::from_rgba8(w, h, rgba)
+            .map_err(|e| Error::invalid(format!("convert: composited frame: {e}")))?;
+        flat.to_format(target)
+    } else {
+        img.to_format(target)
+    }
+    .map_err(|e| Error::invalid(format!("convert: palette → {target:?}: {e}")))?;
+    let (mut out, _) = out.into_video_frame();
+    if out.blobs().is_empty() && !blobs.is_empty() {
+        out.set_blobs(blobs);
+    }
+    Ok(Frame::Video(out))
+}
+
+/// Composite packed RGBA over an opaque `bg` colour in place.
+fn composite_over(rgba: &mut [u8], bg: [u8; 4]) {
+    for px in rgba.chunks_exact_mut(4) {
+        let a = u32::from(px[3]);
+        if a == 255 {
+            continue;
+        }
+        let inv = 255 - a;
+        for c in 0..3 {
+            px[c] = ((u32::from(px[c]) * a + u32::from(bg[c]) * inv + 127) / 255) as u8;
+        }
+        px[3] = 255;
+    }
+}
+
 /// `frame` without its metadata-blobs record.
 fn strip_frame(frame: Frame) -> Frame {
     match frame {
@@ -524,6 +602,19 @@ mod tests {
             panic!("video")
         };
         assert!(v.blobs().is_empty());
+    }
+
+    #[test]
+    fn composite_over_blends_toward_the_background() {
+        let mut px = vec![255, 0, 0, 255, 0, 0, 255, 0, 0, 0, 0, 128];
+        composite_over(&mut px, [255, 255, 255, 255]);
+        assert_eq!(&px[..4], &[255, 0, 0, 255], "opaque pixels untouched");
+        assert_eq!(
+            &px[4..8],
+            &[255, 255, 255, 255],
+            "fully transparent = background"
+        );
+        assert_eq!(&px[8..], &[127, 127, 127, 255], "half over white");
     }
 
     #[test]
