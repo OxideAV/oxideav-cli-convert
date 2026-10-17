@@ -1,13 +1,23 @@
 //! Frame tap: the still-image write path `convert` owns itself.
 //!
 //! The regular pipeline route hands the whole job — decode, filters,
-//! conversion, encode, mux — to the executor. Two still-image features
-//! need the encode + mux stages on this side instead:
+//! conversion, encode, mux — to the executor. Every still-image output
+//! whose source layout the planner knows runs the encode + mux stages
+//! on this side instead, because the still-image contract the
+//! `oxideav-image` gateway documents needs them here:
 //!
-//! * **Encoder options** (`--opt KEY=VALUE`, and the `.avif` ⇒
-//!   `codec=av1` inference). The encoder is built here with the
-//!   options in its [`CodecParameters::options`] bag, validated
-//!   against the encoder's declared schema at plan time.
+//! * **Encoder options** (`--opt KEY=VALUE`) are validated against the
+//!   encoder's declared schema at plan time and handed over in its
+//!   [`CodecParameters::options`] bag; `-quality N` becomes the
+//!   `quality` option exactly when the schema declares one (the
+//!   gateway's `SaveOptions::quality` rule).
+//! * **Metadata blobs** (ICC / Exif / XMP, core 0.1.40) ride through:
+//!   the source stream's blobs go on the encoder's parameters and on
+//!   the muxer's stream, the frame's own record stays on the frame —
+//!   with a single picture's frame blobs promoted ahead of the stream's
+//!   (the gateway's single-picture rule). `-strip` withholds them all.
+//! * **Thread budget**: the encoder is granted the plan's
+//!   [`ExecutionContext`] (the executor grants the decoder the same).
 //! * **Per-frame fan-out** (`convert seq.heics frame-%03d.png`): every
 //!   frame of the selected stream lands in its own file, each through
 //!   a fresh encoder + muxer.
@@ -70,6 +80,11 @@ pub struct TapSpec {
     /// the job's `threads` key, else the host's parallelism — the same
     /// resolution the pipeline executor applies to its own codecs.
     pub threads: usize,
+    /// `-quality N`: the encoder's `quality` option when its schema
+    /// declares one and `--opt quality=` did not set it.
+    pub quality: Option<u8>,
+    /// `-strip`: write no metadata blobs (stream level or per frame).
+    pub strip_metadata: bool,
 }
 
 /// What the tap wrote.
@@ -167,6 +182,11 @@ fn write_frames(
     let result = (|| {
         for frame in rx.iter() {
             stats.first_frame.get_or_insert_with(|| start.elapsed());
+            let frame = if spec.strip_metadata {
+                strip_frame(frame)
+            } else {
+                frame
+            };
             let Frame::Video(ref vf) = frame else {
                 continue;
             };
@@ -182,14 +202,22 @@ fn write_frames(
             match &spec.template {
                 Some(t) => {
                     let path = t.expand(stats.frames as usize);
-                    let mut f = OpenFile::create(ctx, spec, &path, w, h, &mut stats)?;
+                    let mut f = OpenFile::create(ctx, spec, &path, w, h, vf, &mut stats)?;
                     f.push(&frame, &mut stats)?;
                     f.finish(&mut stats)?;
                     stats.files += 1;
                 }
                 None => {
                     if single.is_none() {
-                        single = Some(OpenFile::create(ctx, spec, &spec.output, w, h, &mut stats)?);
+                        single = Some(OpenFile::create(
+                            ctx,
+                            spec,
+                            &spec.output,
+                            w,
+                            h,
+                            vf,
+                            &mut stats,
+                        )?);
                     }
                     single
                         .as_mut()
@@ -230,24 +258,44 @@ struct OpenFile {
 }
 
 impl OpenFile {
+    /// `first` is the file's first frame: its own blobs record is the
+    /// file's metadata ahead of the stream's (every file this writer
+    /// produces holds one picture per encoder stream).
     fn create(
         ctx: &RuntimeContext,
         spec: &TapSpec,
         path: &str,
         w: u32,
         h: u32,
+        first: &oxideav_core::VideoFrame,
         stats: &mut TapStats,
     ) -> Result<OpenFile> {
-        let mut params = CodecParameters::video(CodecId::new(spec.codec.as_str()));
+        let codec_id = CodecId::new(spec.codec.as_str());
+        let mut params = CodecParameters::video(codec_id.clone());
         params.width = Some(w);
         params.height = Some(h);
         params.pixel_format = Some(spec.frame_format);
         params.frame_rate = spec.stream.params.frame_rate;
         let mut options = CodecOptions::new();
+        if let Some(q) = spec.quality {
+            let declared = ctx
+                .codecs
+                .encoder_options_schema(&codec_id)
+                .is_some_and(|schema| schema.iter().any(|f| f.name == "quality"));
+            if declared && !spec.options.iter().any(|(k, _)| k == "quality") {
+                options.insert("quality", q.to_string());
+            }
+        }
         for (k, v) in &spec.options {
             options.insert(k.as_str(), v.as_str());
         }
         params.options = options;
+        let blobs = if spec.strip_metadata {
+            Vec::new()
+        } else {
+            file_blobs(first, spec.stream.params.blobs())
+        };
+        params.blobs = blobs.clone();
         let t = Instant::now();
         let mut encoder = oxideav_pipeline::selection::make_encoder(&ctx.codecs, &params)
             .map_err(|e| Error::invalid(format!("convert: {} encoder: {e}", spec.codec)))?;
@@ -257,6 +305,14 @@ impl OpenFile {
         let mut stream = spec.stream.clone();
         stream.index = 0;
         stream.params = encoder.output_params().clone();
+        // A muxer that embeds metadata itself (HEIF) reads the stream's
+        // blobs; an encoder that does not echo them on its output
+        // parameters would otherwise leave the muxer without them.
+        if stream.params.blobs().is_empty() && !blobs.is_empty() {
+            stream.params.blobs = blobs;
+        } else if spec.strip_metadata {
+            stream.params.blobs = Vec::new();
+        }
         let t = Instant::now();
         let file = File::create(path)
             .map_err(|e| Error::invalid(format!("convert: failed to create {path}: {e}")))?;
@@ -331,6 +387,34 @@ impl OpenFile {
         let path = self.path.clone();
         drop(self);
         let _ = std::fs::remove_file(Path::new(&path));
+    }
+}
+
+/// The blobs a one-picture file carries: the picture's own record
+/// first, then the stream's blobs of kinds the picture does not carry
+/// (a frame blob overrides a stream blob of its kind — the gateway's
+/// precedence and single-picture promotion rules).
+pub fn file_blobs(
+    frame: &oxideav_core::VideoFrame,
+    stream: &[oxideav_core::MetadataBlob],
+) -> Vec<oxideav_core::MetadataBlob> {
+    let mut out = frame.blobs();
+    for b in stream {
+        if !out.iter().any(|f| f.kind == b.kind) {
+            out.push(b.clone());
+        }
+    }
+    out
+}
+
+/// `frame` without its metadata-blobs record.
+fn strip_frame(frame: Frame) -> Frame {
+    match frame {
+        Frame::Video(mut vf) => {
+            let _ = vf.take_blobs();
+            Frame::Video(vf)
+        }
+        other => other,
     }
 }
 
@@ -416,6 +500,30 @@ mod tests {
             ),
             Some((64, 48))
         );
+    }
+
+    #[test]
+    fn frame_blobs_override_stream_blobs_of_their_kind() {
+        use oxideav_core::{BlobKind, MetadataBlob};
+        let mut f = frame(&[(3, 1)]);
+        f.set_blobs(vec![MetadataBlob::new(BlobKind::EXIF, vec![1])]);
+        let stream = vec![
+            MetadataBlob::new(BlobKind::ICC, vec![2]),
+            MetadataBlob::new(BlobKind::EXIF, vec![3]),
+        ];
+        let got = file_blobs(&f, &stream);
+        assert_eq!(got.len(), 2);
+        assert!(got[0].is(&BlobKind::EXIF) && got[0].data == [1]);
+        assert!(got[1].is(&BlobKind::ICC) && got[1].data == [2]);
+        assert!(file_blobs(&frame(&[(3, 1)]), &stream)
+            .iter()
+            .map(|b| b.data[0])
+            .eq([2, 3]));
+        let stripped = strip_frame(Frame::Video(f));
+        let Frame::Video(v) = stripped else {
+            panic!("video")
+        };
+        assert!(v.blobs().is_empty());
     }
 
     #[test]

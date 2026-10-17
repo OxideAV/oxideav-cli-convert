@@ -720,11 +720,15 @@ fn finish_job(
     };
 
     let (job, tap) = match (still, wants_tap) {
-        (Some(si), false) => {
+        // Every still output `convert` can size runs through its own
+        // writer (quality, metadata, the thread budget); the executor
+        // keeps the ones it cannot (an undeclared source layout, a
+        // bit-packed layout after filter ops).
+        (Some(si), false) if !tap_can_write(plan, &chain, &si, &sink, codec.as_deref()) => {
             let job = still_job(plan, chain, codec, sink, &si, &mut notes)?;
             (job, None)
         }
-        (Some(si), true) => {
+        (Some(si), _) => {
             let (job, tap) = tap_job(plan, ctx, chain, codec, sink, si, options)?;
             (job, Some(tap))
         }
@@ -1061,6 +1065,42 @@ fn still_job(
     )
 }
 
+/// Whether [`tap_job`] can write this still output: the source
+/// layout is declared (the writer sizes its frames from it) and, when
+/// filter ops change the geometry, the frames reach the writer in a
+/// byte-aligned layout it can measure (a bit-packed `pbm` after a
+/// resize is left to the executor).
+fn tap_can_write(
+    plan: &ConvertPlan,
+    chain: &TrackInput,
+    si: &StillInput,
+    sink: &SinkSide,
+    codec: Option<&str>,
+) -> bool {
+    let Some(src) = si.streams[si.ordinal].params.pixel_format else {
+        return false;
+    };
+    if matches!(chain, TrackInput::Source(_)) {
+        return true;
+    }
+    let hint = LayoutHint::for_output(&plan.output);
+    let target = image_sink::chroma_subsampled_default(
+        codec.unwrap_or(""),
+        src,
+        &si.accepted,
+        sink.quality,
+        &[],
+    )
+    .or_else(|| image_sink::pick_sink_format(src, &si.accepted, hint, sink.depth))
+    .unwrap_or(if si.accepted.is_empty() || si.accepted.contains(&src) {
+        src
+    } else {
+        si.accepted[0]
+    });
+    let bits = target.bits_per_pixel_approx();
+    bits % 8 == 0 && !oxideav_pixfmt::FormatInfo::of(target).is_palette
+}
+
 /// Frame-tap job: the executor decodes / filters / converts into the
 /// reserved [`TAP_SINK`]; [`crate::frame_tap`] encodes and muxes.
 fn tap_job(
@@ -1157,6 +1197,8 @@ fn tap_job(
         output: plan.output.clone(),
         template: plan.output_template.clone(),
         threads,
+        quality: sink.quality,
+        strip_metadata: sink.strip_metadata,
     };
     Ok((job, tap))
 }

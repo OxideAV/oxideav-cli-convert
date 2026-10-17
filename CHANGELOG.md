@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Every still-image output whose source layout is declared is written by
+  `convert`'s own encode + mux stage (the frame tap), which adopts the
+  `oxideav-image` gateway's still-image contract: `-quality N` becomes the
+  encoder's `quality` option exactly when its schema declares one (`--opt
+  quality=` stays explicit), the source stream's metadata blobs (ICC /
+  Exif / XMP, core 0.1.40) go on the encoder's parameters and the muxer's
+  stream with a picture's own record promoted ahead of them, `-strip`
+  withholds them all, and the encoder is granted the plan's thread
+  budget. Outputs the writer cannot size (an undeclared source layout, a
+  bit-packed layout after filter ops) keep the executor's encode.
+- The output codec is resolved through the gateway's `resolve_target`:
+  the requested format name picks the codec on a multi-brand container
+  (`.avif` is the `avif` encoder, `.heic` the `heif` one).
+
 ### Fixed
 
 - JPEG outputs from a packed-RGB source are coded as 4:2:0 YCbCr again

@@ -274,6 +274,27 @@ pub fn resolve_output_codec(
         .or_else(|| ext_of(output).map(|s| s.to_ascii_lowercase()))?;
     let container = ctx.containers.container_for_extension(&ext)?.to_string();
     let has_enc = |id: &str| ctx.codecs.has_encoder(&CodecId::new(id));
+    // The gateway's resolution first: the requested format name picks
+    // the codec on a multi-brand container (`.avif` on the heif
+    // container is the `avif` encoder, not the container's HEVC
+    // default), and a container's default codec is the gateway's
+    // (`jpeg` → `mjpeg`). Only an answer that names an image encoder
+    // for a format this planner would also treat as an image is taken;
+    // a container whose extension names no codec stays per-stream.
+    let image_format = has_enc(&container)
+        || has_enc(&ext)
+        || CONTAINER_CODEC_ALIASES
+            .iter()
+            .any(|(c, codec)| *c == container && has_enc(codec));
+    if image_format {
+        if let Ok(target) =
+            oxideav_image::resolve_target(ctx, &ext, &oxideav_image::SaveOptions::default())
+        {
+            if has_enc(target.codec()) {
+                return Some(target.codec().to_string());
+            }
+        }
+    }
     if has_enc(&container) {
         return Some(container);
     }

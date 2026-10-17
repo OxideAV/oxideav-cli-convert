@@ -280,11 +280,14 @@ fn depth_8_narrows_a_sixteen_bit_png() {
     assert_eq!(got.data, high, "16 → 8 keeps the high byte");
 }
 
-/// The job the planner emits for a still-image sink: one video track
-/// pinned to video stream #0, with the explicit conversion node when
-/// the source layout is not the pick.
+/// The job the planner emits for a still-image sink: the executor
+/// decodes / converts one video track, pinned to video stream #0, into
+/// the frame tap's reserved `@out` sink (the writer owns the codec),
+/// with the explicit conversion node when the source layout is not
+/// the pick.
 #[test]
 fn still_sink_job_pins_stream_and_layout() {
+    use oxideav_cli_convert::frame_tap::TAP_SINK;
     let dir = temp_dir("jobshape");
     let src = dir.join("in.jpg");
     write_jpeg444(&src, 24, 16);
@@ -294,11 +297,11 @@ fn still_sink_job_pins_stream_and_layout() {
         .collect();
     let plan = oxideav_cli_convert::args::parse(&argv).unwrap();
     let job = oxideav_cli_convert::plan_to_job::plan_to_job(&plan, &ctx()).unwrap();
-    let out = &job.outputs["out.png"];
+    let out = &job.outputs[TAP_SINK];
     assert!(out.all.is_empty(), "still sinks do not fan out over kinds");
     assert_eq!(out.video.len(), 1);
     let track = &out.video[0];
-    assert_eq!(track.codec.as_deref(), Some("png"));
+    assert_eq!(track.codec, None, "the frame tap owns the encoder");
     let sel = track.stream_selector.as_ref().expect("selector");
     assert_eq!(sel.index, Some(0));
     let conv = track.input.as_convert().expect("explicit convert node");
@@ -313,7 +316,7 @@ fn still_sink_job_pins_stream_and_layout() {
         .collect();
     let plan = oxideav_cli_convert::args::parse(&argv).unwrap();
     let job = oxideav_cli_convert::plan_to_job::plan_to_job(&plan, &ctx()).unwrap();
-    assert!(job.outputs["out.png"].video[0].input.is_source());
+    assert!(job.outputs[TAP_SINK].video[0].input.is_source());
 }
 
 /// The JPEG container carries the `mjpeg` codec: a `.jpg` output must
