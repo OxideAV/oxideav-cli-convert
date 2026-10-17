@@ -42,7 +42,7 @@ use oxideav_ico::{write_ico, IconImage, IconType, WriteOptions};
 use oxideav_image_filter::{ImageFilter, Resize, VideoStreamParams};
 
 use crate::op::{ConvertPlan, Op};
-use crate::raster_io::{read_image_to_rgba, RgbaImage};
+use crate::raster_io::{read_image_to_rgba_with, RgbaImage};
 
 /// Returns true when the plan's output extension is `.ico`.
 ///
@@ -58,7 +58,8 @@ pub fn is_ico_output(output: &str) -> bool {
 /// single `.ico` file at `plan.output`. The input is any still-image
 /// format `ctx` can open.
 pub fn run(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<()> {
-    let src = read_image_to_rgba(ctx, &plan.input)?;
+    let opts = plan.restrictions.apply(oxideav_image::OpenOptions::new());
+    let src = read_image_to_rgba_with(ctx, &plan.input, &opts)?;
 
     let sizes = parse_auto_resize_define(&plan.ops)?;
 

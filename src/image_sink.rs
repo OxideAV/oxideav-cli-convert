@@ -468,21 +468,39 @@ pub fn probe_video_streams(input: &str, ctx: &RuntimeContext) -> Option<Vec<Stre
 /// Every stream of `input` as its container header declares it, or
 /// `None` under the same conditions as [`probe_video_streams`].
 pub fn probe_streams(input: &str, ctx: &RuntimeContext) -> Option<Vec<StreamInfo>> {
-    let raw = match ctx.sources.open(input).ok()? {
-        SourceOutput::Bytes(b) => b,
-        _ => return None,
+    probe_streams_restricted(input, ctx, &crate::restrict::Restrictions::default())
+        .ok()
+        .flatten()
+}
+
+/// [`probe_streams`] under allow / deny lists: the probed container
+/// name is checked before the header is parsed and every video
+/// stream's codec id before anything is decoded, exactly as the
+/// `oxideav-image` gateway checks its `OpenOptions` lists. `Ok(None)`
+/// when the input is not a byte-shaped source the registry can probe
+/// (nothing to check: the pipeline reports what it cannot open),
+/// `Err` (`crate::restrict::is_restricted`) on a refusal.
+pub fn probe_streams_restricted(
+    input: &str,
+    ctx: &RuntimeContext,
+    restrictions: &crate::restrict::Restrictions,
+) -> oxideav_core::Result<Option<Vec<StreamInfo>>> {
+    let raw = match ctx.sources.open(input) {
+        Ok(SourceOutput::Bytes(b)) => b,
+        _ => return Ok(None),
     };
     let mut handle: Box<dyn ReadSeek> = Box::new(raw);
     let ext = ext_of(input).map(|e| e.to_ascii_lowercase());
-    let format = ctx
-        .containers
-        .probe_input(&mut *handle, ext.as_deref())
-        .ok()?;
-    let demuxer = ctx
-        .containers
-        .open_demuxer(&format, handle, &ctx.codecs)
-        .ok()?;
-    Some(demuxer.streams().to_vec())
+    let Ok(format) = ctx.containers.probe_input(&mut *handle, ext.as_deref()) else {
+        return Ok(None);
+    };
+    restrictions.check_container(&format)?;
+    let Ok(demuxer) = ctx.containers.open_demuxer(&format, handle, &ctx.codecs) else {
+        return Ok(None);
+    };
+    let streams = demuxer.streams().to_vec();
+    restrictions.check_streams(&streams)?;
+    Ok(Some(streams))
 }
 
 fn ext_of(path: &str) -> Option<&str> {

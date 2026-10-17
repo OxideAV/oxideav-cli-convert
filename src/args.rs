@@ -11,6 +11,7 @@ use crate::op::{
     Mesh3DRenderMode, Op, PageAtom, PageSelector, PrintfTemplate, ProjectionMode, ResizeMode,
     StlFormatChoice,
 };
+use crate::restrict::Restrictions;
 use oxideav_core::Error;
 
 /// Every flag the parser below recognises, stored without the leading
@@ -29,6 +30,8 @@ use oxideav_core::Error;
 /// in review.
 const KNOWN_FLAG_NAMES: &[&str] = &[
     "aa",
+    "allow-codecs",
+    "allow-containers",
     "alpha",
     "auto-gamma",
     "background",
@@ -43,6 +46,8 @@ const KNOWN_FLAG_NAMES: &[&str] = &[
     "crop",
     "define",
     "density",
+    "deny-codecs",
+    "deny-containers",
     "depth",
     "dither",
     "edge",
@@ -116,6 +121,7 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
     let mut probe_json = false;
     let mut probe_watch = false;
     let mut mesh3d_options = Mesh3DOptions::default();
+    let mut restrictions = Restrictions::default();
     // Track the most recent `-background` colour in source order so
     // `-extent` (which paints padding pixels with the active background)
     // captures the correct value at parse time. Defaults to IM's opaque
@@ -327,6 +333,29 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                     ))
                 })?;
                 ops.push(Op::Threads(n));
+                i += 2;
+            }
+            // Input restrictions: comma- / space-separated lists,
+            // repeatable (the lists accumulate). GNU-style double
+            // dash like `--opt`; the single-dash spelling is accepted.
+            "--allow-containers" | "-allow-containers" => {
+                let list = crate::restrict::parse_list(val(i + 1)?);
+                restrictions = restrictions.with_allow_containers(list);
+                i += 2;
+            }
+            "--deny-containers" | "-deny-containers" => {
+                let list = crate::restrict::parse_list(val(i + 1)?);
+                restrictions = restrictions.with_deny_containers(list);
+                i += 2;
+            }
+            "--allow-codecs" | "-allow-codecs" => {
+                let list = crate::restrict::parse_list(val(i + 1)?);
+                restrictions = restrictions.with_allow_codecs(list);
+                i += 2;
+            }
+            "--deny-codecs" | "-deny-codecs" => {
+                let list = crate::restrict::parse_list(val(i + 1)?);
+                restrictions = restrictions.with_deny_codecs(list);
                 i += 2;
             }
             "-quality" => {
@@ -820,6 +849,7 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
             probe_json,
             probe_watch,
             mesh3d_options,
+            restrictions,
         });
     }
 
@@ -888,6 +918,7 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
         probe_json,
         probe_watch,
         mesh3d_options,
+        restrictions,
     })
 }
 
@@ -916,7 +947,18 @@ pub fn usage() -> String {
         for name in chunk {
             // The four GNU-style mode switches take a double dash;
             // everything else is a single-dash IM-style op.
-            let lead = if matches!(*name, "probe" | "json" | "watch" | "help" | "opt") {
+            let lead = if matches!(
+                *name,
+                "probe"
+                    | "json"
+                    | "watch"
+                    | "help"
+                    | "opt"
+                    | "allow-containers"
+                    | "deny-containers"
+                    | "allow-codecs"
+                    | "deny-codecs"
+            ) {
                 "--"
             } else {
                 "-"
@@ -3835,7 +3877,18 @@ mod tests {
     fn usage_lists_every_known_flag_with_correct_lead() {
         let text = usage();
         for name in KNOWN_FLAG_NAMES {
-            let lead = if matches!(*name, "probe" | "json" | "watch" | "help" | "opt") {
+            let lead = if matches!(
+                *name,
+                "probe"
+                    | "json"
+                    | "watch"
+                    | "help"
+                    | "opt"
+                    | "allow-containers"
+                    | "deny-containers"
+                    | "allow-codecs"
+                    | "deny-codecs"
+            ) {
                 "--"
             } else {
                 "-"
@@ -3847,6 +3900,75 @@ mod tests {
             );
         }
         assert!(text.starts_with("usage: oxideav convert"));
+    }
+
+    #[test]
+    fn restriction_flags_accumulate_into_the_plan() {
+        let p = parse(&to_vec(&[
+            "--allow-containers",
+            "png, heif",
+            "-allow-containers",
+            "gif",
+            "--deny-codecs",
+            "hevc",
+            "in.png",
+            "--deny-containers",
+            "GIF",
+            "--allow-codecs",
+            "png",
+            "out.png",
+        ]))
+        .unwrap();
+        let r = &p.restrictions;
+        assert_eq!(
+            r.allow_containers.as_deref(),
+            Some(&["png".to_string(), "heif".into(), "gif".into()][..])
+        );
+        assert_eq!(r.deny_containers, ["gif"]);
+        assert_eq!(r.allow_codecs.as_deref(), Some(&["png".to_string()][..]));
+        assert_eq!(r.deny_codecs, ["hevc"]);
+        assert!(parse(&to_vec(&["in.png", "out.png"]))
+            .unwrap()
+            .restrictions
+            .is_empty());
+        let err = parse(&to_vec(&["in.png", "--deny-codecs"])).unwrap_err();
+        assert!(format!("{err}").contains("--deny-codecs"), "{err}");
+    }
+
+    #[test]
+    fn plan_accessors_read_the_last_of_their_ops() {
+        let p = parse(&to_vec(&[
+            "-threads", "0", "-threads", "3", "-quality", "120", "-quality", "40", "in.png",
+            "out.jpg",
+        ]));
+        // -quality 120 is rejected at parse time; keep the valid shape.
+        assert!(p.is_err());
+        let p = parse(&to_vec(&[
+            "-threads", "0", "-threads", "3", "-quality", "40", "in.png", "out.jpg",
+        ]))
+        .unwrap();
+        assert_eq!(p.threads(), Some(3));
+        assert_eq!(p.execution_context().threads, 3);
+        assert_eq!(p.quality(), Some(40));
+        assert!(!p.strip_metadata());
+        let p = parse(&to_vec(&[
+            "-threads",
+            "0",
+            "-thumbnail",
+            "4x4",
+            "in.png",
+            "out.jpg",
+        ]))
+        .unwrap();
+        assert_eq!(p.threads(), None);
+        assert_eq!(
+            p.execution_context().threads,
+            oxideav_core::ExecutionContext::auto().threads
+        );
+        assert!(p.strip_metadata());
+        assert!(parse(&to_vec(&["-strip", "in.png", "out.jpg"]))
+            .unwrap()
+            .strip_metadata());
     }
 
     // ---- `--` end-of-flags marker + empty-argument hardening ----
@@ -4010,6 +4132,10 @@ mod tests {
             ("-negate", &[]),
             ("-normalize", &[]),
             ("--opt", &["filter=none"]),
+            ("--allow-containers", &["png,heif"]),
+            ("--deny-containers", &["gif"]),
+            ("--allow-codecs", &["png hevc"]),
+            ("--deny-codecs", &["av1"]),
             ("-ping", &[]),
             ("-posterize", &["4"]),
             ("-projection", &["persp"]),

@@ -190,3 +190,95 @@ fn a_png_source_through_the_gateway_lands_in_its_own_layout() {
     assert_eq!(r.threads(), 2);
     assert_eq!(r.first_bytes(), [0, 1, 2, 3, 4, 5, 6, 7]);
 }
+
+#[test]
+fn allow_and_deny_lists_refuse_before_any_decode() {
+    use oxideav_cli_convert::restrict::is_restricted;
+    let dir = temp_dir("restrict");
+    let src = rgb_source(&dir, "in.tprobe", vec![]);
+    let out = dir.join("out.tprobe");
+    let refused = |args: &[&str]| {
+        let mut v = vec![s(&src)];
+        v.extend_from_slice(args);
+        v.push(s(&out));
+        let e = convert(&v).unwrap_err();
+        assert!(is_restricted(&e), "{e}");
+        assert!(!out.exists(), "nothing written: {e}");
+    };
+    refused(&["--deny-containers", "tprobe"]);
+    refused(&["--allow-containers", "png,heif"]);
+    refused(&["--deny-codecs", "TPROBE"]);
+    refused(&["--allow-codecs", "png"]);
+    // Allowed: the lists name the input.
+    convert(&[
+        s(&src),
+        "--allow-containers",
+        "tprobe",
+        "--allow-codecs",
+        "tprobe",
+        "--deny-codecs",
+        "hevc",
+        s(&out),
+    ])
+    .unwrap();
+    assert!(out.exists());
+
+    // The planner refuses the same way (library callers of plan_to_job).
+    let plan = oxideav_cli_convert::ConvertPlan::new(s(&src), s(&out)).with_restrictions(
+        oxideav_cli_convert::Restrictions::new().with_deny_containers(["tprobe"]),
+    );
+    let e = oxideav_cli_convert::plan_to_job::plan_to_job(&plan, &ctx()).unwrap_err();
+    assert!(is_restricted(&e), "{e}");
+
+    // The gateway-backed side-channel (`.ico` output reads through the
+    // gateway's OpenOptions) maps the gateway's refusal to the same shape.
+    let ico = dir.join("out.ico");
+    let mut v = vec![s(&src), "--deny-containers", "tprobe"];
+    v.push(s(&ico));
+    let e = oxideav_cli_convert::run(&v.iter().map(|x| x.to_string()).collect::<Vec<_>>(), &{
+        let mut c = ctx();
+        oxideav_ico::register(&mut c);
+        c
+    })
+    .unwrap_err();
+    assert!(is_restricted(&e), "{e}");
+}
+
+#[test]
+fn filter_ops_on_a_palette_source_run_in_rgba_and_keep_the_pick() {
+    // A `Pal8` source: the filters do not take it, so the planner
+    // converts it ahead of the first filter op (RGBA: palette entries
+    // may be transparent); the probe encoder accepts RGBA and gets the
+    // filtered picture.
+    let dir = temp_dir("palfilter");
+    let p = dir.join("in.tprobe");
+    Source::packed(4, 4, PixelFormat::Pal8, |x, _| vec![(x % 2) as u8])
+        .with_palette(vec![[255, 0, 0, 255], [0, 0, 255, 255]])
+        .write(&p);
+    let out = dir.join("out.tprobe");
+    convert(&[s(&p), "-negate", s(&out)]).unwrap();
+    let r = Report::read(&out);
+    assert_eq!(r.format(), "Rgba");
+    // Negated red (255,0,0) → (0,255,255), alpha untouched.
+    assert_eq!(r.first_bytes()[..4], [0, 255, 255, 255]);
+    assert_eq!(
+        oxideav_cli_convert::plan_to_job::filter_input_layout(PixelFormat::Pal8),
+        Some(PixelFormat::Rgba)
+    );
+    assert_eq!(
+        oxideav_cli_convert::plan_to_job::filter_input_layout(PixelFormat::YuvJ420P),
+        Some(PixelFormat::Rgb24)
+    );
+    assert_eq!(
+        oxideav_cli_convert::plan_to_job::filter_input_layout(PixelFormat::Gray16Le),
+        Some(PixelFormat::Gray8)
+    );
+    assert_eq!(
+        oxideav_cli_convert::plan_to_job::filter_input_layout(PixelFormat::Yuva420P),
+        Some(PixelFormat::Rgba)
+    );
+    assert_eq!(
+        oxideav_cli_convert::plan_to_job::filter_input_layout(PixelFormat::Rgb24),
+        None
+    );
+}

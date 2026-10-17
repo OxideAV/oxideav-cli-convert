@@ -3,6 +3,10 @@
 //! Each variant carries exactly the data the CLI needs to hand to
 //! [`crate::plan_to_job`], nothing more.
 
+use oxideav_core::ExecutionContext;
+
+pub use crate::restrict::Restrictions;
+
 /// Dither strategy used when `-colors N` forces a paletted output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1037,6 +1041,12 @@ pub struct ConvertPlan {
     /// registry's default factory for each format" so callers who
     /// don't pass any of these flags see no behaviour change.
     pub mesh3d_options: Mesh3DOptions,
+    /// Input restrictions (`--allow-containers`, `--deny-containers`,
+    /// `--allow-codecs`, `--deny-codecs`): handed to the
+    /// `oxideav-image` gateway's `OpenOptions` on the side-channels
+    /// and enforced on the pipeline route's header probe before any
+    /// decoder exists. Empty = no restriction.
+    pub restrictions: Restrictions,
 }
 
 impl ConvertPlan {
@@ -1058,7 +1068,51 @@ impl ConvertPlan {
             probe_json: false,
             probe_watch: false,
             mesh3d_options: Mesh3DOptions::default(),
+            restrictions: Restrictions::default(),
         }
+    }
+
+    /// Input restrictions (allow / deny lists).
+    pub fn with_restrictions(mut self, v: Restrictions) -> Self {
+        self.restrictions = v;
+        self
+    }
+
+    /// The thread budget the plan asks for: the last `-threads N`
+    /// with `N ≥ 1`; `None` = auto (the host's parallelism).
+    pub fn threads(&self) -> Option<usize> {
+        self.ops.iter().rev().find_map(|o| match o {
+            Op::Threads(n) if *n >= 1 => Some(*n),
+            Op::Threads(_) => None,
+            _ => None,
+        })
+    }
+
+    /// The execution context granted to every codec `convert` builds
+    /// (and to the pipeline executor's codecs through the job's
+    /// `threads` key): [`threads`](Self::threads), else the host's
+    /// parallelism.
+    pub fn execution_context(&self) -> ExecutionContext {
+        match self.threads() {
+            Some(n) => ExecutionContext::with_threads(n),
+            None => ExecutionContext::auto(),
+        }
+    }
+
+    /// True when the output must carry no metadata blobs (`-strip`,
+    /// or `-thumbnail`, which strips by contract).
+    pub fn strip_metadata(&self) -> bool {
+        self.ops
+            .iter()
+            .any(|o| matches!(o, Op::Strip | Op::Thumbnail { .. }))
+    }
+
+    /// The last `-quality N`, capped to 100.
+    pub fn quality(&self) -> Option<u8> {
+        self.ops.iter().rev().find_map(|o| match o {
+            Op::Quality(q) => Some((*q).min(100) as u8),
+            _ => None,
+        })
     }
     /// Operation chain in source order.
     pub fn with_ops(mut self, ops: Vec<Op>) -> Self {

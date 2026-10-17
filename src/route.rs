@@ -187,6 +187,7 @@ mod tests {
             probe_json: false,
             probe_watch: false,
             mesh3d_options: Default::default(),
+            restrictions: Default::default(),
         }
     }
 

@@ -75,16 +75,105 @@ pub(crate) fn plan_pipeline(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<
     // with [`plan_to_render3d_job`].
     let mut sink = SinkSide::default();
 
+    // The input's streams, read from its container header once (the
+    // still-image planning reuses them); a refusal under the plan's
+    // allow / deny lists is the error here, before any decoder exists.
+    let probed = image_sink::probe_streams_restricted(&plan.input, ctx, &plan.restrictions)?;
+
     // Starting input: the file itself.
-    let mut chain: TrackInput = TrackInput::Source(SourceRef {
+    let source = TrackInput::Source(SourceRef {
         from: plan.input.clone(),
     });
+    let lower_all = |mut chain: TrackInput, sink: &mut SinkSide| {
+        for op in &plan.ops {
+            chain = lower_op(chain, op, sink, false);
+        }
+        chain
+    };
+    let mut chain = lower_all(source.clone(), &mut sink);
+    let mut notes = Vec::new();
 
-    for op in &plan.ops {
-        chain = lower_op(chain, op, &mut sink, false);
+    // Filter ops run on a layout the filter crate handles. A source
+    // decoding to anything else (a JPEG-range or 10-bit YCbCr HEIC, a
+    // palette PNG, 16-bit RGB) is converted first — the filters, not
+    // the sink, decide this layout; the sink pick still applies to
+    // what the filters produce.
+    if !matches!(chain, TrackInput::Source(_)) {
+        let fanout = plan.output_template.is_some();
+        let src = probed.as_deref().and_then(|streams| {
+            let video: Vec<StreamInfo> = streams
+                .iter()
+                .filter(|s| s.params.media_type == MediaType::Video)
+                .cloned()
+                .collect();
+            let ordinal = if fanout {
+                image_sink::fanout_stream(&video)
+            } else {
+                image_sink::still_stream(&video)
+            };
+            video.get(ordinal).and_then(|s| s.params.pixel_format)
+        });
+        if let Some(target) = src.and_then(filter_input_layout) {
+            let wrapped = wrap_convert(source, target);
+            if wrapped.is_convert() {
+                sink = SinkSide::default();
+                chain = lower_all(wrapped, &mut sink);
+                notes.push(format!(
+                    "convert: note: filter ops run in {target:?} (the source decodes to {:?}, which the filters do not take)",
+                    src.expect("some")
+                ));
+            }
+        }
     }
 
-    finish_job(plan, ctx, chain, sink, true)
+    let mut planned = finish_job(plan, ctx, chain, sink, probed)?;
+    notes.append(&mut planned.notes);
+    planned.notes = notes;
+    Ok(planned)
+}
+
+/// Layouts the `oxideav-image-filter` filters operate on (its
+/// documented set); anything else is converted before the first
+/// filter op by [`filter_input_layout`].
+const FILTER_LAYOUTS: &[PixelFormat] = &[
+    PixelFormat::Gray8,
+    PixelFormat::Rgb24,
+    PixelFormat::Rgba,
+    PixelFormat::Yuv420P,
+    PixelFormat::Yuv422P,
+    PixelFormat::Yuv444P,
+];
+
+/// The layout to convert a `src` frame to before filter ops: `None`
+/// when the filters take `src`; else 8-bit grey for a grey source,
+/// RGBA when the source carries alpha (or a palette, whose entries may
+/// be transparent), RGB otherwise — the layouts every filter handles.
+/// `None` as well when pixfmt has no route.
+pub fn filter_input_layout(src: PixelFormat) -> Option<PixelFormat> {
+    if FILTER_LAYOUTS.contains(&src) {
+        return None;
+    }
+    let info = oxideav_pixfmt::FormatInfo::of(src);
+    let gray = matches!(
+        src,
+        PixelFormat::MonoBlack
+            | PixelFormat::MonoWhite
+            | PixelFormat::Gray10Le
+            | PixelFormat::Gray12Le
+            | PixelFormat::Gray16Le
+            | PixelFormat::GrayF32Le
+    );
+    let target = if gray {
+        PixelFormat::Gray8
+    } else if info.has_alpha
+        || info.is_palette
+        || matches!(src, PixelFormat::Ya8 | PixelFormat::Ya16Le)
+    {
+        PixelFormat::Rgba
+    } else {
+        PixelFormat::Rgb24
+    };
+    oxideav_pixfmt::supports(src, target).then_some(target)
 }
 
 /// Build a 3D→raster [`Job`] from a [`ConvertPlan`] whose input is a
@@ -145,7 +234,7 @@ pub fn plan_to_render3d_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<
         chain = lower_op(chain, op, &mut sink, true);
     }
 
-    finish_job(plan, ctx, chain, sink, false).map(|p| p.job)
+    finish_job(plan, ctx, chain, sink, None).map(|p| p.job)
 }
 
 /// Pull the render canvas dimensions from the op chain: the LAST
@@ -665,22 +754,22 @@ struct StillInput {
 /// params, resolve the output codec, assemble the single-output
 /// [`Job`], and enforce the schema-validation guarantee.
 ///
-/// `probe_input` enables the still-image sink planning (see
-/// [`crate::image_sink`]): when the output resolves to an image
-/// encoder and the input's container header can be read, the track
-/// is pinned to one video stream and — for a plain conversion — to
-/// the encoder input layout that loses nothing the source carries.
-/// Encoder options and `%d` fan-out additionally route the frames to
-/// `convert`'s own writer ([`crate::frame_tap`]). The 3D-render
-/// planner passes `false` (its source is a renderer, not a file with
-/// streams).
+/// `probed` (the input's streams from its container header) enables
+/// the still-image sink planning (see [`crate::image_sink`]): when the
+/// output resolves to an image encoder, the track is pinned to one
+/// video stream and — for a plain conversion — to the encoder input
+/// layout that loses nothing the source carries.
+/// The frames of every sizable still output go to `convert`'s own
+/// writer ([`crate::frame_tap`]). The 3D-render planner passes `None`
+/// (its source is a renderer, not a file with streams).
 fn finish_job(
     plan: &ConvertPlan,
     ctx: &RuntimeContext,
     chain: TrackInput,
     mut sink: SinkSide,
-    probe_input: bool,
+    probed: Option<Vec<StreamInfo>>,
 ) -> Result<Planned, Error> {
+    let probe_input = probed.is_some();
     // Sink-side metadata handling.
     if sink.strip_metadata {
         sink.codec_params["strip_metadata"] = json!(true);
@@ -713,11 +802,9 @@ fn finish_job(
     let wants_tap = fanout || !options.is_empty();
 
     let mut notes = Vec::new();
-    let still = if probe_input {
-        still_input(plan, ctx, codec.as_deref(), fanout, &mut notes)
-    } else {
-        None
-    };
+    let still = probed
+        .as_deref()
+        .and_then(|streams| still_input(plan, ctx, streams, codec.as_deref(), fanout, &mut notes));
 
     let (job, tap) = match (still, wants_tap) {
         // Every still output `convert` can size runs through its own
@@ -962,12 +1049,17 @@ fn single_output_job(key: &str, out: OutputSpec, threads: Option<usize>) -> Resu
 fn still_input(
     plan: &ConvertPlan,
     ctx: &RuntimeContext,
+    probed: &[StreamInfo],
     codec: Option<&str>,
     fanout: bool,
     notes: &mut Vec<String>,
 ) -> Option<StillInput> {
     let accepted = image_sink::encoder_accepted_formats(ctx, codec?)?;
-    let streams = image_sink::probe_video_streams(&plan.input, ctx)?;
+    let streams: Vec<StreamInfo> = probed
+        .iter()
+        .filter(|s| s.params.media_type == MediaType::Video)
+        .cloned()
+        .collect();
     if streams.is_empty() {
         return None;
     }
@@ -1184,9 +1276,7 @@ fn tap_job(
     )?;
     // The encoder's thread budget resolves exactly as the executor's:
     // the job's `threads` key, else the host's parallelism.
-    let threads = sink
-        .threads
-        .unwrap_or_else(|| oxideav_core::ExecutionContext::auto().threads);
+    let threads = plan.execution_context().threads;
     let tap = TapSpec {
         codec,
         container,
@@ -1285,6 +1375,7 @@ mod tests {
             probe_json: false,
             probe_watch: false,
             mesh3d_options: Default::default(),
+            restrictions: Default::default(),
         }
     }
 
@@ -2102,6 +2193,7 @@ mod tests {
             probe_json: false,
             probe_watch: false,
             mesh3d_options: Default::default(),
+            restrictions: Default::default(),
         };
         let job = plan_to_job(&plan, &empty_ctx()).unwrap();
         let track = &job.outputs.values().next().unwrap().all[0];
@@ -2315,6 +2407,7 @@ mod tests {
             probe_json: false,
             probe_watch: false,
             mesh3d_options: opts,
+            restrictions: Default::default(),
         }
     }
 

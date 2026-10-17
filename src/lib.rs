@@ -58,6 +58,7 @@ pub mod plan_to_job;
 pub mod probe;
 #[doc(hidden)]
 pub mod raster_io;
+pub mod restrict;
 pub mod route;
 #[doc(hidden)]
 pub mod suggest;
@@ -84,6 +85,7 @@ mod timing {
 }
 
 pub use op::{AlphaOp, ConvertPlan, Dither, Op, PrintfTemplate, ResizeMode};
+pub use restrict::Restrictions;
 pub use route::Route;
 
 use oxideav_core::{Error, RuntimeContext};
@@ -112,7 +114,32 @@ pub fn run_with_preferences(
     // tested); this function only performs the dispatched work. See
     // the `route` module docs for the precedence order and why input
     // classification outranks output classification.
-    match route::decide_with(&plan, Some(ctx))? {
+    let route = route::decide_with(&plan, Some(ctx))?;
+    // Allow / deny lists: refused before any decoder exists. The
+    // pipeline planner and the gateway-backed readers check again on
+    // their own open (the lists ride the plan); the side-channels that
+    // read through other readers (PDF, 3D assets) get the container
+    // check here.
+    if !plan.restrictions.is_empty() {
+        match route {
+            Route::Help | Route::Ping | Route::Probe => {}
+            Route::PdfSideChannel => plan.restrictions.check_container("pdf")?,
+            #[cfg(feature = "mesh3d")]
+            Route::Mesh3dToMesh3d | Route::Mesh3dToRaster => {
+                let ext = plan
+                    .input
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                plan.restrictions.check_container(&ext)?;
+            }
+            _ => {
+                image_sink::probe_streams_restricted(&plan.input, ctx, &plan.restrictions)?;
+            }
+        }
+    }
+    match route {
         // `--help`: print the usage synopsis (generated from the
         // parser's own flag table) and do nothing else.
         Route::Help => {

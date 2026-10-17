@@ -203,6 +203,9 @@ pub fn gateway_error(what: &str, e: ImageError) -> Error {
         ImageError::UnknownFormat(m) | ImageError::Unsupported(m) => {
             Error::unsupported(format!("{what}: {m}"))
         }
+        // The gateway's refusal under allow / deny lists, in the shape
+        // `crate::restrict::is_restricted` recognises.
+        ImageError::Restricted(m) => Error::unsupported(format!("{what}: restricted: {m}")),
         other => Error::invalid(format!("{what}: {other}")),
     }
 }
@@ -211,7 +214,17 @@ pub fn gateway_error(what: &str, e: ImageError) -> Error {
 /// into packed RGBA through the `oxideav-image` gateway. Only the first
 /// picture is decoded (`max_frames = 1`).
 pub fn read_image_to_rgba(ctx: &RuntimeContext, input: &str) -> Result<RgbaImage> {
-    let opts = OpenOptions::new().with_max_frames(1);
+    read_image_to_rgba_with(ctx, input, &OpenOptions::new())
+}
+
+/// [`read_image_to_rgba`] with the caller's gateway options (allow /
+/// deny lists, decoder options); `max_frames` is forced to 1.
+pub fn read_image_to_rgba_with(
+    ctx: &RuntimeContext,
+    input: &str,
+    opts: &OpenOptions,
+) -> Result<RgbaImage> {
+    let opts = opts.clone().with_max_frames(1);
     let file = oxideav_image::open_with(ctx, input, &opts)
         .map_err(|e| gateway_error(&format!("convert: failed to read {input}"), e))?;
     RgbaImage::from_image(file.primary())
@@ -279,6 +292,9 @@ fn save_options(
     if let Some(q) = last_quality(ops) {
         opts = opts.with_quality(q);
     }
+    if strips_metadata(ops) {
+        opts = opts.without_metadata();
+    }
     let codec = image_sink::resolve_output_codec(None, path, ctx);
     let user: Vec<(String, String)> = ops
         .iter()
@@ -289,6 +305,22 @@ fn save_options(
         .collect();
     for (k, v) in image_sink::encoder_options(ctx, codec.as_deref(), Some(ext), &user)? {
         opts = opts.with_option(k, v);
+    }
+    // The gateway has no execution-context hook: an encoder that
+    // declares a `threads` option (heif) is granted the plan's budget
+    // through it, unless the user set the option.
+    if let Some(c) = codec.as_deref() {
+        let declares_threads = ctx
+            .codecs
+            .encoder_options_schema(&CodecId::new(c))
+            .is_some_and(|schema| schema.iter().any(|f| f.name == "threads"));
+        if declares_threads && !opts.options.iter().any(|(k, _)| k == "threads") {
+            let threads = match last_threads(ops) {
+                Some(n) => n,
+                None => oxideav_core::ExecutionContext::auto().threads,
+            };
+            opts = opts.with_option("threads", threads.to_string());
+        }
     }
     // Options can change the encoder's accepted layouts (a `codec`
     // option on a container encoder); the gateway's ladder handles
@@ -390,6 +422,19 @@ fn last_quality(ops: &[Op]) -> Option<u8> {
         Op::Quality(q) => Some((*q).min(100) as u8),
         _ => None,
     })
+}
+
+fn last_threads(ops: &[Op]) -> Option<usize> {
+    ops.iter().rev().find_map(|o| match o {
+        Op::Threads(n) if *n >= 1 => Some(*n),
+        Op::Threads(_) => None,
+        _ => None,
+    })
+}
+
+fn strips_metadata(ops: &[Op]) -> bool {
+    ops.iter()
+        .any(|o| matches!(o, Op::Strip | Op::Thumbnail { .. }))
 }
 
 fn last_depth(ops: &[Op]) -> Option<u8> {

@@ -19,6 +19,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   withholds them all, and the encoder is granted the plan's thread
   budget. Outputs the writer cannot size (an undeclared source layout, a
   bit-packed layout after filter ops) keep the executor's encode.
+- Input restrictions: `--allow-containers` / `--deny-containers` /
+  `--allow-codecs` / `--deny-codecs` (comma lists, repeatable; deny wins,
+  names compare case-insensitively — the gateway's rules). They ride the
+  plan (`ConvertPlan::restrictions`, `Restrictions` builder) into the
+  gateway's `OpenOptions` on the side-channels and are enforced on the
+  pipeline route's header probe before any decoder exists; a refusal is
+  `Error::Unsupported` with a `convert: restricted:` message
+  (`restrict::is_restricted`), the gateway's `ImageError::Restricted`
+  mapped the same way.
+- `ConvertPlan::threads()` / `execution_context()` / `strip_metadata()` /
+  `quality()` read the plan's sink-side settings; the execution context
+  is what every codec `convert` builds is granted (and the executor's
+  codecs through the job's `threads` key). Gateway-written stills hand
+  the same budget to an encoder that declares a `threads` option (heif),
+  since the gateway has no execution-context hook.
+- Filter ops run on a layout the filters take: a source decoding to a
+  JPEG-range or deep YCbCr (HEIC), a palette or a 16-bit layout is
+  converted ahead of the first filter op (grey → `Gray8`, alpha or
+  palette → `Rgba`, else `Rgb24`, with a `convert: note:`), so
+  `convert in.heic -resize 50% out.png` works instead of failing on the
+  filter's layout check.
 - The output codec is resolved through the gateway's `resolve_target`:
   the requested format name picks the codec on a multi-brand container
   (`.avif` is the `avif` encoder, `.heic` the `heif` one).
