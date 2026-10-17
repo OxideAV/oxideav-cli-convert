@@ -778,6 +778,41 @@ fn finish_job(
         sink.codec_params["format"] = json!(f);
     }
 
+    // A sequence-brand output (`.heics` / `.heifs` / `.avifs`) fed by a
+    // timed source codes that source's frames as a video track for the
+    // sequence muxer; the still encoder the extension resolves to
+    // would refuse the second picture.
+    if plan.output_template.is_none() {
+        if let Some((codec, ordinal)) = sequence_output(plan, ctx, &sink, probed.as_deref()) {
+            let mut notes = Vec::new();
+            notes.push(format!(
+                "convert: note: '{}' is an image sequence; coding the frames of video stream #{ordinal} as {codec} into its track",
+                plan.output
+            ));
+            let track = TrackSpec {
+                input: chain,
+                codec: Some(codec.to_string()),
+                params: sink.codec_params,
+                stream_selector: Some(video_selector(ordinal)),
+            };
+            let job = single_output_job(
+                &plan.output,
+                OutputSpec {
+                    audio: vec![],
+                    video: vec![track],
+                    subtitle: vec![],
+                    all: vec![],
+                },
+                sink.threads,
+            )?;
+            return Ok(Planned {
+                job,
+                notes,
+                tap: None,
+            });
+        }
+    }
+
     // The pipeline insists every filter-terminated track carry an
     // output codec — frames can't be stream-copied.  Infer from the
     // output extension (or `-format` override) so the IM-style
@@ -802,9 +837,21 @@ fn finish_job(
     let wants_tap = fanout || !options.is_empty();
 
     let mut notes = Vec::new();
-    let still = probed
-        .as_deref()
-        .and_then(|streams| still_input(plan, ctx, streams, codec.as_deref(), fanout, &mut notes));
+    let timed_output = !fanout
+        && out_ext
+            .as_deref()
+            .is_some_and(image_sink::is_timed_still_output);
+    let still = probed.as_deref().and_then(|streams| {
+        still_input(
+            plan,
+            ctx,
+            streams,
+            codec.as_deref(),
+            fanout,
+            timed_output,
+            &mut notes,
+        )
+    });
 
     let (job, tap) = match (still, wants_tap) {
         // Every still output `convert` can size runs through its own
@@ -1046,12 +1093,16 @@ fn single_output_job(key: &str, out: OutputSpec, threads: Option<usize>) -> Resu
 /// output is not an image encoder or the input's stream list cannot
 /// be read from its header (the caller then keeps the historical job
 /// shape).
+///
+/// `timed_output` (an animation format such as GIF): like a fan-out,
+/// the image-sequence track is taken over the cover still.
 fn still_input(
     plan: &ConvertPlan,
     ctx: &RuntimeContext,
     probed: &[StreamInfo],
     codec: Option<&str>,
     fanout: bool,
+    timed_output: bool,
     notes: &mut Vec<String>,
 ) -> Option<StillInput> {
     let accepted = image_sink::encoder_accepted_formats(ctx, codec?)?;
@@ -1063,13 +1114,14 @@ fn still_input(
     if streams.is_empty() {
         return None;
     }
-    let ordinal = if fanout {
+    let takes_track = fanout || timed_output;
+    let ordinal = if takes_track {
         image_sink::fanout_stream(&streams)
     } else {
         image_sink::still_stream(&streams)
     };
     if streams.len() > 1 {
-        notes.push(if fanout {
+        notes.push(if takes_track {
             format!(
                 "convert: note: '{}' has {} video streams; writing the frames of video stream #{ordinal}",
                 plan.input,
@@ -1155,6 +1207,32 @@ fn still_job(
         },
         sink.threads,
     )
+}
+
+/// The track codec and source video-stream ordinal for a
+/// sequence-brand output fed by a timed source ([`image_sink::sequence_codec`]):
+/// the first timed video stream (never the cover still). `None` when
+/// the output is not a sequence brand, the codec has no encoder, or
+/// the input has no timed video stream (a still into `.heics` is a
+/// still).
+fn sequence_output(
+    plan: &ConvertPlan,
+    ctx: &RuntimeContext,
+    sink: &SinkSide,
+    probed: Option<&[StreamInfo]>,
+) -> Option<(&'static str, usize)> {
+    let ext = sink
+        .format_override
+        .clone()
+        .or_else(|| ext_of(&plan.output).map(str::to_string))?;
+    let codec = image_sink::sequence_codec(&ext, ctx)?;
+    let video: Vec<StreamInfo> = probed?
+        .iter()
+        .filter(|s| s.params.media_type == MediaType::Video)
+        .cloned()
+        .collect();
+    let ordinal = video.iter().position(|s| !image_sink::is_still(s))?;
+    Some((codec, ordinal))
 }
 
 /// Whether [`tap_job`] can write this still output: the source

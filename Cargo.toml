@@ -121,3 +121,10 @@ oxideav-webp = "0.3"
 oxideav-gif = "0.0"
 oxideav-tiff = "0.0"
 oxideav-qoi = "0.1"
+# HEIF-family targets (`.heic` HEVC stills, `.avif` through the `avif`
+# encoder on the heif muxer, `.heics` sequences): the production path
+# the gateway's codec pick, metadata carriage and quality ladder are
+# proved on.
+oxideav-heif = "0.0"
+oxideav-avif = "0.0"
+oxideav-h265 = "0.0"

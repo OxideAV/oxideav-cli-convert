@@ -323,6 +323,27 @@ pub fn resolve_output_codec(
 /// different id.
 const CONTAINER_CODEC_ALIASES: &[(&str, &str)] = &[("jpeg", "mjpeg")];
 
+/// Output extensions that name an *image sequence* brand of the HEIF
+/// family, with the track codec a timed input is coded as: the
+/// still-image encoder the container resolves to writes one picture
+/// per file, so a timed source goes to the sequence muxer as a video
+/// track instead (see [`sequence_codec`]).
+const SEQUENCE_BRANDS: &[(&str, &str)] = &[("heics", "hevc"), ("heifs", "hevc"), ("avifs", "av1")];
+
+/// The track codec for a sequence-brand output extension (`heics` /
+/// `heifs` → `hevc`, `avifs` → `av1`) when that encoder is registered;
+/// `None` for every other extension, or when the codec has no encoder
+/// (the still path then applies and the muxer reports what it cannot
+/// append).
+pub fn sequence_codec(ext: &str, ctx: &RuntimeContext) -> Option<&'static str> {
+    let ext = ext.to_ascii_lowercase();
+    SEQUENCE_BRANDS
+        .iter()
+        .find(|(e, _)| *e == ext)
+        .map(|(_, c)| *c)
+        .filter(|c| ctx.codecs.has_encoder(&CodecId::new(*c)))
+}
+
 /// Accepted input layouts of the encoder the pipeline will build for
 /// `codec`: the preferred implementation (lowest priority value, then
 /// earliest registration — the selection walk's first candidate).
@@ -440,6 +461,21 @@ pub fn fanout_stream(streams: &[StreamInfo]) -> usize {
         return 0;
     }
     streams.iter().position(|s| !is_still(s)).unwrap_or(0)
+}
+
+/// Still-image output extensions whose file is a *timed* sequence of
+/// pictures (an animation): fed by an input with an image-sequence
+/// track, they take the track's frames — like a `%d` fan-out and like
+/// a video output — rather than the cover still a single-picture
+/// output takes.
+const TIMED_STILL_EXTENSIONS: &[&str] = &["gif", "apng"];
+
+/// True when a still-image output with extension `ext` is a timed
+/// sequence (see [`TIMED_STILL_EXTENSIONS`]).
+pub fn is_timed_still_output(ext: &str) -> bool {
+    TIMED_STILL_EXTENSIONS
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(ext))
 }
 
 /// Video-stream ordinal a single still output writes: the first still

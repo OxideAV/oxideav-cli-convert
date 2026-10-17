@@ -47,6 +47,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for transparent entries on an alpha target, and compositing over
   `-background` (opaque white by default) on a target without alpha,
   where the gateway's own views would drop the transparency.
+- Sequence-brand outputs (`.heics` / `.heifs` → HEVC track, `.avifs` →
+  AV1 track) fed by a timed source code its frames as a video track for
+  the heif sequence muxer (`convert anim.gif out.heics`), where the still
+  encoder refused the second picture. Animation outputs (`.gif`, `.apng`)
+  from an input with an image-sequence track take the track's frames,
+  like a `%d` fan-out and like a video output; a single-picture output
+  keeps the primary still (r475 ruling).
+- HEIF-family coverage through the released `oxideav-heif` /
+  `oxideav-avif` / `oxideav-h265` (dev-dependencies): the codec pick,
+  ICC / Exif through HEIC → HEIC and AVIF → HEIC with `-strip`, monotone
+  `-quality` size ladders on textured content for HEIC / AVIF / JPEG,
+  budget-independent bytes, `-quality` parity with the gateway, and the
+  `.heics` stream rules.
 - The output codec is resolved through the gateway's `resolve_target`:
   the requested format name picks the codec on a multi-brand container
   (`.avif` is the `avif` encoder, `.heic` the `heif` one).
