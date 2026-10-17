@@ -354,3 +354,79 @@ fn palette_alpha_is_composited_for_a_target_without_alpha() {
     assert_eq!(&px[6..8], &[127, 128], "half green over red");
     assert_eq!(r.muxer_blob_kinds(), ["icc"]);
 }
+
+#[test]
+fn source_aware_resize_modes_resolve_against_the_input_geometry() {
+    let dir = temp_dir("geometry");
+    let src = rgb_source(&dir, "in.tprobe", vec![]); // 6 × 4
+    let size = |args: &[&str]| {
+        let out = dir.join(format!(
+            "{}.tprobe",
+            args.join("_").replace(['%', '>', '<', '^', '@', '!'], "x")
+        ));
+        let mut v = vec![s(&src)];
+        v.extend_from_slice(args);
+        v.push(s(&out));
+        convert(&v).unwrap();
+        let r = Report::read(&out);
+        (
+            r.frame()["width"].as_u64().unwrap(),
+            r.frame()["height"].as_u64().unwrap(),
+        )
+    };
+    assert_eq!(size(&["-resize", "50%"]), (3, 2), "percent of the source");
+    assert_eq!(
+        size(&["-resize", "3x3"]),
+        (3, 2),
+        "default keeps the aspect"
+    );
+    assert_eq!(size(&["-resize", "3x3!"]), (3, 3), "force is literal");
+    assert_eq!(size(&["-resize", "100x100>"]), (6, 4), "shrink only");
+    assert_eq!(size(&["-resize", "12x12<"]), (12, 8), "grow only");
+    assert_eq!(size(&["-resize", "3x3^"]), (5, 3), "fill covers the box");
+    assert_eq!(size(&["-resize", "3x2@"]), (3, 2), "area");
+    assert_eq!(
+        size(&["-crop", "4x4+0+0", "-resize", "50%"]),
+        (2, 2),
+        "percent of the cropped geometry"
+    );
+    assert_eq!(size(&["-thumbnail", "50%"]), (3, 2));
+    use oxideav_cli_convert::{Op, ResizeMode};
+    let ops = vec![
+        Op::Resize {
+            width: 50,
+            height: 50,
+            mode: ResizeMode::Percent,
+        },
+        Op::Trim { fuzz: 0 },
+        Op::Resize {
+            width: 50,
+            height: 50,
+            mode: ResizeMode::Percent,
+        },
+    ];
+    let resolved = oxideav_cli_convert::plan_to_job::resolve_geometry_ops(&ops, Some((100, 60)));
+    assert!(matches!(
+        resolved[0],
+        Op::Resize {
+            width: 50,
+            height: 30,
+            mode: ResizeMode::Force
+        }
+    ));
+    assert!(
+        matches!(
+            resolved[2],
+            Op::Resize {
+                width: 50,
+                height: 50,
+                mode: ResizeMode::Percent
+            }
+        ),
+        "unknown after -trim"
+    );
+    assert_eq!(
+        oxideav_cli_convert::plan_to_job::resolve_geometry_ops(&ops, None).len(),
+        3
+    );
+}

@@ -310,3 +310,46 @@ fn convert_quality_matches_the_gateway_quality() {
         g.primary().to_rgb8().unwrap()
     );
 }
+
+/// `.avif` without `-quality` is a lossy photo (the `convert` default,
+/// quality 60, the HEIF encoder's own AV1 default) — the `avif`
+/// encoder's own default is lossless; `-quality 100` asks for that.
+#[test]
+fn avif_defaults_to_a_lossy_quality() {
+    let dir = temp_dir("avifdefault");
+    let png = write_png(&dir, "in.png", &textured(96, 64));
+    let plain = dir.join("plain.avif");
+    let q60 = dir.join("q60.avif");
+    let lossless = dir.join("q100.avif");
+    convert(&[s(&png), s(&plain)]).unwrap();
+    convert(&[s(&png), "-quality", "60", s(&q60)]).unwrap();
+    convert(&[s(&png), "-quality", "100", s(&lossless)]).unwrap();
+    assert_eq!(
+        fs::read(&plain).unwrap(),
+        fs::read(&q60).unwrap(),
+        "default = quality 60"
+    );
+    assert!(
+        fs::metadata(&plain).unwrap().len() * 2 < fs::metadata(&lossless).unwrap().len(),
+        "the default is far from lossless"
+    );
+    let src = oxideav_image::open(&ctx(), &png)
+        .unwrap()
+        .into_primary()
+        .to_rgb8()
+        .unwrap();
+    let back = oxideav_image::open(&ctx(), &lossless)
+        .unwrap()
+        .into_primary()
+        .to_rgb8()
+        .unwrap();
+    assert_eq!(src, back, "quality 100 is lossless");
+    assert_eq!(
+        oxideav_cli_convert::image_sink::default_quality("avif"),
+        Some(60)
+    );
+    assert_eq!(
+        oxideav_cli_convert::image_sink::default_quality("heif"),
+        None
+    );
+}

@@ -11,7 +11,9 @@
 
 use crate::frame_tap::{TapSpec, TAP_SINK};
 use crate::image_sink::{self, LayoutHint};
-use crate::op::{ConvertPlan, Dither, Mesh3DOptions, Mesh3DRenderMode, Op, ProjectionMode};
+use crate::op::{
+    ConvertPlan, Dither, Mesh3DOptions, Mesh3DRenderMode, Op, ProjectionMode, ResizeMode,
+};
 use indexmap::IndexMap;
 use oxideav_core::{Error, MediaType, PixelFormat, RuntimeContext, StreamInfo};
 use oxideav_pipeline::schema::{ConvertNode, StreamSelector};
@@ -84,8 +86,27 @@ pub(crate) fn plan_pipeline(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<
     let source = TrackInput::Source(SourceRef {
         from: plan.input.clone(),
     });
+    // Source-aware resize geometry (`50%`, `>`/`<`, `^`, `@`, and the
+    // aspect-preserving default) is resolved against the input's
+    // geometry here, where the container header is known; the
+    // pipeline's resize filter takes literal dimensions.
+    let source_dims = probed.as_deref().and_then(|streams| {
+        let video: Vec<&StreamInfo> = streams
+            .iter()
+            .filter(|s| s.params.media_type == MediaType::Video)
+            .collect();
+        let ordinal = if plan.output_template.is_some() {
+            image_sink::fanout_stream(&video.iter().map(|s| (*s).clone()).collect::<Vec<_>>())
+        } else {
+            image_sink::still_stream(&video.iter().map(|s| (*s).clone()).collect::<Vec<_>>())
+        };
+        video
+            .get(ordinal)
+            .and_then(|s| s.params.width.zip(s.params.height))
+    });
+    let ops = resolve_geometry_ops(&plan.ops, source_dims);
     let lower_all = |mut chain: TrackInput, sink: &mut SinkSide| {
-        for op in &plan.ops {
+        for op in &ops {
             chain = lower_op(chain, op, sink, false);
         }
         chain
@@ -130,6 +151,89 @@ pub(crate) fn plan_pipeline(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<
     notes.append(&mut planned.notes);
     planned.notes = notes;
     Ok(planned)
+}
+
+/// `ops` with every `-resize` / `-thumbnail` whose mode depends on the
+/// source geometry (`Default` fit, `Fill`, `Shrink`, `Grow`, `Percent`,
+/// `Area`) resolved to literal dimensions (`Force`) against `source`
+/// — the input's geometry, carried through the ops that change it
+/// (`-crop`, `-extent`, a 90° `-rotate`, earlier resizes). Without a
+/// known geometry (no probe, or after `-trim`) the ops are returned
+/// unchanged and the pipeline's resize applies its literal reading.
+pub fn resolve_geometry_ops(ops: &[Op], source: Option<(u32, u32)>) -> Vec<Op> {
+    let mut dims = source;
+    ops.iter()
+        .map(|op| match op {
+            Op::Resize {
+                width,
+                height,
+                mode,
+            } => {
+                let (w, h, m) = resolve_resize(*width, *height, *mode, &mut dims);
+                Op::Resize {
+                    width: w,
+                    height: h,
+                    mode: m,
+                }
+            }
+            Op::Thumbnail {
+                width,
+                height,
+                mode,
+            } => {
+                let (w, h, m) = resolve_resize(*width, *height, *mode, &mut dims);
+                Op::Thumbnail {
+                    width: w,
+                    height: h,
+                    mode: m,
+                }
+            }
+            Op::Crop { w, h, .. } => {
+                dims = Some((*w, *h));
+                op.clone()
+            }
+            Op::Extent { width, height, .. } => {
+                dims = Some((*width, *height));
+                op.clone()
+            }
+            Op::Rotate { degrees } => {
+                if degrees.rem_euclid(180) == 90 {
+                    dims = dims.map(|(w, h)| (h, w));
+                } else if degrees.rem_euclid(90) != 0 {
+                    dims = None;
+                }
+                op.clone()
+            }
+            Op::Trim { .. } => {
+                dims = None;
+                op.clone()
+            }
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// One resize against the running geometry: literal `Force` output
+/// when the geometry is known (and the geometry becomes the output),
+/// the request unchanged otherwise.
+fn resolve_resize(
+    width: u32,
+    height: u32,
+    mode: ResizeMode,
+    dims: &mut Option<(u32, u32)>,
+) -> (u32, u32, ResizeMode) {
+    match (*dims, mode) {
+        (_, ResizeMode::Force) => {
+            *dims = Some((width, height));
+            (width, height, ResizeMode::Force)
+        }
+        (Some((sw, sh)), m) => {
+            let (w, h) = m.resolve(width, height, sw, sh);
+            *dims = Some((w, h));
+            (w, h, ResizeMode::Force)
+        }
+        (None, m) => (width, height, m),
+    }
 }
 
 /// Layouts the `oxideav-image-filter` filters operate on (its

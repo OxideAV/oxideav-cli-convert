@@ -60,6 +60,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-quality` size ladders on textured content for HEIC / AVIF / JPEG,
   budget-independent bytes, `-quality` parity with the gateway, and the
   `.heics` stream rules.
+- Source-aware `-resize` / `-thumbnail` geometry (`50%`, `WxH>` / `<`,
+  `^`, `@`, and the aspect-preserving default) is resolved against the
+  input's geometry at plan time — carried through `-crop`, `-extent`,
+  90° `-rotate` and earlier resizes — so `convert in.heic -resize 50%
+  out.png` halves the picture instead of writing a 50 × 50 one (the
+  pipeline's resize filter reads literal dimensions).
+- `.avif` without `-quality` is written at quality 60 (the HEIF encoder's
+  own AV1 default; `-quality 100` is lossless): the `avif` encoder the
+  gateway now picks for the extension defaults to lossless, which made a
+  12 MP photo a 20 MB file.
 - The output codec is resolved through the gateway's `resolve_target`:
   the requested format name picks the codec on a multi-brand container
   (`.avif` is the `avif` encoder, `.heic` the `heif` one).

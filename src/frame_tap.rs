@@ -292,7 +292,10 @@ impl OpenFile {
         params.pixel_format = Some(spec.frame_format);
         params.frame_rate = spec.stream.params.frame_rate;
         let mut options = CodecOptions::new();
-        if let Some(q) = spec.quality {
+        let quality = spec
+            .quality
+            .or_else(|| crate::image_sink::default_quality(&spec.codec));
+        if let Some(q) = quality {
             let declared = ctx
                 .codecs
                 .encoder_options_schema(&codec_id)

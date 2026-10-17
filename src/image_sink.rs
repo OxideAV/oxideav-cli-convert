@@ -254,6 +254,20 @@ pub fn chroma_subsampled_default(
     (takes && oxideav_pixfmt::supports(src, target)).then_some(target)
 }
 
+/// The `quality` `convert` writes with when the user gave none and
+/// the encoder's default would not be what a `convert` user expects
+/// of the format: the `avif` encoder defaults to lossless (a 12 MP
+/// photo becomes a 20 MB file); `convert` writes AVIF at quality 60,
+/// the same default the HEIF encoder applies to its AV1 items, so
+/// `.avif` output is a lossy photo format by default and `-quality
+/// 100` asks for lossless. Every other encoder keeps its own default.
+pub fn default_quality(codec: &str) -> Option<u8> {
+    match codec {
+        "avif" => Some(60),
+        _ => None,
+    }
+}
+
 /// Resolve the output codec for `output` (or the `-format` override).
 ///
 /// The container registered for the extension names the codec for
