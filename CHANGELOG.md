@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.8...v0.0.9) - 2026-10-17
+
+### Other
+
+- the still-image writer keeps the I/O class when the output file cannot be created
+- README — the still-image contract (stream, codec, layout, quality, metadata, palette alpha, budget, restrictions), the 12 MP budgets table before/after with library and gateway timings; gateway_timing example
+- source-aware resize modes resolve against the input geometry at plan time (50% was 50x50 on the pipeline route); .avif defaults to quality 60 now that the avif encoder (lossless by default) is the pick
+- sequence-brand outputs take a timed source as an HEVC / AV1 track, animation outputs take the image-sequence track; HEIF-family tests through heif / avif / h265 (codec pick, blob chain, quality ladders, budget parity, .heics rules)
+- palette alpha rides to palette targets and is expanded by the writer otherwise — alpha on alpha targets, composited over -background on targets without alpha
+- allow / deny lists on the plan (gateway OpenOptions + pipeline header probe, typed restricted refusals), plan-level budget / strip / quality accessors, filter ops get a layout the filters take
+- the frame tap writes every sizable still output — schema-gated quality, stream + frame metadata blobs with the gateway's precedence, -strip, the thread budget; codec resolved through oxideav-image::resolve_target
+- JPEG from packed RGB is 4:2:0 YCbCr on a layout-declaring encoder (4:4:4 from quality 90); deterministic thread-budget test through a test-only probe format
+
 ### Added
 
 - Every still-image output whose source layout is declared is written by
