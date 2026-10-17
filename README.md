@@ -16,16 +16,18 @@ the rest of the workspace already knows how to do.
 
 | Op | Notes |
 |---|---|
-| `-resize WxH[!]` | bilinear; `!` skips aspect-ratio preservation |
+| `-resize WxH[!>^<@]` / `N%` | bilinear; the source-aware modes (`%`, `>` shrink-only, `<` grow-only, `^` fill, `@` area, and the aspect-preserving default) are resolved against the input's geometry at plan time, carried through `-crop` / `-extent` / 90° `-rotate` / earlier resizes; `!` is literal |
 | `-blur RxS` | Gaussian; `S` = sigma (defaults to `R/2`) |
 | `-edge R` | Sobel magnitude |
 | `-colors N` + `-dither {none\|bayer\|floyd_steinberg}` | palette quantisation via `pixfmt → Pal8` |
 | `-format FMT` | bypass extension-based codec/container detection |
-| `-quality N` | `0..=100`; forwarded to the sink codec when supported (JPG, WebP, …); out-of-range values reject at parse time |
+| `-quality N` | `0..=100`; the encoder's `quality` option exactly when its declared schema has one (JPEG, HEIC, AVIF, TIFF, …; the gateway's `SaveOptions::quality` rule); `--opt quality=` stays explicit; `.avif` defaults to 60 (lossy; `100` = lossless); out-of-range values reject at parse time |
 | `-depth 8\|16` | output bit depth per channel for still-image outputs (a 10-bit HEIC → `-depth 8` → 8-bit PNG); without it the source's own depth is kept when the encoder can carry it |
-| `-threads N` | thread budget for the pipeline route and the `--opt` encoder (`0` = auto, the default) |
+| `-threads N` | the plan's execution budget (`ConvertPlan::execution_context`): the executor's decoders and filters, the still-image writer's encoder, and a gateway-written still's encoder through its `threads` option (heif); `0` = auto (the host's parallelism, the default) |
 | `--opt KEY=VALUE` | encoder option for still-image outputs, repeatable; validated against the target encoder's declared options (`oxideav info <codec>`), unknown keys / ill-typed values are typed errors |
-| `-strip` | drop metadata on write |
+| `-strip` | write no metadata blobs (ICC / Exif / XMP, stream level or per picture); `-thumbnail` implies it |
+| `--allow-containers L` / `--deny-containers L` | input restriction: comma lists of container names (deny wins, case-insensitive), checked on the header probe before any decoder exists; a refusal is `Error::Unsupported` with a `convert: restricted:` message (`restrict::is_restricted`) |
+| `--allow-codecs L` / `--deny-codecs L` | the same over every video stream's codec id (the gateway's `OpenOptions` lists on the side-channels) |
 | `-density N` | DPI for vector→raster (default 72; PDF / SVG inputs only) |
 | `-background COLOR` | canvas + alpha-flatten background (CSS L3 named + `#hex` 3/4/6/8) |
 | `-alpha {on\|off\|activate\|deactivate\|remove\|set\|opaque\|transparent}` | full alpha-op grammar |
@@ -199,34 +201,98 @@ Multiple `%d`s, `%s`, `%x`, etc. are rejected with a precise error.
 
 When the output resolves to an image encoder (`png`, `ppm`/`pgm`/
 `pbm`/`pam`, `heic`, `avif`, `tga`, `jpg`, …) the planner reads the
-input's container header (no decode) and plans three things the
-pipeline's generic defaults get wrong:
+input's container header (no decode) and plans what the pipeline's
+generic defaults get wrong, then hands the decoded frames to
+`convert`'s own encode + mux stage (`frame_tap`), which adopts the
+still-image contract the `oxideav-image` gateway documents:
 
 - **Which stream.** HEIF / AVIF files with an image-sequence track
-  open as stream 0 = the primary still plus one stream per track.
-  `convert seq.heics out.png` writes the primary still (with a stderr
-  note); `convert seq.heics frame-%03d.png` writes every frame of the
-  first image-sequence track. Single-video inputs are unaffected.
+  open as one still stream (the composed primary) plus one stream per
+  track, in container order. `convert seq.heics out.png` writes the
+  primary still (with a stderr note); `convert seq.heics frame-%03d.png`
+  writes every frame of the first image-sequence track; an animation
+  output (`.gif`, `.apng`) and a video output (`.mp4`, …) take the
+  track too. Streams are picked by shape (a still is one tick of a 1/1
+  time base), never by index. Single-video inputs are unaffected.
+- **Which codec.** The gateway's `resolve_target`: the requested format
+  name picks the codec on a multi-brand container (`.avif` is the
+  `avif` encoder, `.heic` the `heif` one, `.jpg` → `mjpeg`); `--opt
+  KEY=VALUE` sets any option the encoder declares, e.g. `convert in.png
+  --opt qp=30 --opt tiles=2x2 out.heic`. A sequence-brand output
+  (`.heics` / `.heifs`, `.avifs`) fed by a timed source codes the
+  source's frames as an HEVC (AV1) track for the sequence muxer:
+  `convert anim.gif out.heics`.
 - **Which encoder input layout.** For a plain conversion the encoder
   gets the accepted layout that loses nothing the source carries
-  (colour, alpha, bit depth) at the fewest bits per pixel — YUV →
-  PNG is RGB (the pipeline default was RGBA with a synthetic opaque
-  alpha: 33% more data through deflate), 10-bit YUV → PNG is 16-bit
-  RGB, and YUV → Netpbm is a real pixmap instead of a thresholded
-  1-bit bitmap. The Netpbm extensions pick their family (`.pbm`
-  bilevel, `.pgm` gray, `.ppm` colour without alpha; `.pam` any);
-  `-depth 8|16` caps or raises the depth.
-- **Which codec + options.** `.jpg` resolves to the `mjpeg` codec;
-  `.avif` writes AV1 (`codec=av1` on the `heif` encoder), `.heic`
-  HEVC; `--opt KEY=VALUE` sets any option the encoder declares, e.g.
-  `convert in.png --opt qp=30 --opt tiles=2x2 out.heic` or
-  `convert in.png --opt quality=90 out.avif`.
+  (colour, alpha, bit depth) at the fewest bits per pixel — YUV → PNG
+  is RGB, 10-bit YUV → PNG is 16-bit RGB, YUV → Netpbm a real pixmap;
+  a packed-RGB source → JPEG is 4:2:0 YCbCr (4:4:4 from `-quality 90`;
+  `--opt chroma=` / `sampling=` choose). The Netpbm extensions pick
+  their family; `-depth 8|16` caps or raises the depth. Filter ops run
+  on a layout the filters take: a source decoding to a JPEG-range or
+  10-bit YCbCr (HEIC), a palette or a 16-bit layout is converted
+  ahead of the first filter op (grey → `Gray8`, alpha / palette →
+  `Rgba`, else `Rgb24`, with a note).
+- **Quality.** `-quality N` is the encoder's `quality` option exactly
+  when its schema declares one (`SaveOptions::quality`); `.avif`
+  defaults to 60 so the `avif` encoder (lossless by default) writes a
+  photo-sized file; `-quality 100` is lossless there and on HEIC.
+- **Metadata.** The source stream's blobs (ICC / Exif / XMP, core
+  0.1.40) go on the encoder's parameters and on the muxer's stream; a
+  picture's own record stays on the frame, promoted ahead of the
+  stream's for the one-picture file it becomes (the gateway's
+  precedence). Whether the format embeds them is the encoder's
+  (`oxideav-heif` writes all three; see its README's survey for the
+  rest). `-strip` / `-thumbnail` withhold them all.
+- **Palette alpha.** A `Pal8` source reaches a palette-accepting
+  encoder with its palette and alpha records untouched; an encoder
+  without `Pal8` gets the picture expanded by the writer — alpha `0`
+  for transparent entries on an alpha target, composited over
+  `-background` (opaque white by default) on a target without alpha.
+- **Budget.** The plan's execution context (`-threads N`, else the
+  host's parallelism) reaches the executor's decoder and the writer's
+  encoder (`Encoder::set_execution_context`); the bytes never depend
+  on it.
+- **Restrictions.** `--allow-containers` / `--deny-containers` /
+  `--allow-codecs` / `--deny-codecs` refuse an input on its header
+  probe (container name, then every video stream's codec id) before
+  any decoder exists — the gateway's `OpenOptions` lists on the
+  side-channels, the same rules on the pipeline route.
 
-Encoder options and `%d` fan-out run through `convert`'s own encode +
-mux stage (`frame_tap`), fed decoded frames by the executor through
-the reserved `@out` sink; everything else stays a plain pipeline job.
-Both paths produce byte-identical files for the same encoder
-settings. `OXIDEAV_CONVERT_TIMING=1` prints per-stage timings.
+Outputs the writer cannot size (an undeclared source layout, a
+bit-packed `pbm` after filter ops) keep the executor's encode.
+`OXIDEAV_CONVERT_TIMING=1` prints per-stage timings. Library callers
+get the same knobs on `ConvertPlan` (`threads()`,
+`execution_context()`, `quality()`, `strip_metadata()`,
+`restrictions` / `with_restrictions`) and `plan_to_job` refuses a
+restricted input the same way.
+
+### Budgets: 12 MP (`oxideav convert`, round 477)
+
+The umbrella CLI as a black box (`cargo build -p oxideav-cli
+--release`, Apple M4 Max, 18 logical CPUs, macOS 26.6): `/usr/bin/time
+-l` wall and peak RSS of the whole process, best of two, over the
+4032×3024 iPhone 13 Pro Max device sample (`src.heic`), its PNG decode
+(`src.png`) and that PNG's AVIF (`src.avif`, quality 60). *Before* is
+the round-476 crate (the executor granted the budget already; `.avif`
+went through the heif encoder's AV1 items), *after* this round
+(`.avif` through the `avif` encoder, the gateway's pick). `library` is
+this crate's `run` in-process (`examples/gateway_timing.rs`); `gateway`
+is `oxideav-image` alone (open + encode), whose decoders run **serial**
+— the gateway has no execution-context hook (asked for; an encoder's
+`threads` option carries the budget meanwhile).
+
+| direction | before, auto | after, auto | after, `-threads 1` | library (auto) | gateway (auto) | peak RSS | output |
+|---|---|---|---|---|---|---|---|
+| AVIF → HEIC | 0.63 s | 0.64 s | 4.8 s | 0.62 s | 1.39 s (open 0.70 serial + encode 0.69) | 201 MiB | 1 531 099 B |
+| HEIC → PNG | 0.24 s | 0.23 s | 1.1 s | 0.17 s | 1.15 s (open 0.63 serial + encode 0.52 serial: png declares no `threads`) | 189 MiB | 14 618 082 B |
+| PNG → AVIF | 1.56 s (heif AV1, 758 267 B, 270 MiB) | 2.28 s | 8.9 s | 2.56 s | 2.52 s (open 0.30 + encode 2.22) | 641 MiB | 737 825 B |
+
+`convert in.heic -resize 50% out.png` (12 MP, previously refused on
+the filter's layout check, and `50%` read as 50 × 50 pixels): 0.17 s
+to a 1512 × 2016 PNG. The `avif` encoder at quality 60 costs 0.7 s and
+370 MiB more than the heif encoder's AV1 item for the same size — an
+`oxideav-avif` finding, reported.
 
 ### Where the time goes: 12 MP HEIC → PNG
 
@@ -490,13 +556,23 @@ carries test-pinned guarantees:
 
 - Multi-input (`convert in1.pdf in2.pdf out.gif`).
 - `-density` applied to raster inputs (silently dropped today).
-- `-quality` / `-define` on the pipeline route land in the job's
-  `codec_params`, which the pipeline does not forward to encoders;
-  `--opt quality=N` is the working channel for encoders that declare
-  a `quality` option.
-- The planned encoder layout applies to plain conversions (and to the
-  frame-tap path); with filter ops in between the pipeline's own
-  running-layout assumption decides.
+- `-define` on the pipeline route lands in the job's `codec_params`,
+  which the pipeline does not forward to encoders; `--opt KEY=VALUE`
+  is the channel for declared options.
+- The gateway has no execution-context hook: a gateway-written still
+  (PDF / 3D renders, the icon writer's input) decodes serially and its
+  encoder is budgeted only through a declared `threads` option.
+- Metadata through the registry is carried by `oxideav-heif` today;
+  the `avif` encoder, `png`, `mjpeg`, `webp`, `tiff`, `gif` do not
+  embed `params.blobs` yet (per-crate adoption), so HEIC → AVIF drops
+  the profile until `oxideav-avif` reads them.
+- `oxideav-image-filter`'s filters index every plane of a frame: a
+  frame carrying a metadata-blobs record ahead of its planes (a HEIF
+  item with Exif, through `-resize`) is a filter-side panic; the
+  filters also take no `YuvJ*` / 10-bit / palette layouts, which the
+  planner converts around.
+- `oxideav-webp`'s registry encoder declares no `quality` option, so
+  `-quality` does not reach a `.webp` output.
 - Registering PDF as a real `Demuxer` so `oxideav probe` /
   `transcode` / `run` see it. Today this side-channels through
   `convert` only.

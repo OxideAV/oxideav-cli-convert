@@ -70,6 +70,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own AV1 default; `-quality 100` is lossless): the `avif` encoder the
   gateway now picks for the extension defaults to lossless, which made a
   12 MP photo a 20 MB file.
+- `examples/gateway_timing.rs` and the README's *Budgets: 12 MP* table:
+  the three HEIF-family directions through the CLI, this crate's `run`
+  and the gateway alone (whose decoders run serial: no execution-context
+  hook there), before and after this round.
 - The output codec is resolved through the gateway's `resolve_target`:
   the requested format name picks the codec on a multi-brand container
   (`.avif` is the `avif` encoder, `.heic` the `heif` one).
