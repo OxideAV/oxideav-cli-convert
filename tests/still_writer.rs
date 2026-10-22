@@ -274,11 +274,14 @@ fn allow_and_deny_lists_refuse_before_any_decode() {
 }
 
 #[test]
-fn filter_ops_on_a_palette_source_run_in_rgba_and_keep_the_pick() {
-    // A `Pal8` source: the filters do not take it, so the planner
-    // converts it ahead of the first filter op (RGBA: palette entries
-    // may be transparent); the probe encoder accepts RGBA and gets the
-    // filtered picture.
+fn filter_ops_on_a_palette_source_follow_the_filters_declared_routes() {
+    // A `Pal8` source through a pointwise filter (`-negate`) takes the
+    // filter's palette route: the indices are untouched and the
+    // palette is negated, so a palette-accepting encoder gets the
+    // palette picture. A filter that is not pointwise (`-blur`) takes
+    // `Pal8` through its packed-RGB hop and emits RGBA (palette
+    // entries may be transparent). The planner inserts nothing in
+    // either case: the filters declare both routes.
     let dir = temp_dir("palfilter");
     let p = dir.join("in.tprobe");
     Source::packed(4, 4, PixelFormat::Pal8, |x, _| vec![(x % 2) as u8])
@@ -287,9 +290,16 @@ fn filter_ops_on_a_palette_source_run_in_rgba_and_keep_the_pick() {
     let out = dir.join("out.tprobe");
     convert(&[s(&p), "-negate", s(&out)]).unwrap();
     let r = Report::read(&out);
-    assert_eq!(r.format(), "Rgba");
-    // Negated red (255,0,0) → (0,255,255), alpha untouched.
-    assert_eq!(r.first_bytes()[..4], [0, 255, 255, 255]);
+    assert_eq!(r.format(), "Pal8");
+    assert_eq!(r.first_bytes()[..4], [0, 1, 0, 1], "indices untouched");
+    // Negated red (255,0,0) → (0,255,255), blue → yellow.
+    assert_eq!(r.palette_rgb().unwrap(), [0, 255, 255, 255, 255, 0]);
+
+    let blurred = dir.join("blur.tprobe");
+    convert(&[s(&p), "-blur", "1x0.5", s(&blurred)]).unwrap();
+    let r = Report::read(&blurred);
+    assert_eq!(r.format(), "Rgba", "the hop's layout");
+    assert_eq!(r.first_bytes()[3], 255, "opaque entries stay opaque");
     assert_eq!(
         oxideav_cli_convert::plan_to_job::filter_input_layout(PixelFormat::Pal8),
         Some(PixelFormat::Rgba)

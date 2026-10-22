@@ -561,6 +561,7 @@ impl Encoder for ProbeEncoder {
             "stride": planes.first().map(|p| p.stride),
             "first_bytes": first,
             "palette_len": palette_len,
+            "palette_rgb": vf.palette().map(|p| p.iter().take(6).copied().collect::<Vec<u8>>()),
             "palette_alpha": palette_alpha,
         });
         let mut pkt = Packet::new(0, TimeBase::new(1, 1), report.to_string().into_bytes());
@@ -690,6 +691,14 @@ impl Report {
 
     pub fn palette_len(&self) -> Option<usize> {
         self.frame()["palette_len"].as_u64().map(|n| n as usize)
+    }
+
+    /// The first two palette entries' RGB bytes, when the frame carried
+    /// a palette.
+    pub fn palette_rgb(&self) -> Option<Vec<u8>> {
+        self.frame()["palette_rgb"]
+            .as_array()
+            .map(|a| a.iter().map(|x| x.as_u64().unwrap() as u8).collect())
     }
 }
 
