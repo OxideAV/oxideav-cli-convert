@@ -289,9 +289,8 @@ fn save_options(
     ops: &[Op],
 ) -> Result<SaveOptions> {
     let mut opts = SaveOptions::new();
-    let codec = image_sink::resolve_output_codec(None, path, ctx);
-    let quality =
-        last_quality(ops).or_else(|| codec.as_deref().and_then(image_sink::default_quality));
+    let quality = last_quality(ops);
+    let codec = image_sink::resolve_output_codec_with(None, path, quality, ctx);
     if let Some(q) = quality {
         opts = opts.with_quality(q);
     }

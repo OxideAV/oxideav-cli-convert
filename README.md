@@ -228,11 +228,18 @@ still-image contract the `oxideav-image` gateway documents:
   is RGB, 10-bit YUV → PNG is 16-bit RGB, YUV → Netpbm a real pixmap;
   a packed-RGB source → JPEG is 4:2:0 YCbCr (4:4:4 from `-quality 90`;
   `--opt chroma=` / `sampling=` choose). The Netpbm extensions pick
-  their family; `-depth 8|16` caps or raises the depth. Filter ops run
-  on a layout the filters take: a source decoding to a JPEG-range or
-  10-bit YCbCr (HEIC), a palette or a 16-bit layout is converted
-  ahead of the first filter op (grey → `Gray8`, alpha / palette →
-  `Rgba`, else `Rgb24`, with a note).
+  their family; `-depth 8|16` caps or raises the depth. Filter ops
+  are planned on the filters' own declared layouts (`oxideav-image-
+  filter` 0.1.3, `accepted_pixel_formats` / `output_pixel_format`):
+  the running layout starts at what the stream decodes to and is
+  converted ahead of an op exactly when that op's filter refuses it
+  — to the declared layout that keeps what the source carries (grey
+  stays grey, alpha and palette transparency keep an alpha channel,
+  a deep source stays deep where the filter has a deep layout), with
+  a `convert: note:` naming the op. Every 8-bit layout (JPEG-range
+  YCbCr, palette, packed BGR, …) reaches every filter untouched
+  through the filter's own routes; the sink pick follows the layout
+  the chain emits. See *Filter layouts* below.
 - **Quality.** `-quality N` is the encoder's `quality` option exactly
   when its schema declares one (`SaveOptions::quality`); without it
   every encoder's own schema default applies — `.avif` is quality 60
@@ -271,6 +278,35 @@ get the same knobs on `ConvertPlan` (`threads()`,
 `execution_context()`, `quality()`, `strip_metadata()`,
 `restrictions` / `with_restrictions`) and `plan_to_job` refuses a
 restricted input the same way.
+
+### Filter layouts: which ops keep a deep source
+
+Planned from the filters' declarations (pinned by
+`filter_layouts::tests::deep_layout_table`): *kept* = the op runs on
+the deep layout and emits it; `A → B` = the planner converts to `A`
+ahead of the op (the filter's declared 8-bit route for that source)
+and the op emits `B`. `-resize` on a 16-bit PNG / TIFF stays 16-bit
+end to end; the pointwise colour ops narrow once and the rest of the
+chain stays 8-bit.
+
+| op | `Rgb48Le` | `Rgba64Le` | `Gray16Le` | `Yuv420P10Le` |
+|---|---|---|---|---|
+| `-resize` / `-thumbnail` | kept | kept | kept | kept |
+| `-crop` | kept | kept | kept | kept |
+| `-flip` / `-flop` | kept | kept | kept | kept |
+| `-roll` | kept | kept | kept | kept |
+| `-rotate 90` (quarter turns) | kept | kept | kept | kept |
+| `-rotate 30` (other angles) | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
+| `-extent` / `-trim` | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
+| `-blur` / `-sharpen` / `-unsharp` | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
+| `-negate` / `-gamma` / `-level` / `-threshold` | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
+| `-normalize` / `-equalize` / `-auto-gamma` | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
+| `-posterize` / `-solarize` | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
+| `-brightness-contrast` / `-contrast` | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
+| `-edge` | `Rgb24` → `Gray8` | `Rgba` → `Gray8` | `Gray8` → `Gray8` | `Rgb24` → `Gray8` |
+| `-sepia` / `-modulate` / `-colorize` / `-vignette` | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
+| `-colorspace gray` | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
+| `-colors` | → `Pal8` | → `Pal8` | → `Pal8` | → `Pal8` |
 
 ### Budgets: 12 MP (`oxideav convert`, round 477)
 
@@ -568,11 +604,10 @@ carries test-pinned guarantees:
   the `avif` encoder, `png`, `mjpeg`, `webp`, `tiff`, `gif` do not
   embed `params.blobs` yet (per-crate adoption), so HEIC → AVIF drops
   the profile until `oxideav-avif` reads them.
-- `oxideav-image-filter`'s filters index every plane of a frame: a
-  frame carrying a metadata-blobs record ahead of its planes (a HEIF
-  item with Exif, through `-resize`) is a filter-side panic; the
-  filters also take no `YuvJ*` / 10-bit / palette layouts, which the
-  planner converts around.
+- Filters without a declared deep layout (the colour and tonal
+  families) narrow a 16-bit / 10-bit source to 8 bits ahead of the
+  op (*Filter layouts* above); a deep path there is the filter
+  crate's to add — the planner follows the declarations.
 - `oxideav-webp`'s registry encoder declares no `quality` option, so
   `-quality` does not reach a `.webp` output.
 - Registering PDF as a real `Demuxer` so `oxideav probe` /

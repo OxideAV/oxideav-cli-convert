@@ -9,6 +9,7 @@
 //! an MP4) and dispatches filters to the matching `FilterKind` at
 //! DAG-build time.
 
+use crate::filter_layouts;
 use crate::frame_tap::{TapSpec, TAP_SINK};
 use crate::image_sink::{self, LayoutHint};
 use crate::op::{
@@ -105,52 +106,73 @@ pub(crate) fn plan_pipeline(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<
             .and_then(|s| s.params.width.zip(s.params.height))
     });
     let ops = resolve_geometry_ops(&plan.ops, source_dims);
-    let lower_all = |mut chain: TrackInput, sink: &mut SinkSide| {
-        for op in &ops {
-            chain = lower_op(chain, op, sink, false);
-        }
-        chain
-    };
-    let mut chain = lower_all(source.clone(), &mut sink);
     let mut notes = Vec::new();
 
-    // Filter ops run on a layout the filter crate handles. A source
-    // decoding to anything else (a JPEG-range or 10-bit YCbCr HEIC, a
-    // palette PNG, 16-bit RGB) is converted first — the filters, not
-    // the sink, decide this layout; the sink pick still applies to
-    // what the filters produce.
-    if !matches!(chain, TrackInput::Source(_)) {
-        let fanout = plan.output_template.is_some();
-        let src = probed.as_deref().and_then(|streams| {
-            let video: Vec<StreamInfo> = streams
-                .iter()
-                .filter(|s| s.params.media_type == MediaType::Video)
-                .cloned()
-                .collect();
-            let ordinal = if fanout {
-                image_sink::fanout_stream(&video)
-            } else {
-                image_sink::still_stream(&video)
-            };
-            video.get(ordinal).and_then(|s| s.params.pixel_format)
-        });
-        if let Some(target) = src.and_then(filter_input_layout) {
-            let wrapped = wrap_convert(source, target);
+    // Filter ops run on layouts the filters declare: the running
+    // layout starts at what the selected stream decodes to and is
+    // converted ahead of an op exactly when that op's filter refuses
+    // it (`filter_layouts`) — a deep, JPEG-range or palette source
+    // reaches every filter that takes it untouched, and the sink pick
+    // applies to the layout the chain emits.
+    let src_layout = probed.as_deref().and_then(|streams| {
+        let video: Vec<StreamInfo> = streams
+            .iter()
+            .filter(|s| s.params.media_type == MediaType::Video)
+            .cloned()
+            .collect();
+        let ordinal = if plan.output_template.is_some() {
+            image_sink::fanout_stream(&video)
+        } else {
+            image_sink::still_stream(&video)
+        };
+        video.get(ordinal).and_then(|s| s.params.pixel_format)
+    });
+    let (filtered_layout, narrowings) = match src_layout {
+        Some(src) => {
+            let (out, n) = filter_layouts::plan_layouts(src, &ops);
+            (Some(out), n)
+        }
+        None => (None, Vec::new()),
+    };
+    let mut chain = source;
+    for (i, op) in ops.iter().enumerate() {
+        if let Some(n) = narrowings.iter().find(|n| n.before_op == i) {
+            let wrapped = wrap_convert(chain, n.to);
             if wrapped.is_convert() {
-                sink = SinkSide::default();
-                chain = lower_all(wrapped, &mut sink);
                 notes.push(format!(
-                    "convert: note: filter ops run in {target:?} (the source decodes to {:?}, which the filters do not take)",
-                    src.expect("some")
+                    "convert: note: {} runs in {:?} (the frames are {:?}, which it does not take)",
+                    op_flag(op),
+                    n.to,
+                    n.from
                 ));
             }
+            chain = wrapped;
         }
+        chain = lower_op(chain, op, &mut sink, false);
     }
 
-    let mut planned = finish_job(plan, ctx, chain, sink, probed)?;
+    let mut planned = finish_job(plan, ctx, chain, sink, probed, filtered_layout)?;
     notes.append(&mut planned.notes);
     planned.notes = notes;
     Ok(planned)
+}
+
+/// The command-line flag an op came from, for notes (`-sepia`).
+fn op_flag(op: &Op) -> String {
+    let dbg = format!("{op:?}");
+    let name = dbg.split([' ', '{', '(']).next().unwrap_or("");
+    let mut flag = String::from("-");
+    for (i, ch) in name.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if i > 0 {
+                flag.push('-');
+            }
+            flag.push(ch.to_ascii_lowercase());
+        } else {
+            flag.push(ch);
+        }
+    }
+    flag
 }
 
 /// `ops` with every `-resize` / `-thumbnail` whose mode depends on the
@@ -338,7 +360,7 @@ pub fn plan_to_render3d_job(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<
         chain = lower_op(chain, op, &mut sink, true);
     }
 
-    finish_job(plan, ctx, chain, sink, None).map(|p| p.job)
+    finish_job(plan, ctx, chain, sink, None, None).map(|p| p.job)
 }
 
 /// Pull the render canvas dimensions from the op chain: the LAST
@@ -852,6 +874,18 @@ struct StillInput {
     streams: Vec<StreamInfo>,
     /// The output encoder's accepted layouts.
     accepted: Vec<PixelFormat>,
+    /// The layout the filter chain emits (the selected stream's own
+    /// when there are no filter ops), when the planner knows it.
+    filtered: Option<PixelFormat>,
+}
+
+impl StillInput {
+    /// The layout the frames reach the sink in: the filter chain's
+    /// output, else the selected stream's own.
+    fn sink_source_layout(&self) -> Option<PixelFormat> {
+        self.filtered
+            .or(self.streams[self.ordinal].params.pixel_format)
+    }
 }
 
 /// Shared tail for both planners: fold sink-side state into the codec
@@ -872,6 +906,7 @@ fn finish_job(
     chain: TrackInput,
     mut sink: SinkSide,
     probed: Option<Vec<StreamInfo>>,
+    filtered_layout: Option<PixelFormat>,
 ) -> Result<Planned, Error> {
     let probe_input = probed.is_some();
     // Sink-side metadata handling.
@@ -922,7 +957,12 @@ fn finish_job(
     // output extension (or `-format` override) so the IM-style
     // `convert in.png -resize 64x64 out.jpg` works without the user
     // stating the obvious.
-    let codec = codec_for_output(sink.format_override.as_deref(), &plan.output, ctx);
+    let codec = codec_for_output(
+        sink.format_override.as_deref(),
+        &plan.output,
+        sink.quality,
+        ctx,
+    );
 
     // Encoder options: `--opt` (validated against the encoder's
     // declared schema) plus the extension-implied ones (`.avif` ⇒
@@ -953,6 +993,7 @@ fn finish_job(
             codec.as_deref(),
             fanout,
             timed_output,
+            filtered_layout,
             &mut notes,
         )
     });
@@ -1200,6 +1241,7 @@ fn single_output_job(key: &str, out: OutputSpec, threads: Option<usize>) -> Resu
 ///
 /// `timed_output` (an animation format such as GIF): like a fan-out,
 /// the image-sequence track is taken over the cover still.
+#[allow(clippy::too_many_arguments)]
 fn still_input(
     plan: &ConvertPlan,
     ctx: &RuntimeContext,
@@ -1207,6 +1249,7 @@ fn still_input(
     codec: Option<&str>,
     fanout: bool,
     timed_output: bool,
+    filtered: Option<PixelFormat>,
     notes: &mut Vec<String>,
 ) -> Option<StillInput> {
     let accepted = image_sink::encoder_accepted_formats(ctx, codec?)?;
@@ -1243,6 +1286,7 @@ fn still_input(
         ordinal,
         streams,
         accepted,
+        filtered,
     })
 }
 
@@ -1351,7 +1395,7 @@ fn tap_can_write(
     sink: &SinkSide,
     codec: Option<&str>,
 ) -> bool {
-    let Some(src) = si.streams[si.ordinal].params.pixel_format else {
+    let Some(src) = si.sink_source_layout() else {
         return false;
     };
     if matches!(chain, TrackInput::Source(_)) {
@@ -1388,7 +1432,7 @@ fn tap_job(
 ) -> Result<(Job, TapSpec), Error> {
     let codec = codec.ok_or_else(|| Error::unsupported("convert: no output codec"))?;
     let stream = si.streams[si.ordinal].clone();
-    let src = stream.params.pixel_format.ok_or_else(|| {
+    let src = si.sink_source_layout().ok_or_else(|| {
         Error::unsupported(format!(
             "convert: '{}' does not declare the pixel layout of video stream #{}",
             plan.input, si.ordinal
@@ -1527,9 +1571,10 @@ fn ext_of(path: &str) -> Option<&str> {
 fn codec_for_output(
     format_override: Option<&str>,
     output: &str,
+    quality: Option<u8>,
     ctx: &RuntimeContext,
 ) -> Option<String> {
-    image_sink::resolve_output_codec(format_override, output, ctx)
+    image_sink::resolve_output_codec_with(format_override, output, quality, ctx)
 }
 
 #[cfg(test)]
@@ -1780,9 +1825,9 @@ mod tests {
     fn unknown_extension_returns_none() {
         // Empty context — no registrations, so every lookup is None.
         let ctx = empty_ctx();
-        assert!(codec_for_output(None, "out.jpg", &ctx).is_none());
-        assert!(codec_for_output(None, "out.mkv", &ctx).is_none());
-        assert!(codec_for_output(None, "out.unknown_ext_xyz", &ctx).is_none());
+        assert!(codec_for_output(None, "out.jpg", None, &ctx).is_none());
+        assert!(codec_for_output(None, "out.mkv", None, &ctx).is_none());
+        assert!(codec_for_output(None, "out.unknown_ext_xyz", None, &ctx).is_none());
     }
 
     #[test]
@@ -1795,12 +1840,12 @@ mod tests {
         let mut ctx = RuntimeContext::new();
         ctx.containers.register_extension("foo", "foo_codec");
         assert_eq!(
-            codec_for_output(None, "out.foo", &ctx).as_deref(),
+            codec_for_output(None, "out.foo", None, &ctx).as_deref(),
             Some("foo_codec")
         );
         // Case-insensitive on the input filename.
         assert_eq!(
-            codec_for_output(None, "OUT.FOO", &ctx).as_deref(),
+            codec_for_output(None, "OUT.FOO", None, &ctx).as_deref(),
             Some("foo_codec")
         );
     }
@@ -2583,12 +2628,12 @@ mod tests {
         // -format BAR with output that ends in something else still
         // lands on bar_codec.
         assert_eq!(
-            codec_for_output(Some("BAR"), "out.unrelated", &ctx).as_deref(),
+            codec_for_output(Some("BAR"), "out.unrelated", None, &ctx).as_deref(),
             Some("bar_codec")
         );
         // -format with no matching registration → None (caller can
         // surface a "use -format CODEC" hint).
-        assert!(codec_for_output(Some("nothing"), "out.unrelated", &ctx).is_none());
+        assert!(codec_for_output(Some("nothing"), "out.unrelated", None, &ctx).is_none());
     }
 
     // ---- plan_to_render3d_job coverage (Phase C-3b) ----

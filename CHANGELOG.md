@@ -25,6 +25,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Minimum siblings: `oxideav-core` 0.1.41, `oxideav-image` 0.0.5,
   `oxideav-image-filter` 0.1.3 (dev: `oxideav-heif` 0.0.13,
   `oxideav-avif` 0.0.16).
+- Filter ops are planned on the filters' declared layouts
+  (`filter_layouts`): each op is paired with the typed
+  `oxideav-image-filter` filter it lowers to, and the running layout
+  is converted ahead of an op exactly when that filter's
+  `accepted_pixel_formats` refuses it — to the declared layout that
+  keeps what the source carries (grey → `Gray8`, alpha / palette →
+  `Rgba`, deep → a deep layout where the filter has one), with a note
+  naming the op. `-resize` / `-crop` / `-flip` / `-flop` / `-roll` /
+  quarter-turn `-rotate` keep a 16-bit or 10-bit source end to end;
+  every 8-bit layout reaches every filter untouched (the filters' own
+  routes); the sink pick follows the layout the chain emits. Replaces
+  the blanket conversion of every non-classic layout ahead of the
+  first filter op (`plan_to_job::filter_input_layout` stays as the
+  historical helper).
+- `.webp` output resolves to the encoder the gateway picks from the
+  container's prefixed family (`webp_vp8l`, lossless; `webp_vp8` under
+  `-quality`) through `image_sink::resolve_output_codec_with`, so a
+  still goes through the writer; previously the source stream was
+  copied into the webp muxer, which refused it and left a 0-byte file.
 - `examples/convert_cli.rs`: `convert` as a standalone process over the
   formats the tests register, for `/usr/bin/time -l` budget runs; its
   exit status follows the umbrella CLI's table.

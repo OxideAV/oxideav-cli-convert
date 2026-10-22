@@ -187,6 +187,101 @@ fn rgb48_png_keeps_sixteen_bits() {
     assert_eq!(got.data, px, "rgb48 → png must be sample-exact");
 }
 
+/// Filter ops are planned on the filters' declared layouts: `-resize`
+/// takes 16-bit words natively, so a 16-bit PNG stays 16-bit end to
+/// end (no conversion node ahead of the filter, a 16-bit output); an
+/// op whose filter declares no deep layout (`-sepia-tone`) gets one
+/// conversion ahead of it, to the declared 8-bit layout that keeps
+/// what the source carries, and the sink pick follows the chain's
+/// output layout (an 8-bit PNG — nothing is widened back).
+#[test]
+fn resize_keeps_sixteen_bits_and_a_narrowing_filter_narrows_once() {
+    use oxideav_cli_convert::frame_tap::TAP_SINK;
+    use oxideav_pipeline::schema::TrackInput;
+    let dir = temp_dir("deep-filters");
+    let src = dir.join("in.png");
+    write_png(&src, PixelFormat::Rgb48Le, 24, 16, pattern(24, 16, 6));
+
+    let out = dir.join("resized.png");
+    convert(&[
+        src.to_str().unwrap(),
+        "-resize",
+        "12x8!",
+        out.to_str().unwrap(),
+    ]);
+    let got = read_png(&out);
+    assert_eq!(got.format, PixelFormat::Rgb48Le, "resize keeps 16 bits");
+    assert_eq!((got.width, got.height), (12, 8));
+    let plan = oxideav_cli_convert::args::parse(&[
+        src.to_str().unwrap().to_string(),
+        "-resize".into(),
+        "12x8!".into(),
+        out.to_str().unwrap().to_string(),
+    ])
+    .unwrap();
+    let job = oxideav_cli_convert::plan_to_job::plan_to_job(&plan, &ctx()).unwrap();
+    let f = job.outputs[TAP_SINK].video[0]
+        .input
+        .as_filter()
+        .expect("resize node");
+    assert!(
+        f.input.is_source(),
+        "no conversion ahead of a filter that takes the layout: {:?}",
+        f.input
+    );
+
+    let out = dir.join("sepia.png");
+    convert(&[
+        src.to_str().unwrap(),
+        "-sepia",
+        "80%",
+        out.to_str().unwrap(),
+    ]);
+    let got = read_png(&out);
+    assert_eq!(got.format, PixelFormat::Rgb24, "the chain emits 8-bit RGB");
+    let plan = oxideav_cli_convert::args::parse(&[
+        src.to_str().unwrap().to_string(),
+        "-sepia".into(),
+        "80%".into(),
+        out.to_str().unwrap().to_string(),
+    ])
+    .unwrap();
+    let job = oxideav_cli_convert::plan_to_job::plan_to_job(&plan, &ctx()).unwrap();
+    let f = job.outputs[TAP_SINK].video[0]
+        .input
+        .as_filter()
+        .expect("sepia node");
+    let conv = match f.input.as_ref() {
+        TrackInput::Convert(c) => c,
+        other => panic!("one conversion ahead of sepia, got {other:?}"),
+    };
+    assert_eq!(conv.convert, "rgb24");
+    assert!(conv.input.is_source());
+
+    // A deep grey picture through a classic filter goes to Gray8 (its
+    // declared grey route), never to RGB.
+    let gray = dir.join("gray16.png");
+    write_png(&gray, PixelFormat::Gray16Le, 8, 8, pattern(8, 8, 2));
+    let out = dir.join("negated.png");
+    convert(&[gray.to_str().unwrap(), "-negate", out.to_str().unwrap()]);
+    assert_eq!(read_png(&out).format, PixelFormat::Gray8);
+    // `-flip` takes the 16-bit words natively: the output is the same
+    // 16-bit layout the plain conversion writes (the encoder's pick for
+    // a `Gray16Le` source, whatever its declared set names).
+    let bare = dir.join("bare.png");
+    convert(&[gray.to_str().unwrap(), bare.to_str().unwrap()]);
+    let out = dir.join("flipped.png");
+    convert(&[gray.to_str().unwrap(), "-flip", out.to_str().unwrap()]);
+    let (bare, flipped) = (read_png(&bare), read_png(&out));
+    assert_eq!(flipped.format, bare.format, "flip keeps the plain pick");
+    assert_eq!(
+        oxideav_pixfmt::FormatInfo::of(flipped.format).bit_depth,
+        16,
+        "flip keeps 16 bits ({:?})",
+        flipped.format
+    );
+}
+
 /// Demux + decode the first video frame of `path` through the
 /// registry — the reference the YUV cases compare against.
 fn decode_first_frame(path: &PathBuf) -> (VideoFrame, PixelFormat, u32, u32) {
@@ -332,6 +427,75 @@ fn jpg_output_resolves_to_the_mjpeg_encoder() {
     let out = &job.outputs["out.jpg"];
     let track = out.all.first().or(out.video.first()).expect("one track");
     assert_eq!(track.codec.as_deref(), Some("mjpeg"));
+}
+
+/// `.webp`'s single-picture encoders are a prefixed family the gateway
+/// resolves (`webp_vp8l` lossless by default, `webp_vp8` under a
+/// `-quality`): the planner takes that pick as the still codec, so the
+/// output runs through the writer (previously the stream was copied
+/// into the webp muxer, which refused the source codec id).
+#[test]
+fn webp_output_resolves_to_the_gateway_prefixed_encoder() {
+    use oxideav_cli_convert::image_sink::resolve_output_codec_with;
+    let c = ctx();
+    assert_eq!(
+        resolve_output_codec_with(None, "out.webp", None, &c).as_deref(),
+        Some("webp_vp8l")
+    );
+    assert_eq!(
+        resolve_output_codec_with(None, "out.webp", Some(80), &c).as_deref(),
+        Some("webp_vp8")
+    );
+    let dir = temp_dir("webp");
+    let src = dir.join("in.png");
+    write_png(&src, PixelFormat::Rgba, 20, 12, pattern(20, 12, 4));
+    let lossless = dir.join("out.webp");
+    convert(&[src.to_str().unwrap(), lossless.to_str().unwrap()]);
+    let back = oxideav_image::open(&c, &lossless).unwrap().into_primary();
+    assert_eq!(back.to_rgba8().unwrap(), pattern(20, 12, 4), "lossless");
+    let lossy = dir.join("lossy.webp");
+    convert(&[
+        src.to_str().unwrap(),
+        "-quality",
+        "50",
+        lossy.to_str().unwrap(),
+    ]);
+    let back = oxideav_image::open(&c, &lossy).unwrap().into_primary();
+    assert_eq!((back.width(), back.height()), (20, 12));
+    assert_ne!(
+        fs::read(&lossless).unwrap(),
+        fs::read(&lossy).unwrap(),
+        "a quality picks the lossy encoder"
+    );
+    // `-quality N` reaches the lossy encoder exactly when its schema
+    // declares `quality` (the gateway's rule): then a low quality
+    // writes fewer bytes than a high one on texture; an encoder that
+    // declares none (webp_vp8 today) writes the same bytes for both.
+    let declares_quality = c
+        .codecs
+        .encoder_options_schema(&oxideav_core::CodecId::new("webp_vp8"))
+        .is_some_and(|schema| schema.iter().any(|f| f.name == "quality"));
+    let noisy = dir.join("noise.png");
+    write_noise_png(&noisy, 96, 64);
+    let (lo, hi) = (dir.join("q20.webp"), dir.join("q90.webp"));
+    convert(&[
+        noisy.to_str().unwrap(),
+        "-quality",
+        "20",
+        lo.to_str().unwrap(),
+    ]);
+    convert(&[
+        noisy.to_str().unwrap(),
+        "-quality",
+        "90",
+        hi.to_str().unwrap(),
+    ]);
+    let (lo, hi) = (fs::read(&lo).unwrap(), fs::read(&hi).unwrap());
+    if declares_quality {
+        assert!(lo.len() < hi.len(), "quality 20 < quality 90 in bytes");
+    } else {
+        assert_eq!(lo, hi, "no `quality` option: the quality cannot reach it");
+    }
 }
 
 fn convert_err(args: &[&str]) -> String {

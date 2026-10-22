@@ -283,6 +283,19 @@ pub fn resolve_output_codec(
     output: &str,
     ctx: &RuntimeContext,
 ) -> Option<String> {
+    resolve_output_codec_with(format_override, output, None, ctx)
+}
+
+/// [`resolve_output_codec`] with the plan's `-quality`, which picks
+/// the member of a container's prefixed encoder family the gateway
+/// resolves (`.webp` is `webp_vp8l`, lossless, unless a quality asks
+/// for the lossy `webp_vp8`).
+pub fn resolve_output_codec_with(
+    format_override: Option<&str>,
+    output: &str,
+    quality: Option<u8>,
+    ctx: &RuntimeContext,
+) -> Option<String> {
     let ext = format_override
         .map(|s| s.to_ascii_lowercase())
         .or_else(|| ext_of(output).map(|s| s.to_ascii_lowercase()))?;
@@ -300,13 +313,16 @@ pub fn resolve_output_codec(
         || CONTAINER_CODEC_ALIASES
             .iter()
             .any(|(c, codec)| *c == container && has_enc(codec));
+    let mut gateway_opts = oxideav_image::SaveOptions::default();
+    if let Some(q) = quality {
+        gateway_opts = gateway_opts.with_quality(q);
+    }
+    let gateway = oxideav_image::resolve_target(ctx, &ext, &gateway_opts)
+        .ok()
+        .filter(|t| has_enc(t.codec()) && encoder_accepted_formats(ctx, t.codec()).is_some());
     if image_format {
-        if let Ok(target) =
-            oxideav_image::resolve_target(ctx, &ext, &oxideav_image::SaveOptions::default())
-        {
-            if has_enc(target.codec()) {
-                return Some(target.codec().to_string());
-            }
+        if let Some(target) = &gateway {
+            return Some(target.codec().to_string());
         }
     }
     if has_enc(&container) {
@@ -321,6 +337,18 @@ pub fn resolve_output_codec(
     {
         if has_enc(codec) {
             return Some(codec.to_string());
+        }
+    }
+    // A container whose single-picture encoders are a prefixed family
+    // the gateway resolves (`webp` → `webp_vp8l` / `webp_vp8`), or a
+    // codec-only format: the gateway's pick is the still-image codec.
+    if let Some(target) = gateway {
+        let prefixed = target
+            .codec()
+            .strip_prefix(container.as_str())
+            .is_some_and(|rest| rest.starts_with('_'));
+        if target.is_codec_only() || prefixed {
+            return Some(target.codec().to_string());
         }
     }
     // A container that is not itself a codec (`.webm`, `.mkv`, `.wav`,
