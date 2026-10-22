@@ -23,7 +23,7 @@ the rest of the workspace already knows how to do.
 | `-format FMT` | bypass extension-based codec/container detection |
 | `-quality N` | `0..=100`; the encoder's `quality` option exactly when its declared schema has one (JPEG, HEIC, AVIF, TIFF, …; the gateway's `SaveOptions::quality` rule); `--opt quality=` stays explicit; `.avif` defaults to 60 (lossy; `100` = lossless); out-of-range values reject at parse time |
 | `-depth 8\|16` | output bit depth per channel for still-image outputs (a 10-bit HEIC → `-depth 8` → 8-bit PNG); without it the source's own depth is kept when the encoder can carry it |
-| `-threads N` | the plan's execution budget (`ConvertPlan::execution_context`): the executor's decoders and filters, the still-image writer's encoder, and a gateway-written still's encoder through its `threads` option (heif); `0` = auto (the host's parallelism, the default) |
+| `-threads N` | the plan's execution budget (`ConvertPlan::execution_context`): the executor's decoders and filters, the still-image writer's encoder, and every decoder / encoder of a gateway-written still (`OpenOptions` / `SaveOptions::with_execution_context`, `oxideav-image` 0.0.5); `0` = auto (the host's parallelism, the default) |
 | `--opt KEY=VALUE` | encoder option for still-image outputs, repeatable; validated against the target encoder's declared options (`oxideav info <codec>`), unknown keys / ill-typed values are typed errors |
 | `-strip` | write no metadata blobs (ICC / Exif / XMP, stream level or per picture); `-thumbnail` implies it |
 | `--allow-containers L` / `--deny-containers L` | input restriction: comma lists of container names (deny wins, case-insensitive), checked on the header probe before any decoder exists; a refusal is `Error::Unsupported` with a `convert: restricted:` message (`restrict::is_restricted`) |
@@ -234,9 +234,11 @@ still-image contract the `oxideav-image` gateway documents:
   ahead of the first filter op (grey → `Gray8`, alpha / palette →
   `Rgba`, else `Rgb24`, with a note).
 - **Quality.** `-quality N` is the encoder's `quality` option exactly
-  when its schema declares one (`SaveOptions::quality`); `.avif`
-  defaults to 60 so the `avif` encoder (lossless by default) writes a
-  photo-sized file; `-quality 100` is lossless there and on HEIC.
+  when its schema declares one (`SaveOptions::quality`); without it
+  every encoder's own schema default applies — `.avif` is quality 60
+  (a photo-sized file, the `avif` encoder's default since 0.0.16,
+  pinned by a test that reads the schema); `-quality 100` is lossless
+  there and on HEIC.
 - **Metadata.** The source stream's blobs (ICC / Exif / XMP, core
   0.1.40) go on the encoder's parameters and on the muxer's stream; a
   picture's own record stays on the frame, promoted ahead of the
@@ -251,8 +253,11 @@ still-image contract the `oxideav-image` gateway documents:
   `-background` (opaque white by default) on a target without alpha.
 - **Budget.** The plan's execution context (`-threads N`, else the
   host's parallelism) reaches the executor's decoder and the writer's
-  encoder (`Encoder::set_execution_context`); the bytes never depend
-  on it.
+  encoder (`Encoder::set_execution_context`), and every decoder and
+  encoder the gateway creates for a side-channel still (PDF / 3D
+  renders, the icon writer's input) through `OpenOptions` /
+  `SaveOptions::with_execution_context`; the bytes never depend on
+  it.
 - **Restrictions.** `--allow-containers` / `--deny-containers` /
   `--allow-codecs` / `--deny-codecs` refuse an input on its header
   probe (container name, then every video stream's codec id) before
@@ -559,9 +564,6 @@ carries test-pinned guarantees:
 - `-define` on the pipeline route lands in the job's `codec_params`,
   which the pipeline does not forward to encoders; `--opt KEY=VALUE`
   is the channel for declared options.
-- The gateway has no execution-context hook: a gateway-written still
-  (PDF / 3D renders, the icon writer's input) decodes serially and its
-  encoder is budgeted only through a declared `threads` option.
 - Metadata through the registry is carried by `oxideav-heif` today;
   the `avif` encoder, `png`, `mjpeg`, `webp`, `tiff`, `gif` do not
   embed `params.blobs` yet (per-crate adoption), so HEIC → AVIF drops

@@ -311,23 +311,47 @@ fn convert_quality_matches_the_gateway_quality() {
     );
 }
 
-/// `.avif` without `-quality` is a lossy photo (the `convert` default,
-/// quality 60, the HEIF encoder's own AV1 default) — the `avif`
-/// encoder's own default is lossless; `-quality 100` asks for that.
+/// `.avif` without `-quality` is a lossy photo: the `avif` encoder's
+/// own schema default (60 since `oxideav-avif` 0.0.16, the HEIF
+/// encoder's AV1 default) is what `convert` writes with, so `convert`
+/// sets no `quality` of its own. The test reads the default off the
+/// encoder's declared schema and pins it to the documented 60: a
+/// future change of the encoder's default fails here instead of
+/// silently changing what `convert in.png out.avif` writes.
 #[test]
-fn avif_defaults_to_a_lossy_quality() {
+fn avif_defaults_to_the_encoder_schema_quality() {
+    use oxideav_core::{CodecId, OptionValue};
+    let schema = ctx()
+        .codecs
+        .encoder_options_schema(&CodecId::new("avif"))
+        .expect("avif encoder schema");
+    let field = schema
+        .iter()
+        .find(|f| f.name == "quality")
+        .expect("avif declares quality");
+    let default = match &field.default {
+        OptionValue::U32(q) => *q,
+        other => panic!("avif quality default is not a u32: {other:?}"),
+    };
+    assert_eq!(default, 60, "the documented `convert` default for .avif");
+    assert_eq!(
+        oxideav_cli_convert::image_sink::default_quality("avif"),
+        None,
+        "convert pins no quality of its own on .avif any more"
+    );
+
     let dir = temp_dir("avifdefault");
     let png = write_png(&dir, "in.png", &textured(96, 64));
     let plain = dir.join("plain.avif");
-    let q60 = dir.join("q60.avif");
+    let at_default = dir.join("default.avif");
     let lossless = dir.join("q100.avif");
     convert(&[s(&png), s(&plain)]).unwrap();
-    convert(&[s(&png), "-quality", "60", s(&q60)]).unwrap();
+    convert(&[s(&png), "-quality", &default.to_string(), s(&at_default)]).unwrap();
     convert(&[s(&png), "-quality", "100", s(&lossless)]).unwrap();
     assert_eq!(
         fs::read(&plain).unwrap(),
-        fs::read(&q60).unwrap(),
-        "default = quality 60"
+        fs::read(&at_default).unwrap(),
+        "no -quality = the schema default"
     );
     assert!(
         fs::metadata(&plain).unwrap().len() * 2 < fs::metadata(&lossless).unwrap().len(),
@@ -344,12 +368,4 @@ fn avif_defaults_to_a_lossy_quality() {
         .to_rgb8()
         .unwrap();
     assert_eq!(src, back, "quality 100 is lossless");
-    assert_eq!(
-        oxideav_cli_convert::image_sink::default_quality("avif"),
-        Some(60)
-    );
-    assert_eq!(
-        oxideav_cli_convert::image_sink::default_quality("heif"),
-        None
-    );
 }

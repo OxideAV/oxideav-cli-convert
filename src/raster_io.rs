@@ -308,22 +308,11 @@ fn save_options(
     for (k, v) in image_sink::encoder_options(ctx, codec.as_deref(), Some(ext), &user)? {
         opts = opts.with_option(k, v);
     }
-    // The gateway has no execution-context hook: an encoder that
-    // declares a `threads` option (heif) is granted the plan's budget
-    // through it, unless the user set the option.
-    if let Some(c) = codec.as_deref() {
-        let declares_threads = ctx
-            .codecs
-            .encoder_options_schema(&CodecId::new(c))
-            .is_some_and(|schema| schema.iter().any(|f| f.name == "threads"));
-        if declares_threads && !opts.options.iter().any(|(k, _)| k == "threads") {
-            let threads = match last_threads(ops) {
-                Some(n) => n,
-                None => oxideav_core::ExecutionContext::auto().threads,
-            };
-            opts = opts.with_option("threads", threads.to_string());
-        }
-    }
+    // The plan's budget: the gateway hands it to every encoder it
+    // creates (`Encoder::set_execution_context`) and, where the
+    // encoder's schema declares a `threads` option the user did not
+    // set, through that option as well (`oxideav-image` 0.0.5).
+    opts = opts.with_execution_context(execution_context(ops));
     // Options can change the encoder's accepted layouts (a `codec`
     // option on a container encoder); the gateway's ladder handles
     // those. Otherwise pin the layout the pipeline route would pick.
@@ -432,6 +421,27 @@ fn last_threads(ops: &[Op]) -> Option<usize> {
         Op::Threads(_) => None,
         _ => None,
     })
+}
+
+/// The execution budget `ops` ask for: the last `-threads N` (`N >= 1`),
+/// else the host's parallelism — the same resolution
+/// [`ConvertPlan::execution_context`](crate::ConvertPlan::execution_context)
+/// makes for the pipeline route.
+pub fn execution_context(ops: &[Op]) -> oxideav_core::ExecutionContext {
+    match last_threads(ops) {
+        Some(n) => oxideav_core::ExecutionContext::with_threads(n),
+        None => oxideav_core::ExecutionContext::auto(),
+    }
+}
+
+/// The gateway's open options for a side-channel read: the plan's
+/// allow / deny lists and its execution budget, which the gateway
+/// hands to every decoder it creates (and through a declared
+/// `threads` decoder option the user did not set).
+pub fn open_options(plan: &crate::ConvertPlan) -> OpenOptions {
+    plan.restrictions
+        .apply(OpenOptions::new())
+        .with_execution_context(plan.execution_context())
 }
 
 fn strips_metadata(ops: &[Op]) -> bool {

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Gateway-written stills (PDF / 3D renders, the icon writer's input)
+  ride `oxideav-image` 0.0.5's execution budget: `OpenOptions` /
+  `SaveOptions::with_execution_context` carry the plan's `-threads`
+  budget to every decoder and encoder the gateway creates (and through
+  a declared `threads` option the user did not set), replacing the
+  hand-rolled forwarding that reached only an encoder with a `threads`
+  option. `raster_io::execution_context` / `open_options` build them.
+- `.avif` no longer pins quality 60 itself: the `avif` encoder's schema
+  default is 60 since `oxideav-avif` 0.0.16, so `convert` writes with
+  every encoder's own default and sets `quality` only when asked;
+  `image_sink::default_quality` answers `None` for every codec. A test
+  reads the default off the encoder's declared schema and pins it to
+  the documented 60.
+- Minimum siblings: `oxideav-core` 0.1.41, `oxideav-image` 0.0.5,
+  `oxideav-image-filter` 0.1.3 (dev: `oxideav-heif` 0.0.13,
+  `oxideav-avif` 0.0.16).
+- `examples/convert_cli.rs`: `convert` as a standalone process over the
+  formats the tests register, for `/usr/bin/time -l` budget runs; its
+  exit status follows the umbrella CLI's table.
+
 ### Added
 
 - Every still-image output whose source layout is declared is written by

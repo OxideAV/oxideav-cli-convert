@@ -191,6 +191,35 @@ fn a_png_source_through_the_gateway_lands_in_its_own_layout() {
     assert_eq!(r.first_bytes(), [0, 1, 2, 3, 4, 5, 6, 7]);
 }
 
+/// A gateway-written still (the side-channels' writer) hands the
+/// plan's budget to its encoder through the gateway's
+/// `SaveOptions::with_execution_context` — every encoder, not only one
+/// whose schema declares a `threads` option (the test encoder declares
+/// none). Without `-threads` the budget is the host's parallelism.
+#[test]
+fn gateway_written_stills_grant_the_budget_to_every_encoder() {
+    use oxideav_cli_convert::raster_io::{encode_raster, RgbaImage};
+    use oxideav_cli_convert::Op;
+    let dir = temp_dir("gateway-budget");
+    let img = RgbaImage {
+        width: 4,
+        height: 2,
+        pixels: (0..32).collect(),
+        stride: 16,
+    };
+    let out = dir.join("out.tprobe");
+    let bytes = encode_raster(&ctx(), &img, s(&out), &[Op::Threads(3)]).unwrap();
+    fs::write(&out, bytes).unwrap();
+    assert_eq!(Report::read(&out).threads(), 3);
+    let bytes = encode_raster(&ctx(), &img, s(&out), &[Op::Threads(0)]).unwrap();
+    fs::write(&out, bytes).unwrap();
+    assert_eq!(
+        Report::read(&out).threads(),
+        oxideav_core::ExecutionContext::auto().threads,
+        "-threads 0 / none = the host's parallelism"
+    );
+}
+
 #[test]
 fn allow_and_deny_lists_refuse_before_any_decode() {
     use oxideav_cli_convert::restrict::is_restricted;

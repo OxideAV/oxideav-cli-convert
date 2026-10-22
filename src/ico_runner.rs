@@ -58,7 +58,7 @@ pub fn is_ico_output(output: &str) -> bool {
 /// single `.ico` file at `plan.output`. The input is any still-image
 /// format `ctx` can open.
 pub fn run(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<()> {
-    let opts = plan.restrictions.apply(oxideav_image::OpenOptions::new());
+    let opts = crate::raster_io::open_options(plan);
     let src = read_image_to_rgba_with(ctx, &plan.input, &opts)?;
 
     let sizes = parse_auto_resize_define(&plan.ops)?;

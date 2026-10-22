@@ -255,17 +255,17 @@ pub fn chroma_subsampled_default(
 }
 
 /// The `quality` `convert` writes with when the user gave none and
-/// the encoder's default would not be what a `convert` user expects
-/// of the format: the `avif` encoder defaults to lossless (a 12 MP
-/// photo becomes a 20 MB file); `convert` writes AVIF at quality 60,
-/// the same default the HEIF encoder applies to its AV1 items, so
-/// `.avif` output is a lossy photo format by default and `-quality
-/// 100` asks for lossless. Every other encoder keeps its own default.
+/// the encoder's own default would not be what a `convert` user
+/// expects of the format. Empty since `oxideav-avif` 0.0.16: the
+/// `avif` encoder's schema default is 60 (a lossy photo; `-quality
+/// 100` is lossless), the same default the HEIF encoder applies to
+/// its AV1 items, so every encoder's declared default is `convert`'s
+/// default and the `quality` option is only set when the user asked
+/// (`SaveOptions::quality`). Kept so callers that consult it keep
+/// compiling; the HEIF-family tests pin the schema defaults instead.
 pub fn default_quality(codec: &str) -> Option<u8> {
-    match codec {
-        "avif" => Some(60),
-        _ => None,
-    }
+    let _ = codec;
+    None
 }
 
 /// Resolve the output codec for `output` (or the `-format` override).
