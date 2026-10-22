@@ -135,9 +135,25 @@ pub fn run(
             .with_codec_preferences(prefs.clone())
             .with_sink_override(TAP_SINK, Box::new(sink))
             .run();
-        let written = writer
-            .join()
-            .unwrap_or_else(|_| Err(Error::other("convert: frame writer panicked")));
+        let written = writer.join().unwrap_or_else(|payload| {
+            // An encoder or muxer panic: the in-flight single output
+            // is removed (the writer's own error paths do the same;
+            // unwinding skipped them), and the panic text travels
+            // with the error. `Other` — the umbrella CLI's "anything
+            // else" exit — because a panic is no typed class.
+            if spec.template.is_none() {
+                let _ = std::fs::remove_file(&spec.output);
+            }
+            let what = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            Err(Error::other(format!(
+                "convert: frame writer panicked in the {} encoder / {} muxer: {what}",
+                spec.codec, spec.container
+            )))
+        });
         // A writer failure surfaces on the executor side as a closed
         // channel ([`WRITER_STOPPED`]); report the writer's own, more
         // specific error then. Any other executor failure is the root

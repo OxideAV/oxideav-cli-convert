@@ -313,6 +313,13 @@ fn failure_classes_match_the_umbrella_exit_table() {
     let e = convert(&[s(&png), "--deny-containers", "tprobe", s(&out)]).unwrap_err();
     assert!(matches!(e, Error::Unsupported(_)), "{e}");
 
+    // 1: an encoder panic is no typed class — `Other` with the panic
+    // text — and the in-flight output is removed.
+    let e = convert(&[s(&png), "--opt", "tag=panic", s(&out)]).unwrap_err();
+    assert!(matches!(e, Error::Other(_)), "{e}");
+    assert!(e.to_string().contains("asked to panic"), "{e}");
+    assert!(!out.exists(), "a panicked write leaves no file behind");
+
     // 9: a directory the process may not write into (skipped for a
     // user the OS never refuses).
     #[cfg(unix)]

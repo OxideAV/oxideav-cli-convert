@@ -62,6 +62,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--opt tiling=tili` passes through to the heif encoder (0.0.13): a
   tiled picture (`--opt grid=N`) is written as one `tili` tiled image
   item; pinned by a pass-through test (no new flag).
+- A panic inside the writer's encoder or muxer removes the in-flight
+  output (unwinding skipped the writer's own cleanup) and surfaces as
+  `Error::Other` carrying the panic text and the codec / container
+  names; pinned with the test encoder.
+- README: the 12 MP budget matrix (HEIC → PNG / AVIF / HEIC / JPEG /
+  TIFF / WebP, PNG → HEIC / AVIF, AVIF → HEIC) at `-threads 1 / 4 / 8`
+  before and after, per-stage 1 → 8 timings, and the stages that stay
+  serial by owner.
 - Tests pin the failure classes against the umbrella CLI's exit table
   (missing input / missing output directory → `Io` `NotFound`,
   permission denied → `Io` `PermissionDenied`, malformed flags and

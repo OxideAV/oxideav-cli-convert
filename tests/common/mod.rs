@@ -567,6 +567,9 @@ impl Encoder for ProbeEncoder {
         let Frame::Video(vf) = frame else {
             return Err(Error::unsupported("tprobe: video frames only"));
         };
+        if self.options.tag.as_deref() == Some("panic") {
+            panic!("tprobe: the test encoder was asked to panic");
+        }
         let planes = vf.image_planes();
         let first: Vec<u8> = planes
             .first()

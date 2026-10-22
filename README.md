@@ -315,32 +315,47 @@ chain stays 8-bit.
 | `-colorspace gray` | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
 | `-colors` | → `Pal8` | → `Pal8` | → `Pal8` | → `Pal8` |
 
-### Budgets: 12 MP (`oxideav convert`, round 477)
+### Budgets: 12 MP at `-threads 1 / 4 / 8` (round 479)
 
-The umbrella CLI as a black box (`cargo build -p oxideav-cli
---release`, Apple M4 Max, 18 logical CPUs, macOS 26.6): `/usr/bin/time
--l` wall and peak RSS of the whole process, best of two, over the
-4032×3024 iPhone 13 Pro Max device sample (`src.heic`), its PNG decode
-(`src.png`) and that PNG's AVIF (`src.avif`, quality 60). *Before* is
-the round-476 crate (the executor granted the budget already; `.avif`
-went through the heif encoder's AV1 items), *after* this round
-(`.avif` through the `avif` encoder, the gateway's pick). `library` is
-this crate's `run` in-process (`examples/gateway_timing.rs`); `gateway`
-is `oxideav-image` alone (open + encode), whose decoders run **serial**
-— the gateway has no execution-context hook (asked for; an encoder's
-`threads` option carries the budget meanwhile).
+`examples/convert_cli.rs` (this crate's `run` as a process over the
+formats the tests register; Apple M4 Max, 18 logical CPUs, macOS
+26.6, release build): `/usr/bin/time -l` wall and peak RSS, best of
+two, over the 4032×3024 iPhone 13 Pro Max device sample (`src.heic`,
+8-bit 4:2:0, 48 tiles), its PNG decode (`src.png`, 14.6 MB) and that
+PNG's AVIF (`src.avif`, quality 60). *Before* is the round-477 crate
+(b53c244), *after* this round; every cell is the same bytes at every
+budget. The stage columns are `OXIDEAV_CONVERT_TIMING=1` at 1 → 8
+workers: a stage whose time does not move is **serial** in the crate
+that owns it.
 
-| direction | before, auto | after, auto | after, `-threads 1` | library (auto) | gateway (auto) | peak RSS | output |
-|---|---|---|---|---|---|---|---|
-| AVIF → HEIC | 0.63 s | 0.64 s | 4.8 s | 0.62 s | 1.39 s (open 0.70 serial + encode 0.69) | 201 MiB | 1 531 099 B |
-| HEIC → PNG | 0.24 s | 0.23 s | 1.1 s | 0.17 s | 1.15 s (open 0.63 serial + encode 0.52 serial: png declares no `threads`) | 189 MiB | 14 618 082 B |
-| PNG → AVIF | 1.56 s (heif AV1, 758 267 B, 270 MiB) | 2.28 s | 8.9 s | 2.56 s | 2.52 s (open 0.30 + encode 2.22) | 641 MiB | 737 825 B |
+| direction | before 1 / 4 / 8 | after 1 / 4 / 8 | peak RSS (8) | output | decode 1 → 8 | encode 1 → 8 |
+|---|---|---|---|---|---|---|
+| HEIC → PNG | 0.84 / 0.26 / 0.18 s | 0.93 / 0.30 / 0.20 s | 162 MiB | 14 618 082 B | 0.49 → 0.14 s | 0.41 → 0.07 s |
+| HEIC → AVIF | 7.35 / 2.01 / 1.22 s | 7.81 / 2.37 / 1.34 s | 155 MiB | 778 684 B | 0.49 → 0.14 s | 6.9 → 1.2 s |
+| HEIC → HEIC | 4.21 / 1.13 / 0.68 s | 4.26 / 1.32 / 0.88 s | 124 MiB | 2 249 399 B | 0.49 → 0.14 s | 3.7 → 0.7 s |
+| HEIC → JPEG | 0.51 / 0.19 / 0.14 s | 0.51 / 0.22 / 0.19 s | 74 MiB | 1 709 867 B | 0.51 → 0.11 s | 0.05 → 0.05 s (**mjpeg encoder serial**, 50 ms) |
+| HEIC → TIFF | 0.47 / 0.16 / 0.12 s | 0.48 / 0.19 / 0.15 s | 212 MiB | 36 581 254 B | 0.50 → 0.12 s | 6 → 6 ms (**tiff encoder serial**, trivial) |
+| HEIC → WebP (`-quality 80`) | refused (stream copied into the webp muxer) | 2.69 / 2.47 / 2.57 s | 127 MiB | 905 164 B | 0.50 → 0.11 s | 2.38 → 2.35 s (**webp_vp8 encoder serial**) |
+| PNG → HEIC | 4.12 / 1.30 / 0.90 s | 4.07 / 1.73 / 0.98 s | 196 MiB | 2 251 762 B | 0.28 → 0.27 s (**png decoder serial**) | 4.2 → 0.7 s |
+| PNG → AVIF | 6.96 / 2.17 / 1.42 s | 7.39 / 2.54 / 1.56 s | 201 MiB | 775 510 B | 0.28 → 0.27 s (**png decoder serial**) | 7.5 → 1.3 s |
+| AVIF → HEIC | 3.93 / 1.09 / 0.65 s | 4.09 / 1.25 / 0.70 s | 140 MiB | 1 566 485 B | 0.48 → 0.09 s | 3.8 → 0.6 s |
 
-`convert in.heic -resize 50% out.png` (12 MP, previously refused on
-the filter's layout check, and `50%` read as 50 × 50 pixels): 0.17 s
-to a 1512 × 2016 PNG. The `avif` encoder at quality 60 costs 0.7 s and
-370 MiB more than the heif encoder's AV1 item for the same size — an
-`oxideav-avif` finding, reported.
+Before and after agree within run-to-run noise on the pipeline route:
+the executor's decoder and the writer's encoder were already granted
+the budget in round 477. What moved this round is the **gateway
+side-channel**, which decoded serially whatever the budget: `convert
+src.heic -define icon:auto-resize=256,128 out.ico` (the icon writer
+reads through `oxideav-image`) is 0.51 s at `-threads 1` and 0.15 s
+at `-threads 8` (344 → 367 MiB), where round 477 was ~0.6 s at every
+budget. `convert src.heic -resize 50% out.png` is 0.66 → 0.17 s (1 →
+8; decode + resize 0.55 → 0.15 s, PNG encode 0.12 → 0.02 s).
+
+Stages that stay serial under the budget, by owner: the `webp_vp8`
+encoder (2.35 s for 12 MP; its lossless sibling `webp_vp8l` needs
+2.3 GiB and panics after 140 s on this picture — `oxideav-webp`
+findings, reported), the `png` decoder (0.27 s; inflate), the `mjpeg`
+encoder (50 ms) and the `tiff` encoder (6 ms). Every other stage
+scales with the budget.
 
 ### Where the time goes: 12 MP HEIC → PNG
 
