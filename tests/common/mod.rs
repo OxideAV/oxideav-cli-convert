@@ -320,7 +320,14 @@ impl Demuxer for ProbeDemuxer {
 struct ProbeMuxer {
     out: Box<dyn WriteSeek>,
     streams: Vec<StreamInfo>,
+    /// Container string pairs (`title` / `comment` only — a
+    /// fixed-field format), stored by `set_metadata` before the header.
+    metadata: Vec<(String, String)>,
+    header_written: bool,
 }
+
+/// The keys the probe muxer has a field for.
+pub const CARRIED_KEYS: &[&str] = &["title", "comment"];
 
 fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
     if streams.len() != 1 {
@@ -332,6 +339,8 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
     Ok(Box::new(ProbeMuxer {
         out: output,
         streams: streams.to_vec(),
+        metadata: Vec::new(),
+        header_written: false,
     }))
 }
 
@@ -341,9 +350,11 @@ impl Muxer for ProbeMuxer {
     }
 
     fn write_header(&mut self) -> Result<()> {
+        self.header_written = true;
         let s = &self.streams[0];
         let line = json!({
             "stream": {
+                "metadata": self.metadata.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(),
                 "codec": s.params.codec_id.as_str(),
                 "width": s.params.width,
                 "height": s.params.height,
@@ -366,6 +377,22 @@ impl Muxer for ProbeMuxer {
     fn write_trailer(&mut self) -> Result<()> {
         self.out.flush()?;
         Ok(())
+    }
+
+    fn set_metadata(&mut self, metadata: &[(String, String)]) -> Result<()> {
+        if self.header_written {
+            return Err(Error::invalid("tprobe: metadata after the header"));
+        }
+        self.metadata = metadata
+            .iter()
+            .filter(|(k, _)| self.carries_metadata_key(k))
+            .cloned()
+            .collect();
+        Ok(())
+    }
+
+    fn carries_metadata_key(&self, key: &str) -> bool {
+        CARRIED_KEYS.contains(&key)
     }
 }
 
@@ -695,6 +722,23 @@ impl Report {
 
     /// The first two palette entries' RGB bytes, when the frame carried
     /// a palette.
+    /// The container string pairs the muxer stored before its header.
+    pub fn metadata(&self) -> Vec<(String, String)> {
+        self.stream["metadata"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|p| {
+                        (
+                            p[0].as_str().unwrap().to_string(),
+                            p[1].as_str().unwrap().to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn palette_rgb(&self) -> Option<Vec<u8>> {
         self.frame()["palette_rgb"]
             .as_array()

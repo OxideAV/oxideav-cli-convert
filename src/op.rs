@@ -427,6 +427,15 @@ pub enum Op {
     /// (`-roll +5+10`, `-roll -3+2`); a single offset (`-roll +5`)
     /// is rejected at parse time.
     Roll { dx: i32, dy: i32 },
+    /// `-set KEY=VALUE` / `-comment TEXT` (the key `comment`) — a
+    /// container-level string pair for the output, handed to the
+    /// muxer (`Muxer::set_metadata`, before its header) when it
+    /// carries the key (`Muxer::carries_metadata_key`); a key the
+    /// output's container has no field for is dropped with a note.
+    /// Repeatable; a later value for the same key wins. Explicit
+    /// pairs are written even under `-strip`, which withholds the
+    /// source's blobs, not the caller's own text.
+    SetMetadata { key: String, value: String },
 }
 
 /// A printf-style multi-output template. Detected by the args parser
@@ -1105,6 +1114,22 @@ impl ConvertPlan {
         self.ops
             .iter()
             .any(|o| matches!(o, Op::Strip | Op::Thumbnail { .. }))
+    }
+
+    /// The container string pairs `-set KEY=VALUE` / `-comment TEXT`
+    /// ask for, in command-line order with a later value for the same
+    /// key replacing the earlier one in place.
+    pub fn metadata(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for op in &self.ops {
+            if let Op::SetMetadata { key, value } = op {
+                match out.iter_mut().find(|(k, _)| k == key) {
+                    Some(slot) => slot.1 = value.clone(),
+                    None => out.push((key.clone(), value.clone())),
+                }
+            }
+        }
+        out
     }
 
     /// The last `-quality N`, capped to 100.

@@ -25,7 +25,8 @@ the rest of the workspace already knows how to do.
 | `-depth 8\|16` | output bit depth per channel for still-image outputs (a 10-bit HEIC → `-depth 8` → 8-bit PNG); without it the source's own depth is kept when the encoder can carry it |
 | `-threads N` | the plan's execution budget (`ConvertPlan::execution_context`): the executor's decoders and filters, the still-image writer's encoder, and every decoder / encoder of a gateway-written still (`OpenOptions` / `SaveOptions::with_execution_context`, `oxideav-image` 0.0.5); `0` = auto (the host's parallelism, the default) |
 | `--opt KEY=VALUE` | encoder option for still-image outputs, repeatable; validated against the target encoder's declared options (`oxideav info <codec>`), unknown keys / ill-typed values are typed errors |
-| `-strip` | write no metadata blobs (ICC / Exif / XMP, stream level or per picture); `-thumbnail` implies it |
+| `-strip` | write no metadata blobs (ICC / Exif / XMP, stream level or per picture); `-thumbnail` implies it; the caller's own `-set` / `-comment` pairs are still written |
+| `-set KEY=VALUE` / `-comment TEXT` | a container string pair for the output (`-comment` is the key `comment`), handed to the writer's muxer before its header exactly for the keys it carries (`Muxer::carries_metadata_key`; `Muxer::set_metadata`, core 0.1.41); a key the container has no field for is dropped with a `convert: note:` naming it (the HEIF sequence muxer stores `copyright` / `copyright:<lang>` only; a HEIF / AVIF still, PNG, JPEG store none today); repeatable, a later value for a key wins; `KEY=VALUE` is one argument (`KEY=` sets an empty value) |
 | `--allow-containers L` / `--deny-containers L` | input restriction: comma lists of container names (deny wins, case-insensitive), checked on the header probe before any decoder exists; a refusal is `Error::Unsupported` with a `convert: restricted:` message (`restrict::is_restricted`) |
 | `--allow-codecs L` / `--deny-codecs L` | the same over every video stream's codec id (the gateway's `OpenOptions` lists on the side-channels) |
 | `-density N` | DPI for vector→raster (default 72; PDF / SVG inputs only) |
@@ -252,7 +253,13 @@ still-image contract the `oxideav-image` gateway documents:
   stream's for the one-picture file it becomes (the gateway's
   precedence). Whether the format embeds them is the encoder's
   (`oxideav-heif` writes all three; see its README's survey for the
-  rest). `-strip` / `-thumbnail` withhold them all.
+  rest). `-strip` / `-thumbnail` withhold them all. Container string
+  pairs (`-set KEY=VALUE` / `-comment TEXT`) go to the writer's muxer
+  before its header for the keys it carries (`-set` row above); on
+  the routes that do not open the muxer here — the executor's (a
+  timed source into a sequence brand, an output the writer cannot
+  size) and the gateway side-channels (PDF / 3D renders, `.ico`) —
+  they are dropped with a note (follow-ups below).
 - **Palette alpha.** A `Pal8` source reaches a palette-accepting
   encoder with its palette and alpha records untouched; an encoder
   without `Pal8` gets the picture expanded by the writer — alpha `0`
@@ -604,6 +611,11 @@ carries test-pinned guarantees:
   the `avif` encoder, `png`, `mjpeg`, `webp`, `tiff`, `gif` do not
   embed `params.blobs` yet (per-crate adoption), so HEIC → AVIF drops
   the profile until `oxideav-avif` reads them.
+- `-set` / `-comment` ride only the writer's muxer: the pipeline's
+  `Job` has no container-metadata field (so a timed source into
+  `.heics` cannot carry `copyright`), and the `oxideav-image` gateway's
+  `SaveOptions` carries blobs, not string pairs (so the side-channels
+  drop them). Both are asks on those crates.
 - Filters without a declared deep layout (the colour and tonal
   families) narrow a 16-bit / 10-bit source to 8 bits ahead of the
   op (*Filter layouts* above); a deep path there is the filter

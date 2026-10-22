@@ -497,6 +497,9 @@ struct SinkSide {
     encoder_opts: Vec<(String, String)>,
     /// `-threads N` → the job's `threads` key (`0` / unset = auto).
     threads: Option<usize>,
+    /// `-set KEY=VALUE` / `-comment TEXT` pairs, in command-line
+    /// order, a later value for a key replacing the earlier one.
+    metadata: Vec<(String, String)>,
 }
 
 impl Default for SinkSide {
@@ -509,6 +512,7 @@ impl Default for SinkSide {
             quality: None,
             encoder_opts: Vec::new(),
             threads: None,
+            metadata: Vec::new(),
         }
     }
 }
@@ -674,6 +678,13 @@ fn lower_op(chain: TrackInput, op: &Op, sink: &mut SinkSide, absorb_canvas: bool
         }
         Op::Threads(n) => {
             sink.threads = (*n >= 1).then_some(*n);
+            chain
+        }
+        Op::SetMetadata { key, value } => {
+            match sink.metadata.iter_mut().find(|(k, _)| k == key) {
+                Some(slot) => slot.1 = value.clone(),
+                None => sink.metadata.push((key.clone(), value.clone())),
+            }
             chain
         }
         // Vector-input ops; dropped on both paths. Raster inputs have
@@ -998,6 +1009,25 @@ fn finish_job(
         )
     });
 
+    // Only the writer opens the muxer itself: a job the executor runs
+    // carries no container string pairs (the pipeline's `Job` has no
+    // field for them), so `-set` / `-comment` are dropped on every
+    // other route, with a note.
+    let executor_writes = match (&still, wants_tap) {
+        (Some(si), false) => !tap_can_write(plan, &chain, si, &sink, codec.as_deref()),
+        (Some(_), true) => false,
+        (None, _) => true,
+    };
+    if executor_writes && !sink.metadata.is_empty() {
+        notes.push(format!(
+            "convert: note: -set / -comment dropped: this output is written by the pipeline executor, whose job carries no container metadata ({})",
+            sink.metadata
+                .iter()
+                .map(|(k, _)| format!("'{k}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     let (job, tap) = match (still, wants_tap) {
         // Every still output `convert` can size runs through its own
         // writer (quality, metadata, the thread budget); the executor
@@ -1008,7 +1038,7 @@ fn finish_job(
             (job, None)
         }
         (Some(si), _) => {
-            let (job, tap) = tap_job(plan, ctx, chain, codec, sink, si, options)?;
+            let (job, tap) = tap_job(plan, ctx, chain, codec, sink, si, options, &mut notes)?;
             (job, Some(tap))
         }
         (None, true) => {
@@ -1421,6 +1451,7 @@ fn tap_can_write(
 
 /// Frame-tap job: the executor decodes / filters / converts into the
 /// reserved [`TAP_SINK`]; [`crate::frame_tap`] encodes and muxes.
+#[allow(clippy::too_many_arguments)]
 fn tap_job(
     plan: &ConvertPlan,
     ctx: &RuntimeContext,
@@ -1429,6 +1460,7 @@ fn tap_job(
     sink: SinkSide,
     si: StillInput,
     options: Vec<(String, String)>,
+    notes: &mut Vec<String>,
 ) -> Result<(Job, TapSpec), Error> {
     let codec = codec.ok_or_else(|| Error::unsupported("convert: no output codec"))?;
     let stream = si.streams[si.ordinal].clone();
@@ -1508,6 +1540,7 @@ fn tap_job(
     // The encoder's thread budget resolves exactly as the executor's:
     // the job's `threads` key, else the host's parallelism.
     let threads = plan.execution_context().threads;
+    let metadata = carried_metadata(ctx, &container, &codec, &sink.metadata, notes);
     let tap = TapSpec {
         codec,
         container,
@@ -1522,8 +1555,52 @@ fn tap_job(
         strip_metadata: sink.strip_metadata,
         expand_palette,
         background: last_background(&plan.ops),
+        metadata,
     };
     Ok((job, tap))
+}
+
+/// The `-set` / `-comment` pairs the output's muxer stores
+/// (`Muxer::carries_metadata_key`, asked of a muxer opened on an
+/// in-memory sink for the stream the writer will open it with); every
+/// other key is dropped here with a note naming it.
+fn carried_metadata(
+    ctx: &RuntimeContext,
+    container: &str,
+    codec: &str,
+    pairs: &[(String, String)],
+    notes: &mut Vec<String>,
+) -> Vec<(String, String)> {
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    let mut params = oxideav_core::CodecParameters::video(oxideav_core::CodecId::new(codec));
+    params.width = Some(16);
+    params.height = Some(16);
+    let stream = StreamInfo {
+        index: 0,
+        time_base: oxideav_core::TimeBase::new(1, 1),
+        duration: None,
+        start_time: None,
+        params,
+    };
+    let sink: Box<dyn oxideav_core::WriteSeek> = Box::new(std::io::Cursor::new(Vec::new()));
+    let muxer = ctx.containers.open_muxer(container, sink, &[stream]).ok();
+    let (carried, dropped): (Vec<_>, Vec<_>) = pairs
+        .iter()
+        .cloned()
+        .partition(|(k, _)| muxer.as_ref().is_some_and(|m| m.carries_metadata_key(k)));
+    if !dropped.is_empty() {
+        notes.push(format!(
+            "convert: note: '{container}' carries no metadata key {} (-set / -comment dropped there; the muxer's docs list the keys it stores)",
+            dropped
+                .iter()
+                .map(|(k, _)| format!("'{k}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    carried
 }
 
 /// The last `-background` colour, else opaque white (the canvas

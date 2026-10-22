@@ -311,6 +311,52 @@ fn convert_quality_matches_the_gateway_quality() {
     );
 }
 
+/// A HEIF / AVIF still is the encoder's file with no movie box, so
+/// the heif muxer stores no string pair for it (`set_metadata` is
+/// `Unsupported`, the contract's "not carried"): `-set` / `-comment`
+/// on a `.heic` / `.avif` still are dropped with a note, never an
+/// error, and the picture is written as without them.
+#[test]
+fn set_on_a_heif_still_is_dropped_not_refused() {
+    let dir = temp_dir("set-heif");
+    let png = write_png(&dir, "in.png", &textured(32, 24));
+    let (plain, tagged) = (dir.join("plain.heic"), dir.join("tagged.heic"));
+    convert(&[s(&png), "-threads", "1", s(&plain)]).unwrap();
+    convert(&[
+        s(&png),
+        "-threads",
+        "1",
+        "-set",
+        "copyright=Nobody",
+        "-comment",
+        "a note",
+        s(&tagged),
+    ])
+    .unwrap();
+    let (p, t) = (
+        oxideav_image::open(&ctx(), &plain).unwrap(),
+        oxideav_image::open(&ctx(), &tagged).unwrap(),
+    );
+    assert_eq!(
+        p.primary().to_rgb8().unwrap(),
+        t.primary().to_rgb8().unwrap(),
+        "the picture is written as without the pairs"
+    );
+    assert_eq!(
+        fs::metadata(&plain).unwrap().len(),
+        fs::metadata(&tagged).unwrap().len()
+    );
+    // The demuxer reports the file's structural keys only: neither
+    // pair was stored.
+    assert!(
+        !t.metadata()
+            .iter()
+            .any(|(k, _)| k == "copyright" || k == "comment"),
+        "{:?}",
+        t.metadata()
+    );
+}
+
 /// `.avif` without `-quality` is a lossy photo: the `avif` encoder's
 /// own schema default (60 since `oxideav-avif` 0.0.16, the HEIF
 /// encoder's AV1 default) is what `convert` writes with, so `convert`

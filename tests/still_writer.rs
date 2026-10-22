@@ -220,6 +220,117 @@ fn gateway_written_stills_grant_the_budget_to_every_encoder() {
     );
 }
 
+/// `-set KEY=VALUE` / `-comment TEXT` reach the muxer before its
+/// header exactly for the keys it carries (`Muxer::carries_metadata_key`
+/// — the probe format stores `title` and `comment`); a later value for
+/// a key wins; other keys are dropped at plan time (a note), never an
+/// error; `-strip` withholds the source's blobs, not the caller's own
+/// pairs. A malformed `-set` is `InvalidData` (umbrella exit 3).
+#[test]
+fn set_and_comment_reach_the_muxer_for_the_keys_it_carries() {
+    let dir = temp_dir("set-metadata");
+    let png = rgb_source(&dir, "in.tprobe", vec![]);
+    let out = dir.join("out.tprobe");
+    convert(&[
+        s(&png),
+        "-set",
+        "title=First",
+        "-comment",
+        "a note",
+        "-set",
+        "artist=Nobody",
+        "-set",
+        "title=Hello",
+        "-strip",
+        s(&out),
+    ])
+    .unwrap();
+    let r = Report::read(&out);
+    assert_eq!(
+        r.metadata(),
+        vec![
+            ("title".to_string(), "Hello".to_string()),
+            ("comment".to_string(), "a note".to_string()),
+        ]
+    );
+    assert!(
+        r.muxer_blob_kinds().is_empty(),
+        "-strip still withholds blobs"
+    );
+
+    // No pairs: the muxer sees none (its stored set stays empty).
+    convert(&[s(&png), s(&out)]).unwrap();
+    assert!(Report::read(&out).metadata().is_empty());
+
+    let e = convert(&[s(&png), "-set", "title", s(&out)]).unwrap_err();
+    assert!(matches!(e, oxideav_core::Error::InvalidData(_)), "{e}");
+    assert!(!out.exists() || Report::read(&out).metadata().is_empty());
+}
+
+/// Every failure class this crate raises maps onto the umbrella CLI's
+/// exit table (3 invalid data, 4 unsupported, 5 format not found, 8
+/// input not found, 9 permission denied, 10 other I/O): the error
+/// variant — and for I/O the kind — is what the binary branches on.
+#[test]
+fn failure_classes_match_the_umbrella_exit_table() {
+    use oxideav_core::Error;
+    use std::io::ErrorKind;
+    let dir = temp_dir("exit-classes");
+    let png = rgb_source(&dir, "in.tprobe", vec![]);
+    let out = dir.join("out.tprobe");
+    let io_kind = |e: &Error| match e {
+        Error::Io(io) => Some(io.kind()),
+        _ => None,
+    };
+
+    // 8: the input does not exist.
+    let missing = dir.join("missing.tprobe");
+    let e = convert(&[s(&missing), s(&out)]).unwrap_err();
+    assert_eq!(io_kind(&e), Some(ErrorKind::NotFound), "{e}");
+
+    // 8: the output's directory does not exist (the writer's create).
+    let nodir = dir.join("no-such-dir").join("out.tprobe");
+    let e = convert(&[s(&png), s(&nodir)]).unwrap_err();
+    assert_eq!(io_kind(&e), Some(ErrorKind::NotFound), "{e}");
+
+    // 3: a flag the parser rejects, a malformed `-set`, an `--opt`
+    // the encoder does not declare.
+    for argv in [
+        vec![s(&png), "-no-such-flag", s(&out)],
+        vec![s(&png), "-set", "=x", s(&out)],
+        vec![s(&png), "--opt", "nope=1", s(&out)],
+        vec![s(&png), "-quality", "x", s(&out)],
+    ] {
+        let e = convert(&argv).unwrap_err();
+        assert!(matches!(e, Error::InvalidData(_)), "{argv:?}: {e}");
+    }
+
+    // 5: an output extension no container claims.
+    let e = convert(&[s(&png), s(&dir.join("out.no_such_ext"))]).unwrap_err();
+    assert!(matches!(e, Error::FormatNotFound(_)), "{e}");
+
+    // 4: an input the restrictions refuse.
+    let e = convert(&[s(&png), "--deny-containers", "tprobe", s(&out)]).unwrap_err();
+    assert!(matches!(e, Error::Unsupported(_)), "{e}");
+
+    // 9: a directory the process may not write into (skipped for a
+    // user the OS never refuses).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let locked = dir.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        let target = locked.join("out.tprobe");
+        let r = convert(&[s(&png), s(&target)]);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        if let Err(e) = r {
+            assert_eq!(io_kind(&e), Some(ErrorKind::PermissionDenied), "{e}");
+            assert!(!target.exists(), "no file left behind");
+        }
+    }
+}
+
 #[test]
 fn allow_and_deny_lists_refuse_before_any_decode() {
     use oxideav_cli_convert::restrict::is_restricted;

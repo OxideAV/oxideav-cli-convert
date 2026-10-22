@@ -42,6 +42,7 @@ const KNOWN_FLAG_NAMES: &[&str] = &[
     "colorize",
     "colors",
     "colorspace",
+    "comment",
     "contrast",
     "crop",
     "define",
@@ -79,6 +80,7 @@ const KNOWN_FLAG_NAMES: &[&str] = &[
     "roll",
     "rotate",
     "sepia",
+    "set",
     "sharpen",
     "solarize",
     "stl-format",
@@ -387,6 +389,36 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
             "-strip" => {
                 ops.push(Op::Strip);
                 i += 1;
+            }
+            // `-set KEY=VALUE` — a container string pair for the
+            // output (title, artist, copyright, …); `-comment TEXT` is
+            // `-set comment=TEXT`. The single-argument `KEY=VALUE`
+            // form keeps the positional grammar unambiguous.
+            "-set" => {
+                let v = val(i + 1)?;
+                let (key, value) = v.split_once('=').ok_or_else(|| {
+                    Error::invalid(format!(
+                        "convert: -set: '{v}' is not KEY=VALUE (the value may be empty: KEY=)"
+                    ))
+                })?;
+                if key.is_empty() {
+                    return Err(Error::invalid(format!(
+                        "convert: -set: '{v}' has an empty KEY (expected KEY=VALUE)"
+                    )));
+                }
+                ops.push(Op::SetMetadata {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                });
+                i += 2;
+            }
+            "-comment" => {
+                let v = val(i + 1)?;
+                ops.push(Op::SetMetadata {
+                    key: "comment".to_string(),
+                    value: v.to_string(),
+                });
+                i += 2;
             }
             "-ping" => {
                 ping = true;
@@ -2037,6 +2069,35 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn set_and_comment_are_container_string_pairs() {
+        let p = parse(&to_vec(&[
+            "a.png",
+            "-set",
+            "title=Hello",
+            "-comment",
+            "a note",
+            "-set",
+            "title=Again",
+            "-set",
+            "empty=",
+            "b.png",
+        ]))
+        .unwrap();
+        assert_eq!(
+            p.metadata(),
+            vec![
+                ("title".to_string(), "Again".to_string()),
+                ("comment".to_string(), "a note".to_string()),
+                ("empty".to_string(), String::new()),
+            ]
+        );
+        for bad in [["-set", "novalue"], ["-set", "=v"]] {
+            let e = parse(&to_vec(&["a.png", bad[0], bad[1], "b.png"])).unwrap_err();
+            assert!(matches!(e, Error::InvalidData(_)), "{e}");
+        }
     }
 
     /// `-monochrome` is composable with other ops in source order:
@@ -4109,6 +4170,7 @@ mod tests {
             ("-colorize", &["red/50%"]),
             ("-colors", &["16"]),
             ("-colorspace", &["gray"]),
+            ("-comment", &["a note"]),
             ("-contrast", &[]),
             ("-crop", &["1x1+0+0"]),
             ("-define", &["k=v"]),
@@ -4145,6 +4207,7 @@ mod tests {
             ("-roll", &["+1+1"]),
             ("-rotate", &["90"]),
             ("-sepia", &["80%"]),
+            ("-set", &["title=Hello"]),
             ("-sharpen", &["1x0.5"]),
             ("-solarize", &["50%"]),
             ("-stl-format", &["binary"]),

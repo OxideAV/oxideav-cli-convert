@@ -50,6 +50,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `-set KEY=VALUE` / `-comment TEXT` (`Op::SetMetadata`,
+  `ConvertPlan::metadata`): container string pairs for the output,
+  handed to the writer's muxer with `Muxer::set_metadata` before its
+  header exactly for the keys `Muxer::carries_metadata_key` admits
+  (asked of a muxer opened on an in-memory sink at plan time); keys the
+  container has no field for are dropped with a note naming them, and
+  the routes that never open the muxer here (the executor's, the
+  gateway side-channels) note the drop. Written even under `-strip`. A
+  malformed `-set` is `InvalidData`. `TapSpec::metadata` carries them.
+- Tests pin the failure classes against the umbrella CLI's exit table
+  (missing input / missing output directory → `Io` `NotFound`,
+  permission denied → `Io` `PermissionDenied`, malformed flags and
+  undeclared `--opt` keys → `InvalidData`, unknown output extension →
+  `FormatNotFound`, restricted input → `Unsupported`).
 - Every still-image output whose source layout is declared is written by
   `convert`'s own encode + mux stage (the frame tap), which adopts the
   `oxideav-image` gateway's still-image contract: `-quality N` becomes the

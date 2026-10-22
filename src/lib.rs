@@ -141,6 +141,24 @@ pub fn run_with_preferences(
             }
         }
     }
+    // The side-channels write through the `oxideav-image` gateway,
+    // which has no container-metadata route (`SaveOptions` carries
+    // blobs, not string pairs): `-set` / `-comment` are dropped there.
+    #[allow(unused_mut)]
+    let mut side_channel = matches!(route, Route::PdfSideChannel);
+    #[cfg(feature = "mesh3d")]
+    {
+        side_channel |= matches!(route, Route::Mesh3dToRaster);
+    }
+    #[cfg(feature = "ico")]
+    {
+        side_channel |= matches!(route, Route::IcoOutput);
+    }
+    if side_channel && !plan.metadata().is_empty() {
+        eprintln!(
+            "convert: note: -set / -comment dropped: this output is written through the oxideav-image gateway, which has no container-metadata route"
+        );
+    }
     match route {
         // `--help`: print the usage synopsis (generated from the
         // parser's own flag table) and do nothing else.

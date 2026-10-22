@@ -95,6 +95,11 @@ pub struct TapSpec {
     /// `-background` (opaque white by default): what palette
     /// transparency is composited over on a target without alpha.
     pub background: [u8; 4],
+    /// Container string pairs (`-set KEY=VALUE` / `-comment TEXT`)
+    /// the muxer stores (`Muxer::carries_metadata_key` said so at
+    /// plan time), handed over with `Muxer::set_metadata` before the
+    /// header. Written even under `-strip`.
+    pub metadata: Vec<(String, String)>,
 }
 
 /// What the tap wrote.
@@ -350,6 +355,20 @@ impl OpenFile {
                 return Err(e);
             }
         };
+        // Container string pairs go in before the header (most formats
+        // write their text block there). `Unsupported` is the
+        // contract's "not carried", never a failure of the write; any
+        // other refusal is the muxer's own and keeps its class.
+        if !spec.metadata.is_empty() {
+            match muxer.set_metadata(&spec.metadata) {
+                Ok(()) | Err(Error::Unsupported(_)) => {}
+                Err(e) => {
+                    drop(muxer);
+                    let _ = std::fs::remove_file(path);
+                    return Err(e);
+                }
+            }
+        }
         if let Err(e) = muxer.write_header() {
             drop(muxer);
             let _ = std::fs::remove_file(path);

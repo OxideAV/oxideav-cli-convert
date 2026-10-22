@@ -112,7 +112,8 @@ pub fn layout_step(op: &Op) -> LayoutStep {
         | Op::Threads(_)
         | Op::Density(_)
         | Op::Background(_)
-        | Op::Alpha(_) => LayoutStep::None,
+        | Op::Alpha(_)
+        | Op::SetMetadata { .. } => LayoutStep::None,
     }
 }
 
