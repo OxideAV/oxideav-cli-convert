@@ -59,6 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the routes that never open the muxer here (the executor's, the
   gateway side-channels) note the drop. Written even under `-strip`. A
   malformed `-set` is `InvalidData`. `TapSpec::metadata` carries them.
+- `--opt tiling=tili` passes through to the heif encoder (0.0.13): a
+  tiled picture (`--opt grid=N`) is written as one `tili` tiled image
+  item; pinned by a pass-through test (no new flag).
 - Tests pin the failure classes against the umbrella CLI's exit table
   (missing input / missing output directory → `Io` `NotFound`,
   permission denied → `Io` `PermissionDenied`, malformed flags and

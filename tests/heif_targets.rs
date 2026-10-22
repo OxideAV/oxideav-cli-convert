@@ -357,6 +357,60 @@ fn set_on_a_heif_still_is_dropped_not_refused() {
     );
 }
 
+/// `--opt tiling=tili` passes through to the heif encoder (its
+/// `tiling` option, 0.0.13): a tiled picture is written as one `tili`
+/// tiled image item instead of a `grid` of coded items, decodes to
+/// the same pixels, and the file's primary item type says which.
+#[test]
+fn opt_tiling_tili_passes_through_to_heif() {
+    let dir = temp_dir("tili");
+    let png = write_png(&dir, "in.png", &textured(128, 96));
+    let (grid, tili) = (dir.join("grid.heic"), dir.join("tili.heic"));
+    convert(&[
+        s(&png),
+        "-threads",
+        "1",
+        "--opt",
+        "grid=64",
+        "--opt",
+        "tiling=grid",
+        s(&grid),
+    ])
+    .unwrap();
+    convert(&[
+        s(&png),
+        "-threads",
+        "1",
+        "--opt",
+        "grid=64",
+        "--opt",
+        "tiling=tili",
+        s(&tili),
+    ])
+    .unwrap();
+    let c = ctx();
+    let (g, t) = (
+        oxideav_image::open(&c, &grid).unwrap(),
+        oxideav_image::open(&c, &tili).unwrap(),
+    );
+    let item_type = |f: &oxideav_image::ImageFile| {
+        f.metadata()
+            .iter()
+            .find(|(k, _)| k == "primary_item_type")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(item_type(&g), "grid");
+    assert_eq!(item_type(&t), "tili");
+    assert_eq!(
+        g.primary().to_rgb8().unwrap(),
+        t.primary().to_rgb8().unwrap(),
+        "same tiles, same picture"
+    );
+    let e = convert(&[s(&png), "--opt", "tiling=hexagons", s(&tili)]).unwrap_err();
+    assert!(matches!(e, oxideav_core::Error::InvalidData(_)), "{e}");
+}
+
 /// `.avif` without `-quality` is a lossy photo: the `avif` encoder's
 /// own schema default (60 since `oxideav-avif` 0.0.16, the HEIF
 /// encoder's AV1 default) is what `convert` writes with, so `convert`
