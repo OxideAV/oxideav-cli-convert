@@ -198,8 +198,8 @@ fn a_png_source_through_the_gateway_lands_in_its_own_layout() {
 /// none). Without `-threads` the budget is the host's parallelism.
 #[test]
 fn gateway_written_stills_grant_the_budget_to_every_encoder() {
-    use oxideav_cli_convert::raster_io::{encode_raster, RgbaImage};
     use oxideav_cli_convert::Op;
+    use oxideav_cli_convert::raster_io::{RgbaImage, encode_raster};
     let dir = temp_dir("gateway-budget");
     let img = RgbaImage {
         width: 4,

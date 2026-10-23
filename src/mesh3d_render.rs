@@ -42,14 +42,14 @@ use std::fs;
 use oxideav_core::{Error, Result, RuntimeContext};
 use oxideav_mesh3d::Mesh3DRegistry;
 use oxideav_render::{
-    make_renderer, BackgroundColor, CameraSpec as RCameraSpec, LightSpec as RLightSpec, Projection,
-    RenderBackend, RenderOptions, RgbaImage as RRgbaImage, ShadingMode,
+    BackgroundColor, CameraSpec as RCameraSpec, LightSpec as RLightSpec, Projection, RenderBackend,
+    RenderOptions, RgbaImage as RRgbaImage, ShadingMode, make_renderer,
 };
 
 use crate::op::{Mesh3DOptions, Mesh3DRenderMode, Op, ProjectionMode};
 use crate::pixel_xform::apply_pixel_transform_chain;
 use crate::raster_io::{
-    apply_alpha_ops, classify_output_with, encode_raster_to_path, OutputClass, RgbaImage,
+    OutputClass, RgbaImage, apply_alpha_ops, classify_output_with, encode_raster_to_path,
 };
 
 /// Default raster output dimensions when neither `-resize` nor any

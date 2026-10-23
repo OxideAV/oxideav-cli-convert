@@ -31,7 +31,7 @@ use oxideav_core::{
     ProbeScore, ReadSeek, Result, RuntimeContext, StreamInfo, TimeBase, VideoFrame, VideoPlane,
     WriteSeek,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Container, codec and extension name.
 pub const NAME: &str = "tprobe";
@@ -243,11 +243,7 @@ fn blobs_from_json(v: &Value) -> Vec<MetadataBlob> {
 // ---------------------------------------------------------------------
 
 fn probe(p: &ProbeData) -> ProbeScore {
-    if p.buf.starts_with(MAGIC) {
-        100
-    } else {
-        0
-    }
+    if p.buf.starts_with(MAGIC) { 100 } else { 0 }
 }
 
 struct ProbeDemuxer {

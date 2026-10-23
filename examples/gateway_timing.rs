@@ -60,10 +60,10 @@ fn main() {
     ) {
         opts = opts.with_quality(q);
     }
-    if let Ok(schema) = oxideav_image::encoder_options(&ctx, &ext, &opts) {
-        if schema.iter().any(|f| f.name == "threads") {
-            opts = opts.with_option("threads", threads.to_string());
-        }
+    if let Ok(schema) = oxideav_image::encoder_options(&ctx, &ext, &opts)
+        && schema.iter().any(|f| f.name == "threads")
+    {
+        opts = opts.with_option("threads", threads.to_string());
     }
     let t1 = Instant::now();
     let bytes = oxideav_image::encode(&ctx, file.primary(), &ext, &opts).expect("gateway encode");

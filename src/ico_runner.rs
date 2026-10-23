@@ -38,11 +38,11 @@
 use std::fs;
 
 use oxideav_core::{Error, PixelFormat, Result, RuntimeContext, VideoFrame, VideoPlane};
-use oxideav_ico::{write_ico, IconImage, IconType, WriteOptions};
+use oxideav_ico::{IconImage, IconType, WriteOptions, write_ico};
 use oxideav_image_filter::{ImageFilter, Resize, VideoStreamParams};
 
 use crate::op::{ConvertPlan, Op};
-use crate::raster_io::{read_image_to_rgba_with, RgbaImage};
+use crate::raster_io::{RgbaImage, read_image_to_rgba_with};
 
 /// Returns true when the plan's output extension is `.ico`.
 ///
@@ -101,7 +101,7 @@ fn ensure_rgba(img: RgbaImage) -> RgbaImage {
     let w = img.width as usize;
     let h = img.height as usize;
     let mut out = Vec::with_capacity(w * h * 4);
-    for px in img.pixels.chunks_exact(3) {
+    for px in img.pixels.as_chunks::<3>().0 {
         out.extend_from_slice(&[px[0], px[1], px[2], 255]);
     }
     RgbaImage {

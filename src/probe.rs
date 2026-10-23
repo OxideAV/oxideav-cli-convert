@@ -761,10 +761,10 @@ fn compute_mesh_bbox(mesh: &oxideav_mesh3d::Mesh) -> Option<([f32; 3], [f32; 3])
 fn animation_duration(anim: &oxideav_mesh3d::Animation) -> f32 {
     let mut max = 0.0f32;
     for ch in &anim.channels {
-        if let Some(&t) = ch.sampler.keyframes.last() {
-            if t > max {
-                max = t;
-            }
+        if let Some(&t) = ch.sampler.keyframes.last()
+            && t > max
+        {
+            max = t;
         }
     }
     max

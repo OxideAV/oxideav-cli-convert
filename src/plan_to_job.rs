@@ -10,7 +10,7 @@
 //! DAG-build time.
 
 use crate::filter_layouts;
-use crate::frame_tap::{TapSpec, TAP_SINK};
+use crate::frame_tap::{TAP_SINK, TapSpec};
 use crate::image_sink::{self, LayoutHint};
 use crate::op::{
     ConvertPlan, Dither, Mesh3DOptions, Mesh3DRenderMode, Op, ProjectionMode, ResizeMode,
@@ -18,11 +18,11 @@ use crate::op::{
 use indexmap::IndexMap;
 use oxideav_core::{Error, MediaType, PixelFormat, RuntimeContext, StreamInfo};
 use oxideav_pipeline::schema::{ConvertNode, StreamSelector};
-use oxideav_pipeline::{select_streams, OutputKind};
 use oxideav_pipeline::{
     FilterNode, Job, OutputSpec, Render3DNode, SourceRef, TrackInput, TrackSpec,
 };
-use serde_json::{json, Value};
+use oxideav_pipeline::{OutputKind, select_streams};
+use serde_json::{Value, json};
 
 /// Backend name handed to [`Render3DNode::backend`] for the auto-route
 /// 3D→raster pipeline path.  Mirrors the only [`oxideav_render::RenderBackend`]
@@ -932,35 +932,35 @@ fn finish_job(
     // timed source codes that source's frames as a video track for the
     // sequence muxer; the still encoder the extension resolves to
     // would refuse the second picture.
-    if plan.output_template.is_none() {
-        if let Some((codec, ordinal)) = sequence_output(plan, ctx, &sink, probed.as_deref()) {
-            let mut notes = Vec::new();
-            notes.push(format!(
+    if plan.output_template.is_none()
+        && let Some((codec, ordinal)) = sequence_output(plan, ctx, &sink, probed.as_deref())
+    {
+        let mut notes = Vec::new();
+        notes.push(format!(
                 "convert: note: '{}' is an image sequence; coding the frames of video stream #{ordinal} as {codec} into its track",
                 plan.output
             ));
-            let track = TrackSpec {
-                input: chain,
-                codec: Some(codec.to_string()),
-                params: sink.codec_params,
-                stream_selector: Some(video_selector(ordinal)),
-            };
-            let job = single_output_job(
-                &plan.output,
-                OutputSpec {
-                    audio: vec![],
-                    video: vec![track],
-                    subtitle: vec![],
-                    all: vec![],
-                },
-                sink.threads,
-            )?;
-            return Ok(Planned {
-                job,
-                notes,
-                tap: None,
-            });
-        }
+        let track = TrackSpec {
+            input: chain,
+            codec: Some(codec.to_string()),
+            params: sink.codec_params,
+            stream_selector: Some(video_selector(ordinal)),
+        };
+        let job = single_output_job(
+            &plan.output,
+            OutputSpec {
+                audio: vec![],
+                video: vec![track],
+                subtitle: vec![],
+                all: vec![],
+            },
+            sink.threads,
+        )?;
+        return Ok(Planned {
+            job,
+            notes,
+            tap: None,
+        });
     }
 
     // The pipeline insists every filter-terminated track carry an
@@ -1061,17 +1061,16 @@ fn finish_job(
                         .to_string(),
                 );
             }
-            if probe_input {
-                if let Some(out) =
+            if probe_input
+                && let Some(out) =
                     container_default_output(plan, ctx, &chain, &sink, codec.as_deref(), &mut notes)
-                {
-                    let job = single_output_job(&plan.output, out, sink.threads)?;
-                    return Ok(Planned {
-                        job,
-                        notes,
-                        tap: None,
-                    });
-                }
+            {
+                let job = single_output_job(&plan.output, out, sink.threads)?;
+                return Ok(Planned {
+                    job,
+                    notes,
+                    tap: None,
+                });
             }
             let track = TrackSpec {
                 input: chain,
@@ -1446,7 +1445,7 @@ fn tap_can_write(
         si.accepted[0]
     });
     let bits = target.bits_per_pixel_approx();
-    bits % 8 == 0 && !oxideav_pixfmt::FormatInfo::of(target).is_palette
+    bits.is_multiple_of(8) && !oxideav_pixfmt::FormatInfo::of(target).is_palette
 }
 
 /// Frame-tap job: the executor decodes / filters / converts into the
@@ -2465,8 +2464,8 @@ mod tests {
     #[test]
     fn sharpen_4x4_pixel_match_through_registry() {
         use oxideav_core::{
-            filter::FilterContext, Frame, PixelFormat, PortSpec, Result as CoreResult, TimeBase,
-            VideoFrame, VideoPlane,
+            Frame, PixelFormat, PortSpec, Result as CoreResult, TimeBase, VideoFrame, VideoPlane,
+            filter::FilterContext,
         };
         use oxideav_image_filter::{ImageFilter, Sharpen, VideoStreamParams};
 

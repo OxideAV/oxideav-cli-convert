@@ -300,7 +300,7 @@ pub fn parse(args: &[String]) -> Result<ConvertPlan, Error> {
                     _ => {
                         return Err(Error::invalid(format!(
                             "convert: -depth: '{v}' must be 8 or 16"
-                        )))
+                        )));
                     }
                 };
                 ops.push(Op::Depth(d));
@@ -2240,13 +2240,15 @@ mod tests {
     fn extent_positive_offsets() {
         let p = parse(&to_vec(&["a.png", "-extent", "120x90+10+5", "b.png"])).unwrap();
         match p.ops.as_slice() {
-            [Op::Extent {
-                width: 120,
-                height: 90,
-                x: 10,
-                y: 5,
-                bg: _,
-            }] => {}
+            [
+                Op::Extent {
+                    width: 120,
+                    height: 90,
+                    x: 10,
+                    y: 5,
+                    bg: _,
+                },
+            ] => {}
             other => panic!("unexpected ops: {other:?}"),
         }
     }
@@ -2257,13 +2259,15 @@ mod tests {
     fn extent_negative_offsets() {
         let p = parse(&to_vec(&["a.png", "-extent", "200x150-25-30", "b.png"])).unwrap();
         match p.ops.as_slice() {
-            [Op::Extent {
-                width: 200,
-                height: 150,
-                x: -25,
-                y: -30,
-                bg: _,
-            }] => {}
+            [
+                Op::Extent {
+                    width: 200,
+                    height: 150,
+                    x: -25,
+                    y: -30,
+                    bg: _,
+                },
+            ] => {}
             other => panic!("unexpected ops: {other:?}"),
         }
     }
@@ -2274,13 +2278,15 @@ mod tests {
     fn extent_mixed_signs() {
         let p = parse(&to_vec(&["a.png", "-extent", "64x64+10-5", "b.png"])).unwrap();
         match p.ops.as_slice() {
-            [Op::Extent {
-                width: 64,
-                height: 64,
-                x: 10,
-                y: -5,
-                bg: _,
-            }] => {}
+            [
+                Op::Extent {
+                    width: 64,
+                    height: 64,
+                    x: 10,
+                    y: -5,
+                    bg: _,
+                },
+            ] => {}
             other => panic!("unexpected ops: {other:?}"),
         }
     }
@@ -2406,12 +2412,14 @@ mod tests {
     fn unsharp_full_grammar() {
         let p = parse(&to_vec(&["a.png", "-unsharp", "2x1.5+0.8+5", "b.png"])).unwrap();
         match p.ops.as_slice() {
-            [Op::Unsharp {
-                radius: 2,
-                sigma,
-                amount,
-                threshold: 5,
-            }] => {
+            [
+                Op::Unsharp {
+                    radius: 2,
+                    sigma,
+                    amount,
+                    threshold: 5,
+                },
+            ] => {
                 assert!((sigma - 1.5).abs() < 1e-6);
                 assert!((amount - 0.8).abs() < 1e-6);
             }
@@ -2423,12 +2431,14 @@ mod tests {
     fn unsharp_partial_defaults() {
         let p = parse(&to_vec(&["a.png", "-unsharp", "3", "b.png"])).unwrap();
         match p.ops.as_slice() {
-            [Op::Unsharp {
-                radius: 3,
-                sigma,
-                amount,
-                threshold: 0,
-            }] => {
+            [
+                Op::Unsharp {
+                    radius: 3,
+                    sigma,
+                    amount,
+                    threshold: 0,
+                },
+            ] => {
                 assert!((sigma - 1.5).abs() < 1e-6, "sigma = {sigma}");
                 assert!((amount - 1.0).abs() < 1e-6, "amount = {amount}");
             }
@@ -2576,11 +2586,13 @@ mod tests {
     fn level_full_triplet() {
         let p = parse(&to_vec(&["a.png", "-level", "10/1.2/250", "b.png"])).unwrap();
         match p.ops.as_slice() {
-            [Op::Level {
-                black: 10,
-                gamma,
-                white: 250,
-            }] => assert!((gamma - 1.2).abs() < 1e-6),
+            [
+                Op::Level {
+                    black: 10,
+                    gamma,
+                    white: 250,
+                },
+            ] => assert!((gamma - 1.2).abs() < 1e-6),
             other => panic!("unexpected ops: {other:?}"),
         }
     }
@@ -2589,11 +2601,13 @@ mod tests {
     fn level_percent_endpoints() {
         let p = parse(&to_vec(&["a.png", "-level", "10%/1.0/90%", "b.png"])).unwrap();
         match p.ops.as_slice() {
-            [Op::Level {
-                black,
-                gamma: _,
-                white,
-            }] => {
+            [
+                Op::Level {
+                    black,
+                    gamma: _,
+                    white,
+                },
+            ] => {
                 // 10% of 255 ≈ 26; 90% ≈ 230.
                 assert_eq!(*black, 26);
                 assert_eq!(*white, 230);
@@ -2832,9 +2846,11 @@ mod tests {
     #[test]
     fn printf_template_absent_returns_none() {
         assert!(parse_printf_template("out.png").unwrap().is_none());
-        assert!(parse_printf_template("/some/dir/out.jpg")
-            .unwrap()
-            .is_none());
+        assert!(
+            parse_printf_template("/some/dir/out.jpg")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -3071,12 +3087,14 @@ mod tests {
     fn vignette_radius_only_defaults_sigma_and_centre() {
         let p = parse(&to_vec(&["a.png", "-vignette", "50", "b.png"])).unwrap();
         match p.ops.as_slice() {
-            [Op::Vignette {
-                radius,
-                sigma,
-                x,
-                y,
-            }] => {
+            [
+                Op::Vignette {
+                    radius,
+                    sigma,
+                    x,
+                    y,
+                },
+            ] => {
                 assert!((radius - 50.0).abs() < 1e-6);
                 // Sigma defaults to radius / 2.
                 assert!((sigma - 25.0).abs() < 1e-6);
@@ -3092,12 +3110,14 @@ mod tests {
     fn vignette_radius_and_sigma() {
         let p = parse(&to_vec(&["a.png", "-vignette", "50+10", "b.png"])).unwrap();
         match p.ops.as_slice() {
-            [Op::Vignette {
-                radius,
-                sigma,
-                x,
-                y,
-            }] => {
+            [
+                Op::Vignette {
+                    radius,
+                    sigma,
+                    x,
+                    y,
+                },
+            ] => {
                 assert!((radius - 50.0).abs() < 1e-6);
                 assert!((sigma - 10.0).abs() < 1e-6);
                 assert!((x - 0.5).abs() < 1e-6);
@@ -3111,12 +3131,14 @@ mod tests {
     fn vignette_full_grammar_with_xy() {
         let p = parse(&to_vec(&["a.png", "-vignette", "50+10+0.25+0.75", "b.png"])).unwrap();
         match p.ops.as_slice() {
-            [Op::Vignette {
-                radius,
-                sigma,
-                x,
-                y,
-            }] => {
+            [
+                Op::Vignette {
+                    radius,
+                    sigma,
+                    x,
+                    y,
+                },
+            ] => {
                 assert!((radius - 50.0).abs() < 1e-6);
                 assert!((sigma - 10.0).abs() < 1e-6);
                 assert!((x - 0.25).abs() < 1e-6);
@@ -3988,10 +4010,12 @@ mod tests {
         assert_eq!(r.deny_containers, ["gif"]);
         assert_eq!(r.allow_codecs.as_deref(), Some(&["png".to_string()][..]));
         assert_eq!(r.deny_codecs, ["hevc"]);
-        assert!(parse(&to_vec(&["in.png", "out.png"]))
-            .unwrap()
-            .restrictions
-            .is_empty());
+        assert!(
+            parse(&to_vec(&["in.png", "out.png"]))
+                .unwrap()
+                .restrictions
+                .is_empty()
+        );
         let err = parse(&to_vec(&["in.png", "--deny-codecs"])).unwrap_err();
         assert!(format!("{err}").contains("--deny-codecs"), "{err}");
     }
@@ -4027,9 +4051,11 @@ mod tests {
             oxideav_core::ExecutionContext::auto().threads
         );
         assert!(p.strip_metadata());
-        assert!(parse(&to_vec(&["-strip", "in.png", "out.jpg"]))
-            .unwrap()
-            .strip_metadata());
+        assert!(
+            parse(&to_vec(&["-strip", "in.png", "out.jpg"]))
+                .unwrap()
+                .strip_metadata()
+        );
     }
 
     // ---- `--` end-of-flags marker + empty-argument hardening ----

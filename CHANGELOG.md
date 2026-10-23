@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- edition 2024, MSRV 1.95.
+
+### Changed
+
 - Gateway-written stills (PDF / 3D renders, the icon writer's input)
   ride `oxideav-image` 0.0.5's execution budget: `OpenOptions` /
   `SaveOptions::with_execution_context` carry the plan's `-threads`

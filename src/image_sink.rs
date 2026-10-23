@@ -156,7 +156,7 @@ pub fn pick_sink_format(
     let reachable: Vec<(usize, PixelFormat, Shape)> = accepted
         .iter()
         .enumerate()
-        .filter(|(_, &f)| oxideav_pixfmt::supports(src, f))
+        .filter(|&(_, &f)| oxideav_pixfmt::supports(src, f))
         .map(|(i, &f)| (i, f, shape(f)))
         .collect();
     // Narrow by the extension's family, then by the depth request —
@@ -320,10 +320,8 @@ pub fn resolve_output_codec_with(
     let gateway = oxideav_image::resolve_target(ctx, &ext, &gateway_opts)
         .ok()
         .filter(|t| has_enc(t.codec()) && encoder_accepted_formats(ctx, t.codec()).is_some());
-    if image_format {
-        if let Some(target) = &gateway {
-            return Some(target.codec().to_string());
-        }
+    if image_format && let Some(target) = &gateway {
+        return Some(target.codec().to_string());
     }
     if has_enc(&container) {
         return Some(container);
@@ -334,10 +332,9 @@ pub fn resolve_output_codec_with(
     if let Some(&(_, codec)) = CONTAINER_CODEC_ALIASES
         .iter()
         .find(|(c, _)| *c == container)
+        && has_enc(codec)
     {
-        if has_enc(codec) {
-            return Some(codec.to_string());
-        }
+        return Some(codec.to_string());
     }
     // A container whose single-picture encoders are a prefixed family
     // the gateway resolves (`webp` → `webp_vp8l` / `webp_vp8`), or a

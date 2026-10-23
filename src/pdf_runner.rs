@@ -46,7 +46,7 @@ use oxideav_svg::write_svg;
 use crate::op::{ConvertPlan, Op};
 use crate::pixel_xform::apply_pixel_transform_chain;
 use crate::raster_io::{
-    apply_alpha_ops, classify_output_with, encode_raster_to_path, OutputClass, RgbaImage,
+    OutputClass, RgbaImage, apply_alpha_ops, classify_output_with, encode_raster_to_path,
 };
 
 /// Returns true when the input path's extension is `.pdf` or its
@@ -131,9 +131,8 @@ pub fn run(plan: &ConvertPlan, ctx: &RuntimeContext) -> Result<()> {
             for (out_idx, page) in selected.iter().enumerate() {
                 let bytes = write_svg(&page.content);
                 let path = tmpl.expand(out_idx);
-                fs::write(&path, bytes).map_err(|e| {
-                    Error::invalid(format!("convert: failed to write {path}: {e}"))
-                })?;
+                fs::write(&path, bytes)
+                    .map_err(|e| Error::invalid(format!("convert: failed to write {path}: {e}")))?;
             }
             Ok(())
         }

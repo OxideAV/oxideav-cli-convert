@@ -93,7 +93,7 @@ fn write_jpeg444(path: &PathBuf, w: u32, h: u32) {
     let n = (w * h) as usize;
     let p = pattern(w, h, 3);
     let (mut y, mut cb, mut cr) = (Vec::with_capacity(n), Vec::new(), Vec::new());
-    for px in p.chunks_exact(3) {
+    for px in p.as_chunks::<3>().0 {
         y.push(px[0]);
         cb.push(px[1] / 2 + 64);
         cr.push(px[2] / 2 + 64);
@@ -371,7 +371,7 @@ fn depth_8_narrows_a_sixteen_bit_png() {
     convert(&[src.to_str().unwrap(), "-depth", "8", out.to_str().unwrap()]);
     let got = read_png(&out);
     assert_eq!(got.format, PixelFormat::Rgb24);
-    let high: Vec<u8> = px.chunks_exact(2).map(|w| w[1]).collect();
+    let high: Vec<u8> = px.as_chunks::<2>().0.iter().map(|w| w[1]).collect();
     assert_eq!(got.data, high, "16 → 8 keeps the high byte");
 }
 

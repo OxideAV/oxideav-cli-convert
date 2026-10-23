@@ -140,15 +140,16 @@ pub fn plan_layouts(src: PixelFormat, ops: &[Op]) -> (PixelFormat, Vec<Narrowing
         match layout_step(op) {
             LayoutStep::Filter(filter) => {
                 let accepted = filter.accepted_pixel_formats();
-                if !accepted.is_empty() && !accepted.contains(&cur) {
-                    if let Some(to) = filter_input_layout_for(cur, &accepted) {
-                        narrowings.push(Narrowing {
-                            before_op: i,
-                            from: cur,
-                            to,
-                        });
-                        cur = to;
-                    }
+                if !accepted.is_empty()
+                    && !accepted.contains(&cur)
+                    && let Some(to) = filter_input_layout_for(cur, &accepted)
+                {
+                    narrowings.push(Narrowing {
+                        before_op: i,
+                        from: cur,
+                        to,
+                    });
+                    cur = to;
                 }
                 if let Some(out) = filter.output_pixel_format(cur) {
                     cur = out;

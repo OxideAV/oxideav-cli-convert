@@ -128,13 +128,13 @@ impl Restrictions {
                 "{PREFIX} container '{container}' is denied"
             )));
         }
-        if let Some(allow) = &self.allow_containers {
-            if !allow.contains(&name) {
-                return Err(Error::unsupported(format!(
-                    "{PREFIX} container '{container}' is not in the allow list ({})",
-                    allow.join(", ")
-                )));
-            }
+        if let Some(allow) = &self.allow_containers
+            && !allow.contains(&name)
+        {
+            return Err(Error::unsupported(format!(
+                "{PREFIX} container '{container}' is not in the allow list ({})",
+                allow.join(", ")
+            )));
         }
         Ok(())
     }
@@ -157,14 +157,14 @@ impl Restrictions {
                     s.index
                 )));
             }
-            if let Some(allow) = &self.allow_codecs {
-                if !allow.contains(&id) {
-                    return Err(Error::unsupported(format!(
-                        "{PREFIX} codec '{id}' of video stream #{} is not in the allow list ({})",
-                        s.index,
-                        allow.join(", ")
-                    )));
-                }
+            if let Some(allow) = &self.allow_codecs
+                && !allow.contains(&id)
+            {
+                return Err(Error::unsupported(format!(
+                    "{PREFIX} codec '{id}' of video stream #{} is not in the allow list ({})",
+                    s.index,
+                    allow.join(", ")
+                )));
             }
         }
         Ok(())
@@ -231,9 +231,11 @@ mod tests {
         assert!(is_restricted(&e), "{e}");
         let allow = Restrictions::new().with_allow_codecs(["png"]);
         assert!(allow.check_streams(&ok).is_ok());
-        assert!(allow
-            .check_streams(&[stream(0, "mjpeg", MediaType::Video)])
-            .is_err());
+        assert!(
+            allow
+                .check_streams(&[stream(0, "mjpeg", MediaType::Video)])
+                .is_err()
+        );
     }
 
     #[test]

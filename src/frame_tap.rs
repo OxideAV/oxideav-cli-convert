@@ -33,7 +33,7 @@
 
 use std::fs::File;
 use std::path::Path;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
 use oxideav_core::{
@@ -516,7 +516,7 @@ fn expand_palette(frame: Frame, spec: &TapSpec) -> Result<Frame> {
 
 /// Composite packed RGBA over an opaque `bg` colour in place.
 fn composite_over(rgba: &mut [u8], bg: [u8; 4]) {
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         let a = u32::from(px[3]);
         if a == 255 {
             continue;
@@ -555,7 +555,7 @@ pub fn frame_dims(frame: &oxideav_core::VideoFrame, fmt: PixelFormat) -> Option<
         usize::from(info.bit_depth).div_ceil(8)
     } else {
         let bits = fmt.bits_per_pixel_approx() as usize;
-        if bits % 8 != 0 {
+        if !bits.is_multiple_of(8) {
             return None;
         }
         bits / 8
@@ -637,10 +637,12 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert!(got[0].is(&BlobKind::EXIF) && got[0].data == [1]);
         assert!(got[1].is(&BlobKind::ICC) && got[1].data == [2]);
-        assert!(file_blobs(&frame(&[(3, 1)]), &stream)
-            .iter()
-            .map(|b| b.data[0])
-            .eq([2, 3]));
+        assert!(
+            file_blobs(&frame(&[(3, 1)]), &stream)
+                .iter()
+                .map(|b| b.data[0])
+                .eq([2, 3])
+        );
         let stripped = strip_frame(Frame::Video(f));
         let Frame::Video(v) = stripped else {
             panic!("video")

@@ -17,10 +17,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use oxideav_cli_convert::run as convert_run;
+use oxideav_core::RuntimeContext;
 use oxideav_core::vector::{
     Group, Node, Paint, Path as VPath, PathCommand, PathNode, Point, Rgba, VectorFrame,
 };
-use oxideav_core::RuntimeContext;
 use oxideav_pdf::write_pdf_from_scene;
 use oxideav_scene::{Metadata, Page, Scene};
 

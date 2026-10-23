@@ -480,7 +480,7 @@ fn flatten_alpha_over(img: &mut RgbaImage, bg: [u8; 4]) {
     let bg_r = bg[0] as u32;
     let bg_g = bg[1] as u32;
     let bg_b = bg[2] as u32;
-    for px in img.pixels.chunks_exact_mut(4) {
+    for px in img.pixels.as_chunks_mut::<4>().0 {
         let a = px[3] as u32;
         if a == 255 {
             continue;
@@ -503,7 +503,7 @@ fn drop_alpha(img: &mut RgbaImage) {
     let w = img.width as usize;
     let h = img.height as usize;
     let mut out = Vec::with_capacity(w * h * 3);
-    for px in img.pixels.chunks_exact(4) {
+    for px in img.pixels.as_chunks::<4>().0 {
         out.extend_from_slice(&px[..3]);
     }
     img.pixels = out;
@@ -514,7 +514,7 @@ fn set_alpha(img: &mut RgbaImage, value: u8) {
     if img.is_rgb() {
         return;
     }
-    for px in img.pixels.chunks_exact_mut(4) {
+    for px in img.pixels.as_chunks_mut::<4>().0 {
         px[3] = value;
     }
 }

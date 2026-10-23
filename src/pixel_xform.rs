@@ -444,14 +444,14 @@ pub fn roll(img: &mut RgbaImage, dx: i32, dy: i32) {
 pub fn negate(img: &mut RgbaImage) {
     let bpp = bpp(img);
     if bpp == 4 {
-        for px in img.pixels.chunks_exact_mut(4) {
+        for px in img.pixels.as_chunks_mut::<4>().0 {
             px[0] = 255 - px[0];
             px[1] = 255 - px[1];
             px[2] = 255 - px[2];
             // px[3] (alpha) untouched.
         }
     } else {
-        for px in img.pixels.chunks_exact_mut(3) {
+        for px in img.pixels.as_chunks_mut::<3>().0 {
             px[0] = 255 - px[0];
             px[1] = 255 - px[1];
             px[2] = 255 - px[2];
