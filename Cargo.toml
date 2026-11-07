@@ -64,9 +64,9 @@ oxideav-pixfmt = "0.1"
 # `RuntimeContext`, so every image crate registered there (png, bmp,
 # jpeg, webp, gif, tiff, qoi, heif, …) is readable and writable here
 # without a per-format dependency. No format crate is pulled directly.
-oxideav-image = "0.0.5"
+oxideav-image = "0.0.6"
 # SVG writer for the per-page vector output path (PDF→SVG, no raster).
-oxideav-svg = "0.1"
+oxideav-svg = "0.2"
 # 3D-asset side-channel — typed Scene3D model + the helper that fills
 # a registry with every enabled 3D-format codec sibling
 # (stl/obj/gltf/usdz). Both deps are optional + gated on the `mesh3d`
@@ -125,6 +125,6 @@ oxideav-qoi = "0.1"
 # encoder on the heif muxer, `.heics` sequences): the production path
 # the gateway's codec pick, metadata carriage and quality ladder are
 # proved on.
-oxideav-heif = "0.0.13"
-oxideav-avif = "0.0.16"
+oxideav-heif = "0.0.14"
+oxideav-avif = "0.0.17"
 oxideav-h265 = "0.0"
