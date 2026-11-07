@@ -231,7 +231,7 @@ still-image contract the `oxideav-image` gateway documents:
   `--opt chroma=` / `sampling=` choose). The Netpbm extensions pick
   their family; `-depth 8|16` caps or raises the depth. Filter ops
   are planned on the filters' own declared layouts (`oxideav-image-
-  filter` 0.1.3, `accepted_pixel_formats` / `output_pixel_format`):
+  filter` 0.1.4, `accepted_pixel_formats` / `output_pixel_format`):
   the running layout starts at what the stream decodes to and is
   converted ahead of an op exactly when that op's filter refuses it
   — to the declared layout that keeps what the source carries (grey
@@ -291,10 +291,13 @@ restricted input the same way.
 Planned from the filters' declarations (pinned by
 `filter_layouts::tests::deep_layout_table`): *kept* = the op runs on
 the deep layout and emits it; `A → B` = the planner converts to `A`
-ahead of the op (the filter's declared 8-bit route for that source)
-and the op emits `B`. `-resize` on a 16-bit PNG / TIFF stays 16-bit
-end to end; the pointwise colour ops narrow once and the rest of the
-chain stays 8-bit.
+ahead of the op and the op emits `B`; `→ B` = the op takes the
+layout and emits `B`. Since `oxideav-image-filter` 0.1.4 every filter
+op takes the 16-bit and 10-bit layouts natively, so a 16-bit PNG /
+TIFF stays 16-bit end to end through any chain of them; the planner's
+narrowing (one conversion ahead of the first op whose filter refuses
+the running layout) is exercised in its tests with a filter declaring
+only 8-bit layouts.
 
 | op | `Rgb48Le` | `Rgba64Le` | `Gray16Le` | `Yuv420P10Le` |
 |---|---|---|---|---|
@@ -303,16 +306,16 @@ chain stays 8-bit.
 | `-flip` / `-flop` | kept | kept | kept | kept |
 | `-roll` | kept | kept | kept | kept |
 | `-rotate 90` (quarter turns) | kept | kept | kept | kept |
-| `-rotate 30` (other angles) | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
-| `-extent` / `-trim` | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
-| `-blur` / `-sharpen` / `-unsharp` | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
-| `-negate` / `-gamma` / `-level` / `-threshold` | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
-| `-normalize` / `-equalize` / `-auto-gamma` | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
-| `-posterize` / `-solarize` | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
-| `-brightness-contrast` / `-contrast` | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
-| `-edge` | `Rgb24` → `Gray8` | `Rgba` → `Gray8` | `Gray8` → `Gray8` | `Rgb24` → `Gray8` |
-| `-sepia` / `-modulate` / `-colorize` / `-vignette` | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
-| `-colorspace gray` | `Rgb24` → `Rgb24` | `Rgba` → `Rgba` | `Gray8` → `Gray8` | `Rgb24` → `Rgb24` |
+| `-rotate 30` (other angles) | kept | kept | kept | kept |
+| `-extent` / `-trim` | kept | kept | kept | kept |
+| `-blur` / `-sharpen` / `-unsharp` | kept | kept | kept | kept |
+| `-negate` / `-gamma` / `-level` / `-threshold` | kept | kept | kept | kept |
+| `-normalize` / `-equalize` / `-auto-gamma` | kept | kept | kept | kept |
+| `-posterize` / `-solarize` | kept | kept | kept | kept |
+| `-brightness-contrast` / `-contrast` | kept | kept | kept | kept |
+| `-edge` | → `GrayF32Le` | → `GrayF32Le` | kept | → `GrayF32Le` |
+| `-sepia` / `-modulate` / `-colorize` / `-vignette` | kept | kept | kept | kept |
+| `-colorspace gray` | kept | kept | kept | kept |
 | `-colors` | → `Pal8` | → `Pal8` | → `Pal8` | → `Pal8` |
 
 ### Budgets: 12 MP at `-threads 1 / 4 / 8` (round 479)
@@ -631,10 +634,6 @@ carries test-pinned guarantees:
   `.heics` cannot carry `copyright`), and the `oxideav-image` gateway's
   `SaveOptions` carries blobs, not string pairs (so the side-channels
   drop them). Both are asks on those crates.
-- Filters without a declared deep layout (the colour and tonal
-  families) narrow a 16-bit / 10-bit source to 8 bits ahead of the
-  op (*Filter layouts* above); a deep path there is the filter
-  crate's to add — the planner follows the declarations.
 - `oxideav-webp`'s registry encoder declares no `quality` option, so
   `-quality` does not reach a `.webp` output.
 - Registering PDF as a real `Demuxer` so `oxideav probe` /

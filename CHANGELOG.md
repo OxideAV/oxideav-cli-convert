@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `oxideav-image-filter` floor raised to `0.1.4`: its colour and tonal
+  filters (`-sepia`, `-negate`, `-modulate`, `-blur`, `-level`, …) now
+  take the 16- and 10-bit layouts natively, so the filter planner no
+  longer narrows a deep source ahead of them — a 16-bit PNG stays
+  16-bit through every filter op (`-edge` emits its float grey plane
+  for a deep colour source). README *Filter layouts* table regenerated.
+- The planner's narrowing tests (one conversion ahead of the first
+  refusing filter, grey stays grey, alpha keeps alpha, an undeclared
+  filter takes anything) run on a stand-in filter declaring 8-bit
+  layouts only, since no shipped op refuses a deep layout any more.
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.8...v0.0.9) - 2026-10-23
 
 ### Other

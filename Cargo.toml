@@ -51,7 +51,7 @@ ico = ["dep:oxideav-ico"]
 oxideav-core = "0.1.41"
 oxideav-source = "0.1"
 oxideav-pipeline = "0.1"
-oxideav-image-filter = "0.1.3"
+oxideav-image-filter = "0.1.4"
 oxideav-generator = { version = "0.1", optional = true }
 # Scene-aware inputs (PDF reader → Scene with pages) + per-page fan-out.
 oxideav-pdf = "0.2"

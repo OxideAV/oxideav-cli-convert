@@ -188,14 +188,14 @@ fn rgb48_png_keeps_sixteen_bits() {
 }
 
 /// Filter ops are planned on the filters' declared layouts: `-resize`
-/// takes 16-bit words natively, so a 16-bit PNG stays 16-bit end to
-/// end (no conversion node ahead of the filter, a 16-bit output); an
-/// op whose filter declares no deep layout (`-sepia-tone`) gets one
-/// conversion ahead of it, to the declared 8-bit layout that keeps
-/// what the source carries, and the sink pick follows the chain's
-/// output layout (an 8-bit PNG — nothing is widened back).
+/// and, since `oxideav-image-filter` 0.1.4, the colour and tonal
+/// families (`-sepia-tone`, `-negate`) take 16-bit words natively, so
+/// a 16-bit PNG stays 16-bit end to end — no conversion node ahead of
+/// the filter, a 16-bit output. (The one conversion ahead of a filter
+/// that refuses the running layout is pinned in `filter_layouts`'s
+/// unit tests, with a filter declaring 8-bit layouts only.)
 #[test]
-fn resize_keeps_sixteen_bits_and_a_narrowing_filter_narrows_once() {
+fn deep_sources_stay_deep_through_resize_sepia_and_negate() {
     use oxideav_cli_convert::frame_tap::TAP_SINK;
     use oxideav_pipeline::schema::TrackInput;
     let dir = temp_dir("deep-filters");
@@ -238,7 +238,7 @@ fn resize_keeps_sixteen_bits_and_a_narrowing_filter_narrows_once() {
         out.to_str().unwrap(),
     ]);
     let got = read_png(&out);
-    assert_eq!(got.format, PixelFormat::Rgb24, "the chain emits 8-bit RGB");
+    assert_eq!(got.format, PixelFormat::Rgb48Le, "sepia keeps 16 bits");
     let plan = oxideav_cli_convert::args::parse(&[
         src.to_str().unwrap().to_string(),
         "-sepia".into(),
@@ -251,20 +251,25 @@ fn resize_keeps_sixteen_bits_and_a_narrowing_filter_narrows_once() {
         .input
         .as_filter()
         .expect("sepia node");
-    let conv = match f.input.as_ref() {
-        TrackInput::Convert(c) => c,
-        other => panic!("one conversion ahead of sepia, got {other:?}"),
-    };
-    assert_eq!(conv.convert, "rgb24");
-    assert!(conv.input.is_source());
+    assert!(
+        !matches!(f.input.as_ref(), TrackInput::Convert(_)),
+        "no conversion ahead of sepia: {:?}",
+        f.input
+    );
+    assert!(f.input.is_source());
 
-    // A deep grey picture through a classic filter goes to Gray8 (its
-    // declared grey route), never to RGB.
+    // A deep grey picture through `-negate` stays deep grey.
     let gray = dir.join("gray16.png");
     write_png(&gray, PixelFormat::Gray16Le, 8, 8, pattern(8, 8, 2));
     let out = dir.join("negated.png");
     convert(&[gray.to_str().unwrap(), "-negate", out.to_str().unwrap()]);
-    assert_eq!(read_png(&out).format, PixelFormat::Gray8);
+    let negated = read_png(&out);
+    assert_eq!(
+        oxideav_pixfmt::FormatInfo::of(negated.format).bit_depth,
+        16,
+        "negate keeps 16 bits ({:?})",
+        negated.format
+    );
     // `-flip` takes the 16-bit words natively: the output is the same
     // 16-bit layout the plain conversion writes (the encoder's pick for
     // a `Gray16Le` source, whatever its declared set names).

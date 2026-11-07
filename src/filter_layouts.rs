@@ -8,10 +8,10 @@
 //! paired with the typed filter it lowers to (built with the op's own
 //! parameters where they change the declared set — a resize kernel, a
 //! rotation angle) and the running layout is converted through the
-//! gateway's views only when the next filter refuses it. A 16-bit PNG
-//! through `-resize` stays 16-bit end to end; the same picture through
-//! `-sepia` (packed 8-bit RGB only) is narrowed once, ahead of that
-//! op, with a note.
+//! gateway's views only when the next filter refuses it, once, ahead
+//! of that op, with a note. A 16-bit PNG through `-resize` or `-sepia`
+//! stays 16-bit end to end: every filter op lowered here takes the
+//! deep layouts natively (`oxideav-image-filter` 0.1.4).
 
 use oxideav_core::PixelFormat;
 use oxideav_image_filter::{
@@ -134,10 +134,22 @@ pub struct Narrowing {
 /// implementation outside `oxideav-image-filter`) is assumed to take
 /// anything.
 pub fn plan_layouts(src: PixelFormat, ops: &[Op]) -> (PixelFormat, Vec<Narrowing>) {
+    plan_layouts_with(src, ops, layout_step)
+}
+
+/// [`plan_layouts`] with the op → step lowering supplied by the
+/// caller (the tests pair ops with filters declaring narrower sets
+/// than the shipped ones, so the narrowing walk stays exercised
+/// whatever `oxideav-image-filter` accepts today).
+fn plan_layouts_with(
+    src: PixelFormat,
+    ops: &[Op],
+    step: impl Fn(&Op) -> LayoutStep,
+) -> (PixelFormat, Vec<Narrowing>) {
     let mut cur = src;
     let mut narrowings = Vec::new();
     for (i, op) in ops.iter().enumerate() {
-        match layout_step(op) {
+        match step(op) {
             LayoutStep::Filter(filter) => {
                 let accepted = filter.accepted_pixel_formats();
                 if !accepted.is_empty()
@@ -215,12 +227,66 @@ mod tests {
         }
     }
 
+    /// A filter that declares only `oxideav-image-filter`'s classic
+    /// 8-bit set (what the colour and tonal families declared before
+    /// their deep paths): the stand-in for a filter that refuses a deep
+    /// layout, now that every op this crate lowers takes one.
+    struct EightBitOnly;
+
+    impl ImageFilter for EightBitOnly {
+        fn apply(
+            &self,
+            input: &oxideav_core::VideoFrame,
+            _params: oxideav_image_filter::VideoStreamParams,
+        ) -> Result<oxideav_core::VideoFrame, oxideav_core::Error> {
+            Ok(input.clone())
+        }
+        fn accepted_pixel_formats(&self) -> Vec<PixelFormat> {
+            oxideav_image_filter::layout::CLASSIC.to_vec()
+        }
+        fn output_pixel_format(&self, input: PixelFormat) -> Option<PixelFormat> {
+            oxideav_image_filter::layout::CLASSIC
+                .contains(&input)
+                .then_some(input)
+        }
+    }
+
+    /// A filter that declares nothing (an implementation outside
+    /// `oxideav-image-filter` that only provides `apply`).
+    struct Undeclared;
+
+    impl ImageFilter for Undeclared {
+        fn apply(
+            &self,
+            input: &oxideav_core::VideoFrame,
+            _params: oxideav_image_filter::VideoStreamParams,
+        ) -> Result<oxideav_core::VideoFrame, oxideav_core::Error> {
+            Ok(input.clone())
+        }
+    }
+
+    /// The shipped lowering, except `-sepia` / `-negate` go to
+    /// [`EightBitOnly`] and `-posterize` to [`Undeclared`].
+    fn with_refusing_ops(op: &Op) -> LayoutStep {
+        match op {
+            Op::Sepia { .. } | Op::Negate => LayoutStep::Filter(Box::new(EightBitOnly)),
+            Op::Posterize { .. } => LayoutStep::Filter(Box::new(Undeclared)),
+            _ => layout_step(op),
+        }
+    }
+
     #[test]
-    fn resize_keeps_a_deep_layout_and_sepia_narrows_it() {
+    fn resize_keeps_a_deep_layout_and_a_refusing_filter_narrows_it() {
         let (out, n) = plan_layouts(PixelFormat::Rgb48Le, &[resize()]);
         assert_eq!(out, PixelFormat::Rgb48Le);
         assert!(n.is_empty());
-        let (out, n) = plan_layouts(PixelFormat::Rgb48Le, &[Op::Sepia { threshold: 80.0 }]);
+        let sepia = [Op::Sepia { threshold: 80.0 }];
+        // The shipped sepia takes the 16-bit word natively.
+        let (out, n) = plan_layouts(PixelFormat::Rgb48Le, &sepia);
+        assert_eq!(out, PixelFormat::Rgb48Le);
+        assert!(n.is_empty());
+        // A filter declaring 8-bit layouts only gets packed 8-bit RGB.
+        let (out, n) = plan_layouts_with(PixelFormat::Rgb48Le, &sepia, with_refusing_ops);
         assert_eq!(out, PixelFormat::Rgb24);
         assert_eq!(
             n,
@@ -241,9 +307,12 @@ mod tests {
             resize(),
         ];
         let (out, n) = plan_layouts(PixelFormat::Gray16Le, &ops);
-        // Gray16 resizes natively; sepia takes no 16-bit word, so the
-        // grey picture goes to Gray8 (its declared 8-bit grey route)
-        // there and stays for the rest.
+        assert_eq!(out, PixelFormat::Gray16Le, "every shipped op takes Gray16");
+        assert!(n.is_empty());
+        let (out, n) = plan_layouts_with(PixelFormat::Gray16Le, &ops, with_refusing_ops);
+        // Gray16 resizes natively; the first 8-bit-only filter gets the
+        // grey picture as Gray8 (its declared 8-bit grey route) and the
+        // rest of the chain stays there.
         assert_eq!(out, PixelFormat::Gray8);
         assert_eq!(n.len(), 1);
         assert_eq!(
@@ -253,10 +322,24 @@ mod tests {
     }
 
     #[test]
-    fn classic_filters_take_the_deep_grey_through_gray8() {
+    fn a_refusing_filter_takes_the_deep_grey_through_gray8() {
         let (out, n) = plan_layouts(PixelFormat::Gray16Le, &[Op::Negate]);
+        assert_eq!(out, PixelFormat::Gray16Le);
+        assert!(n.is_empty());
+        let (out, n) = plan_layouts_with(PixelFormat::Gray16Le, &[Op::Negate], with_refusing_ops);
         assert_eq!(out, PixelFormat::Gray8);
         assert_eq!(n[0].to, PixelFormat::Gray8);
+        // Deep with alpha keeps an alpha channel at 8 bits.
+        let (out, n) = plan_layouts_with(PixelFormat::Rgba64Le, &[Op::Negate], with_refusing_ops);
+        assert_eq!((out, n[0].to), (PixelFormat::Rgba, PixelFormat::Rgba));
+    }
+
+    #[test]
+    fn a_filter_declaring_nothing_is_assumed_to_take_anything() {
+        let ops = [Op::Posterize { levels: 4 }];
+        let (out, n) = plan_layouts_with(PixelFormat::Rgb48Le, &ops, with_refusing_ops);
+        assert_eq!(out, PixelFormat::Rgb48Le);
+        assert!(n.is_empty());
     }
 
     #[test]
@@ -373,13 +456,20 @@ mod tests {
                 .map(|(_, c)| c.iter().all(|c| c == "kept"))
                 .unwrap()
         };
-        assert!(keeps("-resize / -thumbnail"));
-        assert!(keeps("-crop"));
-        assert!(keeps("-flip / -flop"));
-        assert!(keeps("-roll"));
-        assert!(keeps("-rotate 90"));
-        assert!(!keeps("-sepia / -modulate / -tint"));
-        assert!(!keeps("-blur / -sharpen / -unsharp"));
+        // Every filter op keeps every deep layout (image-filter 0.1.4);
+        // `-edge` emits its float grey plane for a deep colour source,
+        // `-colors` quantises to a palette.
+        for (flag, _) in &ops {
+            if !matches!(*flag, "-edge" | "-colors") {
+                assert!(keeps(flag), "{flag} narrows a deep layout");
+            }
+        }
+        let row = |flag: &str| rows.iter().find(|(f, _)| *f == flag).unwrap().1.clone();
+        assert_eq!(
+            row("-edge"),
+            ["→ GrayF32Le", "→ GrayF32Le", "kept", "→ GrayF32Le"]
+        );
+        assert_eq!(row("-colors"), ["→ Pal8"; 4]);
     }
 
     #[test]
