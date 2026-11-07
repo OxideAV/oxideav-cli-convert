@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `identify` / `probe` report 16-bit gray+alpha (`Ya16Le`) as 16-bit Gray with alpha
+  instead of depth 0 "unknown" (PNG colour type 4 / 16-bit now decodes to it).
+
 ### Changed
 
 - `oxideav-image-filter` floor raised to `0.1.4`: its colour and tonal

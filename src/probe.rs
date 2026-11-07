@@ -1062,7 +1062,7 @@ fn describe_pixel_format(pf: PixelFormat) -> (u8, &'static str) {
         Gray8 | Ya8 => (8, "Gray"),
         Gray10Le => (10, "Gray"),
         Gray12Le => (12, "Gray"),
-        Gray16Le => (16, "Gray"),
+        Gray16Le | Ya16Le => (16, "Gray"),
         MonoBlack | MonoWhite => (1, "Gray"),
         Pal8 => (8, "sRGB"),
         Cmyk => (8, "CMYK"),
@@ -1074,7 +1074,10 @@ fn describe_pixel_format(pf: PixelFormat) -> (u8, &'static str) {
 /// Conservative — only known-alpha variants return `true`.
 fn has_alpha(pf: PixelFormat) -> bool {
     use PixelFormat::*;
-    matches!(pf, Rgba | Bgra | Argb | Abgr | Rgba64Le | Yuva420P | Ya8)
+    matches!(
+        pf,
+        Rgba | Bgra | Argb | Abgr | Rgba64Le | Yuva420P | Ya8 | Ya16Le
+    )
 }
 
 fn sample_format_bits(sf: oxideav_core::SampleFormat) -> u8 {

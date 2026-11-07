@@ -172,7 +172,7 @@ fn describe_pixel_format(pf: PixelFormat) -> (u8, &'static str) {
         Gray8 | Ya8 => (8, "Gray"),
         Gray10Le => (10, "Gray"),
         Gray12Le => (12, "Gray"),
-        Gray16Le => (16, "Gray"),
+        Gray16Le | Ya16Le => (16, "Gray"),
         MonoBlack | MonoWhite => (1, "Gray"),
         // Palette
         Pal8 => (8, "sRGB"),
@@ -235,6 +235,7 @@ mod tests {
         assert_eq!(describe_pixel_format(PixelFormat::Rgba64Le), (16, "sRGB"));
         assert_eq!(describe_pixel_format(PixelFormat::Gray8), (8, "Gray"));
         assert_eq!(describe_pixel_format(PixelFormat::Gray16Le), (16, "Gray"));
+        assert_eq!(describe_pixel_format(PixelFormat::Ya16Le), (16, "Gray"));
         assert_eq!(
             describe_pixel_format(PixelFormat::Yuv420P10Le),
             (10, "sRGB")
