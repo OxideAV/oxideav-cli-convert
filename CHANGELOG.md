@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.8...v0.0.9) - 2026-10-23
+
+### Other
+
+- edition 2024, MSRV 1.95
+- writer panics remove the in-flight output and carry the panic text; README 12 MP budget matrix at -threads 1 / 4 / 8 before and after with per-stage timings and the serial stages by owner
+- --opt tiling=tili passes through to the heif encoder (tili tiled image item on a gridded picture), pinned by a pass-through test
+- -set KEY=VALUE / -comment TEXT reach the writer's muxer before its header for the keys it carries (Muxer::carries_metadata_key / set_metadata), dropped with a note elsewhere; failure classes pinned against the umbrella exit table
+- a palette source through a pointwise filter keeps its palette (the filter's palette route), the hop's RGBA otherwise — test follows the declared routes
+- filter ops planned on the filters' declared layouts (deep sources stay deep through resize / crop / flip / roll / quarter rotate, one conversion ahead of a refusing op, sink pick follows the chain's output), .webp resolves to the gateway's prefixed encoder pick (webp_vp8l / webp_vp8 under -quality) through the writer
+- gateway-written stills ride oxideav-image 0.0.5's execution budget (OpenOptions / SaveOptions::with_execution_context, every decoder and encoder), .avif takes the avif encoder's own schema default (60, pinned by a schema-reading test), minimum siblings bumped, convert_cli example for budget runs
+- the still-image writer keeps the I/O class when the output file cannot be created
+- README — the still-image contract (stream, codec, layout, quality, metadata, palette alpha, budget, restrictions), the 12 MP budgets table before/after with library and gateway timings; gateway_timing example
+- source-aware resize modes resolve against the input geometry at plan time (50% was 50x50 on the pipeline route); .avif defaults to quality 60 now that the avif encoder (lossless by default) is the pick
+- sequence-brand outputs take a timed source as an HEVC / AV1 track, animation outputs take the image-sequence track; HEIF-family tests through heif / avif / h265 (codec pick, blob chain, quality ladders, budget parity, .heics rules)
+- palette alpha rides to palette targets and is expanded by the writer otherwise — alpha on alpha targets, composited over -background on targets without alpha
+- allow / deny lists on the plan (gateway OpenOptions + pipeline header probe, typed restricted refusals), plan-level budget / strip / quality accessors, filter ops get a layout the filters take
+- the frame tap writes every sizable still output — schema-gated quality, stream + frame metadata blobs with the gateway's precedence, -strip, the thread budget; codec resolved through oxideav-image::resolve_target
+- JPEG from packed RGB is 4:2:0 YCbCr on a layout-declaring encoder (4:4:4 from quality 90); deterministic thread-budget test through a test-only probe format
+
 ### Changed
 
 - edition 2024, MSRV 1.95.
