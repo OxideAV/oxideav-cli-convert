@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-cli-convert/compare/v0.0.9...v0.0.10) - 2026-11-07
+
+### Other
+
+- identify / probe: Ya16Le is 16-bit Gray with alpha
+- dependency floors at the released avif 0.0.17, heif 0.0.14, image 0.0.6, svg 0.2
+- filter planner follows image-filter 0.1.4's deep layouts
+
 ### Fixed
 
 - `identify` / `probe` report 16-bit gray+alpha (`Ya16Le`) as 16-bit Gray with alpha
